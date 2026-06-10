@@ -8,3 +8,6 @@ deploymentTarget = "vm"
 
 [env]
 DATA_DIR = "./data"
+
+[nix]
+channel = "stable-25_05"
