@@ -20,6 +20,7 @@ Full contract: see [SPEC.md](SPEC.md).
 | `MAX_UPLOAD_MB` | no | `25` | Per-upload size cap |
 | `MAX_TOTAL_STORAGE_MB` | no | `500` | Global storage cap |
 | `PORT` | no | `8000` | HTTP port (Replit sets this automatically) |
+| `LOG_LEVEL` | no | `INFO` | Log verbosity (access, tool-call, and auth logs) |
 
 ## Run locally
 
@@ -48,7 +49,12 @@ pytest
    memory. Do not commit `data/` to git (it's `.gitignore`d).
 5. Your endpoint is `https://<your-repl-url>/mcp`.
 
-## Register the server on each surface
+## Register the server on each client
+
+Authentication works two ways with the same token: the
+`Authorization: Bearer <token>` header (preferred), or `?token=<token>` in
+the URL for clients that can't send custom headers. The query-string token
+is never written to this server's logs, but treat such URLs as secrets.
 
 **Claude Code CLI / Desktop:**
 
@@ -58,14 +64,31 @@ claude mcp add -s user --transport http assist-memory \
   -H "Authorization: Bearer <token>"
 ```
 
-**claude.ai web:** Settings → Connectors → Add custom connector, with URL
-`https://<repl-url>/mcp`. Note: the web connector UI authenticates via
-OAuth and does not currently let you attach a custom `Authorization`
-header; this server only supports static bearer auth. If your connector
-form has an advanced/header field, use `Authorization: Bearer <token>`.
-Otherwise web access requires fronting the server with an OAuth-capable
-proxy — until then, use the CLI/Desktop registration and `handoff_save` /
-`handoff_load` to move state to and from web sessions.
+**claude.ai web:** Settings → Connectors → Add custom connector. The web
+connector UI doesn't let you attach a custom `Authorization` header, so use
+the query-parameter form as the connector URL:
+
+```
+https://<repl-url>/mcp?token=<token>
+```
+
+**Cursor:** Settings → MCP → Add new MCP server (or edit `~/.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "assist-memory": {
+      "url": "https://<repl-url>/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+**Other agent tools** (Windsurf, Cline, custom agents, anything
+MCP-compatible): point the client at `https://<repl-url>/mcp` with transport
+`streamable-http`. If the client supports custom headers, send
+`Authorization: Bearer <token>`; if not, append `?token=<token>` to the URL.
 
 ## Tool overview
 
@@ -92,3 +115,5 @@ Uploading a debug-capture ZIP (a `session.json` export with
   count (≤ 2000), and decompression bombs (≤ 4 × `MAX_UPLOAD_MB`).
 - Values matching common credential patterns are stored but tagged
   `possible-secret` with a warning in the response.
+- Logs record request/tool metadata only (names, codes, durations,
+  user-agents) — never tokens, query strings, or stored values.
