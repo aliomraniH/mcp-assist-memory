@@ -16,6 +16,7 @@ class Config:
     max_upload_mb: int = 25
     max_total_storage_mb: int = 500
     port: int = 8000
+    log_level: str = "INFO"
 
     @property
     def max_upload_bytes(self) -> int:
@@ -42,4 +43,5 @@ def load_config() -> Config:
         max_upload_mb=int(os.environ.get("MAX_UPLOAD_MB", "25")),
         max_total_storage_mb=int(os.environ.get("MAX_TOTAL_STORAGE_MB", "500")),
         port=int(os.environ.get("PORT", "8000")),
+        log_level=os.environ.get("LOG_LEVEL", "INFO"),
     )

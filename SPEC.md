@@ -23,6 +23,7 @@ Single source of truth: environment variables, read once at startup.
 | `MAX_UPLOAD_MB` | no | `25` | Per-upload size cap (decoded bytes) |
 | `MAX_TOTAL_STORAGE_MB` | no | `500` | Global cap across DB values + blobs |
 | `PORT` | no | `8000` | HTTP listen port (Replit sets this) |
+| `LOG_LEVEL` | no | `INFO` | Python log level for access/tool/auth logs |
 
 Server binds `0.0.0.0:$PORT`. Entrypoint: `main.py`.
 
@@ -30,8 +31,13 @@ Server binds `0.0.0.0:$PORT`. Entrypoint: `main.py`.
 
 ## 2. Authentication
 
-- Every HTTP request to the MCP endpoint (`/mcp`) MUST carry
-  `Authorization: Bearer <MCP_AUTH_TOKEN>` (exact, constant-time comparison).
+- Every HTTP request to the MCP endpoint (`/mcp`) MUST present
+  `MCP_AUTH_TOKEN` one of two ways (both constant-time compared):
+  1. `Authorization: Bearer <token>` header — preferred; works with Claude
+     Code CLI/Desktop, Cursor, and most MCP clients;
+  2. `?token=<token>` query parameter — fallback for clients that cannot
+     send custom headers (e.g. the claude.ai web connector UI). The query
+     string is never written to logs.
   Anything else → HTTP **401** with body `{"error": "unauthorized"}` and
   `WWW-Authenticate: Bearer` header. Enforced by ASGI middleware *before* any
   MCP routing, so no tool, resource, or session negotiation is reachable
@@ -445,7 +451,15 @@ matched content (log only pattern name + key/artifact id).
 | `artifact_get` chunk per call | 1 MB (page with offset/length for larger files) | `INVALID_ARGUMENT` |
 | `session_list` limit | ≤ 200 | clamped |
 
-### 7.5 No outbound calls
+### 7.5 Observability
+Structured logs (stderr, level from `LOG_LEVEL`):
+- access log per request: method, path, status, duration, user-agent —
+  query strings are never logged (they may carry the auth token);
+- tool log per call: tool name, outcome (ok / error code / crash), duration —
+  never argument values or stored content;
+- auth log on 401s: method, path, user-agent — never token values.
+
+### 7.6 No outbound calls
 The server imports no HTTP client and makes no network requests. Nothing in
 config accepts a third-party credential.
 
