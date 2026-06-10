@@ -1,0 +1,10 @@
+modules = ["python-3.11"]
+run = "python main.py"
+entrypoint = "main.py"
+
+[deployment]
+run = ["python", "main.py"]
+deploymentTarget = "vm"
+
+[env]
+DATA_DIR = "./data"
