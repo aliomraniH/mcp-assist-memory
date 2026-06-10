@@ -32,11 +32,11 @@ class Config:
 
 
 def load_config() -> Config:
+    # MCP_AUTH_TOKEN is optional: when a separate admin database is configured
+    # the dashboard manages the live token, and an env value (if present) is
+    # only used to seed the very first token. It is required only as a fallback
+    # when no admin database is available.
     token = os.environ.get("MCP_AUTH_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError(
-            "MCP_AUTH_TOKEN environment variable is required; refusing to start"
-        )
     return Config(
         auth_token=token,
         data_dir=Path(os.environ.get("DATA_DIR", "./data")),

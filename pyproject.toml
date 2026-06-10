@@ -5,6 +5,7 @@ description = "Shared memory, session, handoff, and artifact MCP server for cros
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.9",
+    "psycopg[binary]>=3.1",
     "starlette>=0.37",
     "uvicorn>=0.30",
 ]

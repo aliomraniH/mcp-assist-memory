@@ -10,7 +10,10 @@ import secrets as _secrets
 import shutil
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .admin_store import AdminStore
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -734,13 +737,33 @@ async def _health(_: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
-def create_app(config: Config, backend: StorageBackend | None = None) -> Starlette:
-    """Full ASGI app: bearer auth → health route + Streamable HTTP MCP at /mcp."""
+def create_app(
+    config: Config,
+    backend: StorageBackend | None = None,
+    *,
+    token_provider: Callable[[], str | None] | None = None,
+    admin: "AdminStore | None" = None,
+    session_secret: str | None = None,
+) -> Starlette:
+    """Full ASGI app: bearer auth → health route + Streamable HTTP MCP at /mcp.
+
+    When ``admin`` is supplied, the live token is managed in a separate
+    database and exposed/rotated via the password-protected /admin dashboard;
+    ``token_provider`` then reads the current token from that store. With no
+    ``admin``, behaviour is unchanged: auth uses the fixed ``config.auth_token``.
+    """
     backend = backend or SqliteFsBackend(config.data_dir, config.max_total_storage_bytes)
     mcp = build_mcp(config, backend)
     app = mcp.streamable_http_app()
     app.router.routes.insert(0, Route("/", _health, methods=["GET"]))
+    if admin is not None:
+        from .dashboard import build_routes
+
+        for route in reversed(build_routes(admin, session_secret or "")):
+            app.router.routes.insert(0, route)
+    if token_provider is None:
+        token_provider = lambda: config.auth_token  # noqa: E731
     # Outermost first: access log sees every request, including 401s.
-    app.add_middleware(BearerAuthMiddleware, token=config.auth_token)
+    app.add_middleware(BearerAuthMiddleware, token_provider=token_provider)
     app.add_middleware(AccessLogMiddleware)
     return app
