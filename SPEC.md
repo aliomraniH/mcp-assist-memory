@@ -338,16 +338,21 @@ target namespace, so full revision history is the handoff history.
      "sha256", "uploaded_at", "source_surface", "session_id", "tags",
      "is_debug_capture"}], "count"}`
 
-**`artifact_get(artifact_id, mode?)`**
+**`artifact_get(artifact_id, mode?, offset?, length?)`**
 - `mode`: `metadata` (default) `| text | base64`.
   - `metadata`: row fields only, no content.
-  - `text`: UTF-8 decode; refused with `BINARY_NOT_TEXT` if bytes aren't
-    valid UTF-8 or mime is binary-ish.
-  - `text`/`base64`: returned content capped at **1 MB** (of returned-string
-    bytes); above that → `INVALID_ARGUMENT` telling the caller to use
-    `metadata` (artifact remains downloadable out-of-band in a future
-    version; v1 has no ranged fetch).
-- → metadata fields + (`"content"`, `"encoding"`) when mode ≠ metadata.
+  - `text`/`base64`: returns a byte range of the artifact. `offset` (default
+    0) and `length` (default = remaining bytes) select the range; the
+    returned chunk is capped at **1 MB** per call (`length` > 1 MB →
+    `INVALID_ARGUMENT`). Files of any size are retrievable by paging with
+    `offset`/`length`; the response always carries `size_bytes`, `offset`,
+    `length` (actual bytes returned), and `eof` so callers know when to stop.
+  - `text`: the selected chunk is UTF-8 decoded (strict); refused with
+    `BINARY_NOT_TEXT` if it doesn't decode (including a range boundary that
+    splits a multi-byte character — the error suggests base64 mode).
+  - `offset` ≥ file size → `INVALID_ARGUMENT`.
+- → metadata fields + (`"content"`, `"encoding"`, `"offset"`, `"length"`,
+  `"eof"`) when mode ≠ metadata.
 - Errors: `NOT_FOUND`, `BINARY_NOT_TEXT`, `INVALID_ARGUMENT`.
 
 ### 5.5 Server meta
@@ -437,7 +442,7 @@ matched content (log only pattern name + key/artifact id).
 | Total storage (db file + blobs) | `MAX_TOTAL_STORAGE_MB` (500) | `STORAGE_FULL` with `used_mb`/`limit_mb` |
 | ZIP decompressed | 4 × `MAX_UPLOAD_MB` | `ZIP_UNSAFE` |
 | ZIP entry count | 2000 | `ZIP_UNSAFE` |
-| `artifact_get` returned content | 1 MB | `INVALID_ARGUMENT` |
+| `artifact_get` chunk per call | 1 MB (page with offset/length for larger files) | `INVALID_ARGUMENT` |
 | `session_list` limit | ≤ 200 | clamped |
 
 ### 7.5 No outbound calls
@@ -508,20 +513,18 @@ tests. All listed test cases from the task brief are covered 1:1.
 ## 10. Out of scope (v1)
 
 - Multi-user auth / OAuth, per-namespace permissions
-- Artifact update/delete, ranged artifact download
+- Artifact update/delete
 - FTS5 ranking, vector search
 - Replit Object Storage / Postgres backends (interface-ready, not implemented)
 - Outbound integrations of any kind (by design, permanent)
 
 ---
 
-## 11. Open questions for approval
+## 11. Approved decisions (2026-06-10)
 
-1. **Handoff key**: spec reserves `handoff/latest` per namespace (one handoff
-   chain per namespace, history = revisions). OK, or do you want per-surface
-   handoff keys?
-2. **Memory value cap at 256 KB** (push bigger things to artifacts) — OK?
-3. **`artifact_get` over 1 MB**: v1 simply refuses content modes (metadata
-   still works); ranged fetch deferred. OK?
-4. Tool errors carry structured `{"code", "message"}` JSON in the MCP error
-   text — OK as the error contract?
+1. **Handoff key**: one chain per namespace at `handoff/latest` — approved.
+2. **Memory value cap at 256 KB** — approved.
+3. **Large artifacts**: supported from v1 via ranged `artifact_get`
+   (`offset`/`length` paging, ≤ 1 MB per call) — per owner request.
+4. **Error contract**: `{"code", "message"}` JSON in MCP tool errors —
+   approved.
