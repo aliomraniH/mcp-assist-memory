@@ -4,20 +4,28 @@ This database is deliberately kept separate from the MCP memory store (which
 lives in SQLite under DATA_DIR). It holds only token-management data — never
 any agent memory, sessions, handoffs, or artifacts.
 
-The active token is cached in-process so the auth middleware does not hit the
-database on every request. The deployment runs a single instance (Reserved
-VM), so the cache is authoritative; rotations update both the database and the
-cache atomically.
+The active token is cached in-process (with a short TTL) so the auth
+middleware does not hit the database on every request. The deployment runs a
+single instance (Reserved VM), so the local cache is effectively authoritative
+and rotations refresh it immediately. The TTL additionally bounds staleness to
+a few seconds if the process is ever scaled horizontally, so a rotation on one
+process is picked up by every other process within ``CACHE_TTL_SECONDS``.
 """
 
 from __future__ import annotations
 
 import secrets
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 
 import psycopg
+
+# How long a cached token read is trusted before it is re-validated against the
+# database. Keeps the auth hot path off the DB while bounding cross-process
+# staleness after a rotation.
+CACHE_TTL_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -31,6 +39,7 @@ class AdminStore:
         self._dsn = dsn
         self._lock = threading.Lock()
         self._cache: str | None = None
+        self._cache_at: float = 0.0
         self._init_db()
 
     def _connect(self) -> psycopg.Connection:
@@ -48,16 +57,24 @@ class AdminStore:
                 )
                 """
             )
+            # Enforce at most one active token row at the database level so a
+            # race between set_token/ensure_token cannot leave two active rows.
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uniq_admin_auth_token_active "
+                "ON admin_auth_tokens (active) WHERE active"
+            )
             conn.commit()
 
     def get_active_token(self) -> str | None:
+        now = time.monotonic()
         with self._lock:
-            if self._cache is not None:
+            if self._cache is not None and now - self._cache_at < CACHE_TTL_SECONDS:
                 return self._cache
         info = self.info()
         token = info.token if info else None
         with self._lock:
             self._cache = token
+            self._cache_at = time.monotonic()
         return token
 
     def info(self) -> TokenInfo | None:
