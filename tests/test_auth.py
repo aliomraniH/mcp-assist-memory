@@ -65,3 +65,27 @@ def test_correct_token_reaches_mcp(tmp_path):
         assert response.status_code == 200
         body = response.json()
         assert body["result"]["serverInfo"]["name"] == "assist-memory"
+
+
+def test_query_param_token_works_for_headerless_clients(tmp_path):
+    """Clients that can't send custom headers (e.g. claude.ai web connectors)
+    can authenticate with ?token=<MCP_AUTH_TOKEN> instead."""
+    with make_client(tmp_path) as client:
+        response = client.post(
+            f"/mcp?token={TEST_TOKEN}", json=INIT_BODY, headers=MCP_HEADERS
+        )
+        assert response.status_code == 200
+        assert response.json()["result"]["serverInfo"]["name"] == "assist-memory"
+
+
+def test_wrong_query_param_token_is_401(tmp_path):
+    with make_client(tmp_path) as client:
+        assert client.post(
+            "/mcp?token=wrong", json=INIT_BODY, headers=MCP_HEADERS
+        ).status_code == 401
+        # a wrong header is not rescued by also being wrong in the query
+        assert client.post(
+            "/mcp?token=wrong",
+            json=INIT_BODY,
+            headers={**MCP_HEADERS, "Authorization": "Bearer wrong"},
+        ).status_code == 401

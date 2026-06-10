@@ -8,13 +8,17 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 import uvicorn
 
 from assist_memory.config import load_config
+from assist_memory.observability import setup_logging
 from assist_memory.server import create_app
 
 
 def main() -> None:
     config = load_config()
+    setup_logging(config.log_level)
     app = create_app(config)
-    uvicorn.run(app, host="0.0.0.0", port=config.port)
+    # uvicorn's access log would print full URLs including ?token=...;
+    # AccessLogMiddleware provides a query-string-free access log instead.
+    uvicorn.run(app, host="0.0.0.0", port=config.port, access_log=False)
 
 
 if __name__ == "__main__":

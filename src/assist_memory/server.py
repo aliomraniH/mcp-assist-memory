@@ -22,6 +22,7 @@ from starlette.routing import Route
 from . import __version__
 from .auth import BearerAuthMiddleware
 from .config import MB, Config
+from .observability import AccessLogMiddleware, logged
 from .models import (
     ARTIFACT_CHUNK_BYTES,
     ARTIFACT_GET_MODES,
@@ -141,6 +142,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
     # ------------------------------------------------------------ memory
 
     @mcp.tool()
+    @logged
     def memory_save(
         key: str,
         value: Any,
@@ -153,6 +155,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         return _save_memory(namespace, key, value, kind, tags, source_surface)
 
     @mcp.tool()
+    @logged
     def memory_get(
         key: str, namespace: str | None = None, revision: int | None = None
     ) -> dict[str, Any]:
@@ -182,6 +185,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         }
 
     @mcp.tool()
+    @logged
     def memory_list(
         namespace: str | None = None,
         kind: str | None = None,
@@ -200,6 +204,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         }
 
     @mcp.tool()
+    @logged
     def memory_search(query: str, namespace: str | None = None) -> dict[str, Any]:
         """Case-insensitive substring search over keys, tags, and values."""
         ns = validate_namespace(namespace)
@@ -213,6 +218,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         }
 
     @mcp.tool()
+    @logged
     def memory_history(key: str, namespace: str | None = None) -> dict[str, Any]:
         """All revisions of a key (ascending), including tombstones."""
         ns = validate_namespace(namespace)
@@ -238,6 +244,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         }
 
     @mcp.tool()
+    @logged
     def memory_revert(
         key: str, to_revision: int, namespace: str | None = None
     ) -> dict[str, Any]:
@@ -266,6 +273,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         }
 
     @mcp.tool()
+    @logged
     def memory_delete(key: str, namespace: str | None = None) -> dict[str, Any]:
         """Tombstone delete: appends a delete revision; history is preserved."""
         ns = validate_namespace(namespace)
@@ -281,6 +289,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
     # ------------------------------------------------------------ sessions
 
     @mcp.tool()
+    @logged
     def session_start(
         surface: str,
         namespace: str | None = None,
@@ -313,6 +322,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         }
 
     @mcp.tool()
+    @logged
     def session_log(
         session_id: str, type: str, message: str, data: Any = None
     ) -> dict[str, Any]:
@@ -323,6 +333,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         return {"session_id": session_id, "seq": seq, "timestamp": timestamp}
 
     @mcp.tool()
+    @logged
     def session_end(session_id: str, summary: str) -> dict[str, Any]:
         """Close a session and set its final summary."""
         session = backend.close_session(session_id, summary)
@@ -334,6 +345,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         }
 
     @mcp.tool()
+    @logged
     def session_list(
         namespace: str | None = None,
         status: str | None = None,
@@ -364,6 +376,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         }
 
     @mcp.tool()
+    @logged
     def session_get(session_id: str) -> dict[str, Any]:
         """Full session record including ordered events and linked artifacts."""
         session = backend.get_session(session_id)
@@ -403,6 +416,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
     # ------------------------------------------------------------ handoff
 
     @mcp.tool()
+    @logged
     def handoff_save(
         from_surface: str,
         content: str,
@@ -431,6 +445,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         }
 
     @mcp.tool()
+    @logged
     def handoff_load(namespace: str | None = None) -> dict[str, Any]:
         """Load the latest handoff plus its revision history pointer for backtracking."""
         ns = validate_namespace(namespace)
@@ -511,6 +526,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         )
 
     @mcp.tool()
+    @logged
     def artifact_upload(
         filename: str,
         content: str,
@@ -609,6 +625,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         }
 
     @mcp.tool()
+    @logged
     def artifact_list(
         namespace: str | None = None, session_id: str | None = None
     ) -> dict[str, Any]:
@@ -622,6 +639,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         }
 
     @mcp.tool()
+    @logged
     def artifact_get(
         artifact_id: str,
         mode: str | None = None,
@@ -684,6 +702,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
     # ------------------------------------------------------------ meta
 
     @mcp.tool()
+    @logged
     def server_status() -> dict[str, Any]:
         """Storage usage, entity counts, version, and configured limits."""
         usage = backend.usage()
@@ -721,5 +740,7 @@ def create_app(config: Config, backend: StorageBackend | None = None) -> Starlet
     mcp = build_mcp(config, backend)
     app = mcp.streamable_http_app()
     app.router.routes.insert(0, Route("/", _health, methods=["GET"]))
+    # Outermost first: access log sees every request, including 401s.
     app.add_middleware(BearerAuthMiddleware, token=config.auth_token)
+    app.add_middleware(AccessLogMiddleware)
     return app
