@@ -43,7 +43,11 @@ class AdminStore:
         self._init_db()
 
     def _connect(self) -> psycopg.Connection:
-        return psycopg.connect(self._dsn)
+        # prepare_threshold=None disables psycopg3's server-side prepared
+        # statements. This is required for PgBouncer in transaction-pooling
+        # mode (e.g. Neon's pooled endpoint), where prepared statements span
+        # connections and break. It is harmless on a direct Postgres endpoint.
+        return psycopg.connect(self._dsn, prepare_threshold=None)
 
     def _init_db(self) -> None:
         with self._connect() as conn, conn.cursor() as cur:
