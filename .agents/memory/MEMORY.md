@@ -1,1 +1,0 @@
-- [Admin token dashboard](admin-token-dashboard.md) — MCP bearer token is dashboard-managed in a separate Postgres DB; cache has a 5s TTL (never cache indefinitely) and one active row enforced by a partial unique index.

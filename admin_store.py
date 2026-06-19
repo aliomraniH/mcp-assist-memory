@@ -1,17 +1,15 @@
-"""Separate PostgreSQL store for the dashboard-managed auth token.
+"""PostgreSQL store for the dashboard-managed MCP auth token.
 
-This database is deliberately kept separate from the MCP memory store (which
-lives in SQLite under DATA_DIR). It holds only token-management data — never
-any agent memory, sessions, handoffs, or artifacts.
+Lives in the same database as the memory store but a separate table
+(``admin_auth_tokens``) — it holds only token-management data, never agent
+memory. The table is self-created by ``init()`` at boot (it is intentionally not
+part of the numbered memory migrations, which stay focused on the data schema).
 
-The active token is cached in-process (with a short TTL) so the auth
-middleware does not hit the database on every request. The deployment runs a
-single instance (Reserved VM), so the local cache is effectively authoritative
-and rotations refresh it immediately. The TTL additionally bounds staleness to
-a few seconds if the process is ever scaled horizontally, so a rotation on one
-process is picked up by every other process within ``CACHE_TTL_SECONDS``.
+The active token is cached in-process (short TTL) so the auth middleware does
+not hit the DB on every request. The deployment is a single Reserved VM, so the
+cache is effectively authoritative and rotations refresh it immediately; the TTL
+bounds staleness to a few seconds if ever scaled horizontally.
 """
-
 from __future__ import annotations
 
 import secrets
@@ -22,9 +20,6 @@ from datetime import datetime
 
 import psycopg
 
-# How long a cached token read is trusted before it is re-validated against the
-# database. Keeps the auth hot path off the DB while bounding cross-process
-# staleness after a rotation.
 CACHE_TTL_SECONDS = 5.0
 
 
@@ -43,19 +38,14 @@ class AdminStore:
         self._initialized = False
 
     def _connect(self) -> psycopg.Connection:
-        # prepare_threshold=None disables psycopg3's server-side prepared
-        # statements. This is required for PgBouncer in transaction-pooling
-        # mode (e.g. Neon's pooled endpoint), where prepared statements span
-        # connections and break. It is harmless on a direct Postgres endpoint.
+        # prepare_threshold=None disables psycopg3 server-side prepared statements,
+        # required for PgBouncer transaction pooling (Neon's pooled endpoint);
+        # harmless on a direct endpoint.
         return psycopg.connect(self._dsn, prepare_threshold=None)
 
     def init(self) -> None:
         """Create the token table. Deferred from __init__ so the store can be
         built at import time without a live DB; called from the app lifespan."""
-        self._init_db()
-        self._initialized = True
-
-    def _init_db(self) -> None:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
@@ -67,13 +57,13 @@ class AdminStore:
                 )
                 """
             )
-            # Enforce at most one active token row at the database level so a
-            # race between set_token/ensure_token cannot leave two active rows.
+            # At most one active token row, enforced at the DB level.
             cur.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uniq_admin_auth_token_active "
                 "ON admin_auth_tokens (active) WHERE active"
             )
             conn.commit()
+        self._initialized = True
 
     def get_active_token(self) -> str | None:
         now = time.monotonic()
@@ -115,12 +105,9 @@ class AdminStore:
         return token
 
     def ensure_token(self, seed: str | None = None) -> str:
-        """Return the active token, creating one on first boot.
-
-        Prefers an explicit ``seed`` (e.g. a pre-existing MCP_AUTH_TOKEN) so
-        existing client registrations keep working; otherwise generates a new
-        strong token.
-        """
+        """Return the active token, creating one on first boot. Prefers an
+        explicit ``seed`` (e.g. MCP_AUTH_TOKEN) so existing client registrations
+        keep working; otherwise generates a strong token."""
         existing = self.get_active_token()
         if existing:
             return existing
