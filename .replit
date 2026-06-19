@@ -1,9 +1,46 @@
-modules = ["python-3.11"]
+modules = ["python-3.11", "postgresql-16"]
 run = "python main.py"
 entrypoint = "main.py"
 
 [deployment]
 run = ["python", "main.py"]
-# Reserved VM (not Autoscale): Phase 0's durability gate needs the process/disk
-# to persist, and the Postgres backend keeps one long-lived connection pool.
 deploymentTarget = "vm"
+
+[env]
+DATA_DIR = "./data"
+
+[nix]
+channel = "stable-25_05"
+packages = ["postgresql"]
+
+[agent]
+expertMode = true
+integrations = ["github:1.0.0"]
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PORT=5000 python main.py"
+waitForPort = 5000
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[ports]]
+localPort = 5000
+externalPort = 80

@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     database_url: SecretStr | None = None
     mcp_auth_token: SecretStr = SecretStr("")
 
+    # Admin dashboard (/admin): password gate + signed-session secret. When
+    # admin_password is unset the dashboard refuses logins; session_secret falls
+    # back to admin_password, then to a per-process random value.
+    admin_password: SecretStr | None = None
+    session_secret: SecretStr | None = None
+
     # Declared now, unused until Phase 3 (embeddings/recall). Never read in Phase 0.
     voyage_api_key: SecretStr | None = None
     openai_api_key: SecretStr | None = None

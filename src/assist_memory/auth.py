@@ -6,15 +6,20 @@ Two ways to present the same MCP_AUTH_TOKEN:
 - ?token=<token> query parameter  (fallback for clients that cannot send
   custom headers, e.g. the claude.ai web connector UI)
 
-The only anonymous routes are GET/HEAD / and GET/HEAD /healthz (liveness/health
-probes). Token values are never logged; the access log omits query strings
-entirely.
+The anonymous routes are GET/HEAD / and GET/HEAD /healthz (liveness/health
+probes) and the /admin dashboard (which enforces its own password session).
+Token values are never logged; the access log omits query strings entirely.
+
+The expected token is read on every request via ``token_provider`` so a
+rotation in the /admin dashboard takes effect immediately. A fixed ``token`` is
+still accepted for the static case and the test suite.
 """
 
 from __future__ import annotations
 
 import logging
 import secrets
+from typing import Callable
 from urllib.parse import parse_qs
 
 from starlette.responses import JSONResponse
@@ -26,20 +31,31 @@ QUERY_TOKEN_PARAM = "token"
 
 
 class BearerAuthMiddleware:
-    def __init__(self, app: ASGIApp, token: str):
+    def __init__(
+        self,
+        app: ASGIApp,
+        token: str | None = None,
+        token_provider: Callable[[], str | None] | None = None,
+    ):
         self.app = app
-        self._expected_header = f"Bearer {token}".encode()
-        self._expected_token = token.encode()
+        if token_provider is None:
+            token_provider = lambda: token  # noqa: E731
+        self._token_provider = token_provider
 
     def _authorized(self, scope: Scope) -> bool:
+        expected = self._token_provider()
+        if not expected:
+            return False
+        expected_header = f"Bearer {expected}".encode()
+        expected_token = expected.encode()
         for name, value in scope.get("headers", []):
             if name.lower() == b"authorization":
-                if secrets.compare_digest(value, self._expected_header):
+                if secrets.compare_digest(value, expected_header):
                     return True
                 break
         params = parse_qs(scope.get("query_string", b"").decode("latin-1"))
         for candidate in params.get(QUERY_TOKEN_PARAM, []):
-            if secrets.compare_digest(candidate.encode("latin-1"), self._expected_token):
+            if secrets.compare_digest(candidate.encode("latin-1"), expected_token):
                 return True
         return False
 
@@ -47,7 +63,12 @@ class BearerAuthMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        if scope["path"] in ("/", "/healthz") and scope["method"] in ("GET", "HEAD"):
+        path = scope["path"]
+        if path in ("/", "/healthz") and scope["method"] in ("GET", "HEAD"):
+            await self.app(scope, receive, send)
+            return
+        # The /admin dashboard enforces its own password-based session auth.
+        if path == "/admin" or path.startswith("/admin/"):
             await self.app(scope, receive, send)
             return
         if not self._authorized(scope):

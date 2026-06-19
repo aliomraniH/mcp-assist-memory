@@ -13,8 +13,10 @@ lets Replit restart the VM rather than hanging.
 from __future__ import annotations
 
 import asyncio
+import secrets as _secrets
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import structlog
 from fastapi import FastAPI
@@ -23,13 +25,17 @@ from psycopg_pool import AsyncConnectionPool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from .admin_store import AdminStore
 from .auth import BearerAuthMiddleware
 from .config import Settings, get_settings
+from .dashboard import build_routes
 from .observability import AccessLogMiddleware, setup_logging
 from .server import build_mcp
 from .storage.postgres import PostgresBackend
 
 log = structlog.get_logger(__name__)
+
+_MIGRATION = Path(__file__).resolve().parents[2] / "migrations" / "0001_init.sql"
 
 
 def create_pool(dsn: str) -> AsyncConnectionPool:
@@ -72,14 +78,36 @@ backend = PostgresBackend(
 mcp = build_mcp(settings, backend)
 _mcp_app = mcp.streamable_http_app()
 
+# The live MCP auth token is managed in Postgres (admin_auth_tokens) and
+# rotatable via the password-protected /admin dashboard. The store is built
+# lazily here (no DB I/O) and initialized in the lifespan. With no DATABASE_URL
+# (tests/dev import), there is no admin store and auth falls back to the static
+# settings token.
+_admin: AdminStore | None = (
+    AdminStore(settings.database_url.get_secret_value())
+    if settings.database_url is not None
+    else None
+)
+_admin_password = (
+    settings.admin_password.get_secret_value() if settings.admin_password else ""
+)
+_session_secret = (
+    (settings.session_secret.get_secret_value() if settings.session_secret else "")
+    or _admin_password
+    or _secrets.token_urlsafe(32)
+)
+
+
+def _token_provider() -> str | None:
+    if _admin is not None:
+        return _admin.get_active_token()
+    return settings.auth_token or None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     setup_logging(settings.log_level)
     log.info("startup", **settings.as_log_safe())
-
-    if not settings.auth_token:
-        raise RuntimeError("MCP_AUTH_TOKEN is required; refusing to start")
 
     pool = create_pool(settings.database_url_str())
     await pool.open()  # returns immediately (min_size=0)
@@ -95,6 +123,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     backend.pool = pool
     app.state.pool = pool
+
+    # Apply the frozen schema (idempotent; everything is IF NOT EXISTS). The
+    # managed Replit/Neon database uses a single role, so the app self-migrates
+    # on startup — mirroring the admin store's table self-creation. `make
+    # migrate` remains available for an explicit owner-role workflow.
+    if _MIGRATION.exists():
+        async with pool.connection() as conn:
+            await conn.execute(_MIGRATION.read_text())
+            await conn.commit()
+        log.info("migrations_applied")
+
+    # Create the admin token table and ensure a live token exists, seeding from
+    # MCP_AUTH_TOKEN on first boot so any pre-existing client registration keeps
+    # working. After this the token is owned by the /admin dashboard.
+    if _admin is not None:
+        _admin.init()
+        _admin.ensure_token(seed=settings.auth_token or None)
+        if not _admin_password:
+            log.warning("admin_password_unset")  # /admin login disabled until set
+    elif not settings.auth_token:
+        raise RuntimeError(
+            "No DATABASE_URL admin store and no MCP_AUTH_TOKEN fallback; "
+            "refusing to start without an auth token."
+        )
     log.info("ready")
 
     # Run the FastMCP streamable-HTTP transport's own (untouched) lifespan so its
@@ -126,13 +178,18 @@ async def _healthz(request: Request) -> JSONResponse:
     )
 
 
-# /healthz is registered before the catch-all mount that serves the MCP tools at
-# /mcp. Bearer auth wraps the whole stack and lets GET /healthz and / through.
+# /healthz and the /admin dashboard are registered before the catch-all mount
+# that serves the MCP tools at /mcp. Bearer auth wraps the whole stack and lets
+# GET /healthz, GET /, and the (self-authenticating) /admin routes through.
 app = FastAPI(title="assist-memory", lifespan=lifespan)
 app.add_api_route("/healthz", _healthz, methods=["GET"])
+if _admin is not None:
+    for route in build_routes(_admin, _session_secret, _admin_password):
+        app.router.routes.append(route)
 app.mount("/", _mcp_app)
-# Outermost first: the access log sees every request, including 401s.
-app.add_middleware(BearerAuthMiddleware, token=settings.auth_token)
+# Outermost first: the access log sees every request, including 401s. The token
+# provider reads the live (rotatable) token from the admin store on each request.
+app.add_middleware(BearerAuthMiddleware, token_provider=_token_provider)
 app.add_middleware(AccessLogMiddleware)
 
 
