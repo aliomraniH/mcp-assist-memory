@@ -1,25 +1,11 @@
-"""Replit / production entrypoint: binds 0.0.0.0 on $PORT."""
+"""Replit / production entrypoint: Postgres-backed FastAPI app on $PORT."""
 
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-import uvicorn
-
-from assist_memory.config import load_config
-from assist_memory.observability import setup_logging
-from assist_memory.server import create_app
-
-
-def main() -> None:
-    config = load_config()
-    setup_logging(config.log_level)
-    app = create_app(config)
-    # uvicorn's access log would print full URLs including ?token=...;
-    # AccessLogMiddleware provides a query-string-free access log instead.
-    uvicorn.run(app, host="0.0.0.0", port=config.port, access_log=False)
-
+from assist_memory.app import main
 
 if __name__ == "__main__":
     main()

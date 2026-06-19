@@ -4,7 +4,6 @@ entrypoint = "main.py"
 
 [deployment]
 run = ["python", "main.py"]
+# Reserved VM (not Autoscale): Phase 0's durability gate needs the process/disk
+# to persist, and the Postgres backend keeps one long-lived connection pool.
 deploymentTarget = "vm"
-
-[env]
-DATA_DIR = "./data"

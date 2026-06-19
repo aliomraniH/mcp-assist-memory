@@ -6,8 +6,9 @@ Two ways to present the same MCP_AUTH_TOKEN:
 - ?token=<token> query parameter  (fallback for clients that cannot send
   custom headers, e.g. the claude.ai web connector UI)
 
-The only anonymous route is GET/HEAD / (health probe). Token values are never
-logged; the access log omits query strings entirely.
+The only anonymous routes are GET/HEAD / and GET/HEAD /healthz (liveness/health
+probes). Token values are never logged; the access log omits query strings
+entirely.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ class BearerAuthMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        if scope["path"] == "/" and scope["method"] in ("GET", "HEAD"):
+        if scope["path"] in ("/", "/healthz") and scope["method"] in ("GET", "HEAD"):
             await self.app(scope, receive, send)
             return
         if not self._authorized(scope):
