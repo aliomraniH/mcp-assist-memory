@@ -9,11 +9,8 @@ import mimetypes
 import secrets as _secrets
 import shutil
 from datetime import datetime, timezone
-from pathlib import PurePosixPath
-from typing import Any, Callable, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .admin_store import AdminStore
+from pathlib import Path, PurePosixPath
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -109,7 +106,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
                 tags.append(POSSIBLE_SECRET_TAG)
             warnings.append(secret_warning(hits))
 
-    def _save_memory(
+    async def _save_memory(
         namespace: str | None,
         key: str,
         value: Any,
@@ -132,8 +129,8 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
             )
         warnings: list[str] = []
         _scan_and_tag(stored, tag_list, warnings)
-        backend.ensure_capacity(size)
-        rev = backend.save_revision(ns, key, stored, is_json, kind_v, tag_list, surface)
+        await backend.ensure_capacity(size)
+        rev = await backend.save_revision(ns, key, stored, is_json, kind_v, tag_list, surface)
         return {
             "namespace": ns,
             "key": key,
@@ -146,7 +143,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def memory_save(
+    async def memory_save(
         key: str,
         value: Any,
         namespace: str | None = None,
@@ -155,11 +152,11 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         source_surface: str | None = None,
     ) -> dict[str, Any]:
         """Save a memory entry. Append-only: every call creates a new revision."""
-        return _save_memory(namespace, key, value, kind, tags, source_surface)
+        return await _save_memory(namespace, key, value, kind, tags, source_surface)
 
     @mcp.tool()
     @logged
-    def memory_get(
+    async def memory_get(
         key: str, namespace: str | None = None, revision: int | None = None
     ) -> dict[str, Any]:
         """Get a memory entry. Omit revision for the latest; tombstoned keys are not found."""
@@ -167,7 +164,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         key = validate_key(key)
         if revision is not None and revision < 1:
             raise ToolFault(INVALID_ARGUMENT, "revision must be >= 1")
-        row = backend.get_revision(ns, key, revision)
+        row = await backend.get_revision(ns, key, revision)
         if row is None or (revision is None and row.deleted):
             raise ToolFault(
                 NOT_FOUND,
@@ -189,7 +186,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def memory_list(
+    async def memory_list(
         namespace: str | None = None,
         kind: str | None = None,
         tag: str | None = None,
@@ -199,7 +196,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         ns = validate_namespace(namespace)
         if kind is not None:
             validate_enum(kind, KINDS, "kind", "note")
-        entries = backend.list_entries(ns, kind, tag, prefix)
+        entries = await backend.list_entries(ns, kind, tag, prefix)
         return {
             "namespace": ns,
             "entries": [_revision_meta(e) for e in entries],
@@ -208,12 +205,12 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def memory_search(query: str, namespace: str | None = None) -> dict[str, Any]:
+    async def memory_search(query: str, namespace: str | None = None) -> dict[str, Any]:
         """Case-insensitive substring search over keys, tags, and values."""
         ns = validate_namespace(namespace)
         if not query:
             raise ToolFault(INVALID_ARGUMENT, "query must be a non-empty string")
-        results = backend.search_entries(ns, query)
+        results = await backend.search_entries(ns, query)
         return {
             "namespace": ns,
             "results": [_revision_meta(e, with_preview=True) for e in results],
@@ -222,11 +219,11 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def memory_history(key: str, namespace: str | None = None) -> dict[str, Any]:
+    async def memory_history(key: str, namespace: str | None = None) -> dict[str, Any]:
         """All revisions of a key (ascending), including tombstones."""
         ns = validate_namespace(namespace)
         key = validate_key(key)
-        history = backend.get_history(ns, key)
+        history = await backend.get_history(ns, key)
         if not history:
             raise ToolFault(NOT_FOUND, f"memory entry {key!r} not found in namespace {ns!r}")
         return {
@@ -248,13 +245,13 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def memory_revert(
+    async def memory_revert(
         key: str, to_revision: int, namespace: str | None = None
     ) -> dict[str, Any]:
         """Non-destructive undo: creates a NEW revision copying an older one's value."""
         ns = validate_namespace(namespace)
         key = validate_key(key)
-        target = backend.get_revision(ns, key, to_revision)
+        target = await backend.get_revision(ns, key, to_revision)
         if target is None:
             raise ToolFault(
                 NOT_FOUND, f"revision {to_revision} of {key!r} not found in namespace {ns!r}"
@@ -263,8 +260,8 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
             raise ToolFault(
                 INVALID_ARGUMENT, f"revision {to_revision} is a tombstone; cannot revert to it"
             )
-        backend.ensure_capacity(len((target.value or "").encode("utf-8")))
-        rev = backend.save_revision(
+        await backend.ensure_capacity(len((target.value or "").encode("utf-8")))
+        rev = await backend.save_revision(
             ns, key, target.value, target.value_is_json, target.kind,
             target.tags, target.source_surface,
         )
@@ -277,14 +274,14 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def memory_delete(key: str, namespace: str | None = None) -> dict[str, Any]:
+    async def memory_delete(key: str, namespace: str | None = None) -> dict[str, Any]:
         """Tombstone delete: appends a delete revision; history is preserved."""
         ns = validate_namespace(namespace)
         key = validate_key(key)
-        latest = backend.get_revision(ns, key, None)
+        latest = await backend.get_revision(ns, key, None)
         if latest is None or latest.deleted:
             raise ToolFault(NOT_FOUND, f"memory entry {key!r} not found in namespace {ns!r}")
-        rev = backend.save_revision(
+        rev = await backend.save_revision(
             ns, key, None, False, latest.kind, [], latest.source_surface, deleted=True
         )
         return {"namespace": ns, "key": key, "revision": rev.revision, "deleted": True}
@@ -293,7 +290,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def session_start(
+    async def session_start(
         surface: str,
         namespace: str | None = None,
         label: str | None = None,
@@ -306,16 +303,16 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         if session_id is not None:
             if not session_id or len(session_id) > 256:
                 raise ToolFault(INVALID_ARGUMENT, "session_id must be 1-256 characters")
-            if backend.get_session(session_id) is not None:
+            if await backend.get_session(session_id) is not None:
                 raise ToolFault(SESSION_EXISTS, f"session {session_id!r} already exists")
             sid = session_id
         else:
             stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
             base = f"{stamp}_{slugify(label or 'session')}"
             sid = base
-            while backend.get_session(sid) is not None:
+            while await backend.get_session(sid) is not None:
                 sid = f"{base}-{_secrets.token_hex(2)}"
-        session = backend.create_session(sid, ns, surface_v, summary=summary)
+        session = await backend.create_session(sid, ns, surface_v, summary=summary)
         return {
             "session_id": session.session_id,
             "namespace": ns,
@@ -326,20 +323,20 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def session_log(
+    async def session_log(
         session_id: str, type: str, message: str, data: Any = None
     ) -> dict[str, Any]:
         """Append an event to an open session."""
         if not type:
             raise ToolFault(INVALID_ARGUMENT, "type must be a non-empty string")
-        seq, timestamp = backend.append_event(session_id, type, message, data)
+        seq, timestamp = await backend.append_event(session_id, type, message, data)
         return {"session_id": session_id, "seq": seq, "timestamp": timestamp}
 
     @mcp.tool()
     @logged
-    def session_end(session_id: str, summary: str) -> dict[str, Any]:
+    async def session_end(session_id: str, summary: str) -> dict[str, Any]:
         """Close a session and set its final summary."""
-        session = backend.close_session(session_id, summary)
+        session = await backend.close_session(session_id, summary)
         return {
             "session_id": session.session_id,
             "status": session.status,
@@ -349,7 +346,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def session_list(
+    async def session_list(
         namespace: str | None = None,
         status: str | None = None,
         limit: int | None = None,
@@ -359,7 +356,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         if status is not None:
             validate_enum(status, SESSION_STATUSES, "status", "open")
         lim = 20 if limit is None else max(1, min(limit, 200))
-        sessions = backend.list_sessions(ns, status, lim)
+        sessions = await backend.list_sessions(ns, status, lim)
         return {
             "namespace": ns,
             "sessions": [
@@ -380,12 +377,12 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def session_get(session_id: str) -> dict[str, Any]:
+    async def session_get(session_id: str) -> dict[str, Any]:
         """Full session record including ordered events and linked artifacts."""
-        session = backend.get_session(session_id)
+        session = await backend.get_session(session_id)
         if session is None:
             raise ToolFault(NOT_FOUND, f"session {session_id!r} not found")
-        linked = backend.list_artifacts(session_id=session_id)
+        linked = await backend.list_artifacts(session_id=session_id)
         return {
             "session_id": session.session_id,
             "namespace": session.namespace,
@@ -420,7 +417,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def handoff_save(
+    async def handoff_save(
         from_surface: str,
         content: str,
         namespace: str | None = None,
@@ -430,9 +427,9 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         validate_enum(from_surface, SURFACES, "from_surface", "other")
         if not content:
             raise ToolFault(INVALID_ARGUMENT, "content must be a non-empty string")
-        if session_id is not None and backend.get_session(session_id) is None:
+        if session_id is not None and await backend.get_session(session_id) is None:
             raise ToolFault(INVALID_ARGUMENT, f"unknown session_id {session_id!r}")
-        result = _save_memory(
+        result = await _save_memory(
             namespace,
             HANDOFF_KEY,
             {"content": content, "session_id": session_id, "saved_at": now_iso()},
@@ -449,16 +446,16 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def handoff_load(namespace: str | None = None) -> dict[str, Any]:
+    async def handoff_load(namespace: str | None = None) -> dict[str, Any]:
         """Load the latest handoff plus its revision history pointer for backtracking."""
         ns = validate_namespace(namespace)
-        latest = backend.get_revision(ns, HANDOFF_KEY, None)
+        latest = await backend.get_revision(ns, HANDOFF_KEY, None)
         if latest is None or latest.deleted:
             raise ToolFault(NOT_FOUND, f"no handoff saved in namespace {ns!r}")
         value = latest.decoded_value()
         if not isinstance(value, dict):
             value = {"content": value, "session_id": None, "saved_at": latest.created_at}
-        history = backend.get_history(ns, HANDOFF_KEY)
+        history = await backend.get_history(ns, HANDOFF_KEY)
         return {
             "namespace": ns,
             "content": value.get("content"),
@@ -479,7 +476,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     # ------------------------------------------------------------ artifacts
 
-    def _ingest_debug_capture(
+    async def _ingest_debug_capture(
         ns: str, data: bytes, warnings: list[str]
     ) -> tuple[dict[str, Any] | None, str | None]:
         """Returns (debug_capture response field, session_id to link)."""
@@ -493,9 +490,9 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         meta = capture.session_json.get("metadata") or {}
         surface = map_surface(meta.get("claude_surface"))
         summary = capture.results_summary or "debug-capture import"
-        existing = backend.get_session(sid)
+        existing = await backend.get_session(sid)
         if existing is None:
-            backend.create_session(
+            await backend.create_session(
                 sid,
                 ns,
                 surface,
@@ -505,15 +502,15 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
                 ended_at=parse_iso(meta.get("ended_at")) or now_iso(),
             )
         else:
-            backend.update_session_import(sid, summary)
+            await backend.update_session_import(sid, summary)
 
         brief_key = None
         if capture.brief_text is not None:
             brief_key = f"debug/{sid}/brief"
             tags = ["debug-capture"]
             _scan_and_tag(capture.brief_text, tags, warnings)
-            backend.ensure_capacity(len(capture.brief_text.encode("utf-8")))
-            backend.save_revision(
+            await backend.ensure_capacity(len(capture.brief_text.encode("utf-8")))
+            await backend.save_revision(
                 ns, brief_key, capture.brief_text, False, "handoff", tags, surface
             )
 
@@ -530,7 +527,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def artifact_upload(
+    async def artifact_upload(
         filename: str,
         content: str,
         encoding: str,
@@ -548,7 +545,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         name = PurePosixPath(filename.replace("\\", "/")).name
         if not name or name in (".", ".."):
             raise ToolFault(INVALID_ARGUMENT, f"invalid filename {filename!r}")
-        if session_id is not None and backend.get_session(session_id) is None:
+        if session_id is not None and await backend.get_session(session_id) is None:
             raise ToolFault(INVALID_ARGUMENT, f"unknown session_id {session_id!r}")
 
         if encoding_v == "text":
@@ -572,7 +569,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
                 f"decoded upload is {len(data)} bytes; the per-upload limit is "
                 f"{config.max_upload_mb} MB",
             )
-        backend.ensure_capacity(len(data))
+        await backend.ensure_capacity(len(data))
 
         warnings: list[str] = []
         if encoding_v in ("text", "json"):
@@ -582,7 +579,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         link_session = session_id
         is_capture = False
         if is_zip(data):
-            debug_capture, capture_sid = _ingest_debug_capture(ns, data, warnings)
+            debug_capture, capture_sid = await _ingest_debug_capture(ns, data, warnings)
             if capture_sid is not None:
                 link_session = capture_sid
                 is_capture = True
@@ -596,7 +593,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
                 "text/plain" if encoding_v == "text" else "application/octet-stream"
             )
 
-        artifact = backend.store_artifact(
+        artifact = await backend.store_artifact(
             Artifact(
                 artifact_id=f"art_{_secrets.token_hex(6)}",
                 namespace=ns,
@@ -629,12 +626,12 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def artifact_list(
+    async def artifact_list(
         namespace: str | None = None, session_id: str | None = None
     ) -> dict[str, Any]:
         """List artifact metadata, optionally filtered by session."""
         ns = validate_namespace(namespace)
-        artifacts = backend.list_artifacts(ns, session_id)
+        artifacts = await backend.list_artifacts(ns, session_id)
         return {
             "namespace": ns,
             "artifacts": [a.public_meta() for a in artifacts],
@@ -643,7 +640,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def artifact_get(
+    async def artifact_get(
         artifact_id: str,
         mode: str | None = None,
         offset: int | None = None,
@@ -652,7 +649,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         """Fetch artifact metadata or content. Content modes return at most 1 MB per
         call; page through larger files with offset/length until eof is true."""
         mode_v = validate_enum(mode, ARTIFACT_GET_MODES, "mode", "metadata")
-        artifact = backend.get_artifact(artifact_id)
+        artifact = await backend.get_artifact(artifact_id)
         if artifact is None:
             raise ToolFault(NOT_FOUND, f"artifact {artifact_id!r} not found")
         result = artifact.public_meta()
@@ -677,7 +674,7 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
         want = length if length is not None else min(
             ARTIFACT_CHUNK_BYTES, max(artifact.size_bytes - start, 0)
         )
-        chunk = backend.read_artifact_bytes(artifact_id, start, want) if want else b""
+        chunk = await backend.read_artifact_bytes(artifact_id, start, want) if want else b""
 
         if mode_v == "text":
             try:
@@ -706,10 +703,13 @@ def build_mcp(config: Config, backend: StorageBackend) -> FastMCP:
 
     @mcp.tool()
     @logged
-    def server_status() -> dict[str, Any]:
+    async def server_status() -> dict[str, Any]:
         """Storage usage, entity counts, version, and configured limits."""
-        usage = backend.usage()
-        free = shutil.disk_usage(config.data_dir).free
+        usage = await backend.usage()
+        # The Postgres backend has no data_dir; report the VM filesystem's free
+        # space so the return shape stays identical across backends.
+        probe = config.data_dir if config.data_dir.exists() else Path("/")
+        free = shutil.disk_usage(probe).free
         return {
             "version": __version__,
             "storage": {
@@ -737,33 +737,13 @@ async def _health(_: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
-def create_app(
-    config: Config,
-    backend: StorageBackend | None = None,
-    *,
-    token_provider: Callable[[], str | None] | None = None,
-    admin: "AdminStore | None" = None,
-    session_secret: str | None = None,
-) -> Starlette:
-    """Full ASGI app: bearer auth → health route + Streamable HTTP MCP at /mcp.
-
-    When ``admin`` is supplied, the live token is managed in a separate
-    database and exposed/rotated via the password-protected /admin dashboard;
-    ``token_provider`` then reads the current token from that store. With no
-    ``admin``, behaviour is unchanged: auth uses the fixed ``config.auth_token``.
-    """
+def create_app(config: Config, backend: StorageBackend | None = None) -> Starlette:
+    """Full ASGI app: bearer auth → health route + Streamable HTTP MCP at /mcp."""
     backend = backend or SqliteFsBackend(config.data_dir, config.max_total_storage_bytes)
     mcp = build_mcp(config, backend)
     app = mcp.streamable_http_app()
     app.router.routes.insert(0, Route("/", _health, methods=["GET"]))
-    if admin is not None:
-        from .dashboard import build_routes
-
-        for route in reversed(build_routes(admin, session_secret or "")):
-            app.router.routes.insert(0, route)
-    if token_provider is None:
-        token_provider = lambda: config.auth_token  # noqa: E731
     # Outermost first: access log sees every request, including 401s.
-    app.add_middleware(BearerAuthMiddleware, token_provider=token_provider)
+    app.add_middleware(BearerAuthMiddleware, token=config.auth_token)
     app.add_middleware(AccessLogMiddleware)
     return app

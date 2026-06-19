@@ -40,7 +40,7 @@ class AdminStore:
         self._lock = threading.Lock()
         self._cache: str | None = None
         self._cache_at: float = 0.0
-        self._init_db()
+        self._initialized = False
 
     def _connect(self) -> psycopg.Connection:
         # prepare_threshold=None disables psycopg3's server-side prepared
@@ -48,6 +48,12 @@ class AdminStore:
         # mode (e.g. Neon's pooled endpoint), where prepared statements span
         # connections and break. It is harmless on a direct Postgres endpoint.
         return psycopg.connect(self._dsn, prepare_threshold=None)
+
+    def init(self) -> None:
+        """Create the token table. Deferred from __init__ so the store can be
+        built at import time without a live DB; called from the app lifespan."""
+        self._init_db()
+        self._initialized = True
 
     def _init_db(self) -> None:
         with self._connect() as conn, conn.cursor() as cur:

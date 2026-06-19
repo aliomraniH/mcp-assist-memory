@@ -22,6 +22,7 @@ from ..models import (
     now_iso,
 )
 from .base import StorageBackend
+from .sanitize import sanitize
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory_revisions (
@@ -86,7 +87,7 @@ class SqliteFsBackend(StorageBackend):
 
     # -- capacity -----------------------------------------------------------
 
-    def usage(self) -> StorageUsage:
+    async def usage(self) -> StorageUsage:
         with self._lock:
             used = 0
             for suffix in ("", "-wal", "-shm"):
@@ -113,8 +114,8 @@ class SqliteFsBackend(StorageBackend):
             artifacts=row["artifacts"],
         )
 
-    def ensure_capacity(self, incoming_bytes: int) -> None:
-        used = self.usage().used_bytes
+    async def ensure_capacity(self, incoming_bytes: int) -> None:
+        used = (await self.usage()).used_bytes
         if used + incoming_bytes > self.max_total_storage_bytes:
             mb = 1024 * 1024
             raise ToolFault(
@@ -142,7 +143,7 @@ class SqliteFsBackend(StorageBackend):
             created_at=row["created_at"],
         )
 
-    def save_revision(
+    async def save_revision(
         self,
         namespace: str,
         key: str,
@@ -152,7 +153,12 @@ class SqliteFsBackend(StorageBackend):
         tags: list[str],
         source_surface: str,
         deleted: bool = False,
+        *,
+        event_id: str | None = None,
     ) -> MemoryRevision:
+        # event_id idempotency is a Postgres-backend concern (no column here, and
+        # no Phase-0 tool supplies one); accepted for ABC parity and ignored.
+        value = sanitize(value)
         created_at = now_iso()
         with self._lock:
             cur = self._conn.execute(
@@ -185,7 +191,7 @@ class SqliteFsBackend(StorageBackend):
             source_surface, deleted, created_at,
         )
 
-    def get_revision(
+    async def get_revision(
         self, namespace: str, key: str, revision: int | None
     ) -> MemoryRevision | None:
         with self._lock:
@@ -203,7 +209,7 @@ class SqliteFsBackend(StorageBackend):
                 ).fetchone()
         return self._row_to_revision(row) if row else None
 
-    def _latest_live(self, namespace: str) -> list[MemoryRevision]:
+    async def _latest_live(self, namespace: str) -> list[MemoryRevision]:
         with self._lock:
             rows = self._conn.execute(
                 """SELECT m.* FROM memory_revisions m
@@ -217,14 +223,14 @@ class SqliteFsBackend(StorageBackend):
             ).fetchall()
         return [self._row_to_revision(r) for r in rows]
 
-    def list_entries(
+    async def list_entries(
         self,
         namespace: str,
         kind: str | None = None,
         tag: str | None = None,
         prefix: str | None = None,
     ) -> list[MemoryRevision]:
-        entries = self._latest_live(namespace)
+        entries = await self._latest_live(namespace)
         if kind is not None:
             entries = [e for e in entries if e.kind == kind]
         if tag is not None:
@@ -233,10 +239,10 @@ class SqliteFsBackend(StorageBackend):
             entries = [e for e in entries if e.key.startswith(prefix)]
         return entries
 
-    def search_entries(self, namespace: str, query: str) -> list[MemoryRevision]:
+    async def search_entries(self, namespace: str, query: str) -> list[MemoryRevision]:
         q = query.lower()
         results = []
-        for e in self._latest_live(namespace):
+        for e in await self._latest_live(namespace):
             haystacks = [e.key.lower(), " ".join(e.tags).lower()]
             if e.value is not None:
                 haystacks.append(e.value.lower())
@@ -244,7 +250,7 @@ class SqliteFsBackend(StorageBackend):
                 results.append(e)
         return results
 
-    def get_history(self, namespace: str, key: str) -> list[MemoryRevision]:
+    async def get_history(self, namespace: str, key: str) -> list[MemoryRevision]:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM memory_revisions WHERE namespace=? AND key=? "
@@ -268,7 +274,7 @@ class SqliteFsBackend(StorageBackend):
             event_count=count,
         )
 
-    def create_session(
+    async def create_session(
         self,
         session_id: str,
         namespace: str,
@@ -278,6 +284,7 @@ class SqliteFsBackend(StorageBackend):
         created_at: str | None = None,
         ended_at: str | None = None,
     ) -> Session:
+        summary = sanitize(summary)
         created_at = created_at or now_iso()
         with self._lock:
             self._conn.execute(
@@ -288,7 +295,7 @@ class SqliteFsBackend(StorageBackend):
             self._conn.commit()
         return Session(session_id, namespace, surface, status, summary, created_at, ended_at)
 
-    def get_session(self, session_id: str) -> Session | None:
+    async def get_session(self, session_id: str) -> Session | None:
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM sessions WHERE session_id=?", (session_id,)
@@ -311,9 +318,10 @@ class SqliteFsBackend(StorageBackend):
         ]
         return self._row_to_session(row, events, len(events))
 
-    def append_event(
+    async def append_event(
         self, session_id: str, type: str, message: str, data: Any | None
     ) -> tuple[int, str]:
+        message = sanitize(message) or ""
         timestamp = now_iso()
         with self._lock:
             row = self._conn.execute(
@@ -346,7 +354,8 @@ class SqliteFsBackend(StorageBackend):
             self._conn.commit()
         return seq, timestamp
 
-    def close_session(self, session_id: str, summary: str | None) -> Session:
+    async def close_session(self, session_id: str, summary: str | None) -> Session:
+        summary = sanitize(summary)
         with self._lock:
             row = self._conn.execute(
                 "SELECT status FROM sessions WHERE session_id=?", (session_id,)
@@ -361,11 +370,12 @@ class SqliteFsBackend(StorageBackend):
                 (now_iso(), summary, session_id),
             )
             self._conn.commit()
-        session = self.get_session(session_id)
+        session = await self.get_session(session_id)
         assert session is not None
         return session
 
-    def update_session_import(self, session_id: str, summary: str | None) -> Session:
+    async def update_session_import(self, session_id: str, summary: str | None) -> Session:
+        summary = sanitize(summary)
         with self._lock:
             self._conn.execute(
                 "UPDATE sessions SET status='closed', summary=?, "
@@ -373,12 +383,12 @@ class SqliteFsBackend(StorageBackend):
                 (summary, now_iso(), session_id),
             )
             self._conn.commit()
-        session = self.get_session(session_id)
+        session = await self.get_session(session_id)
         if session is None:
             raise ToolFault(NOT_FOUND, f"session {session_id!r} not found")
         return session
 
-    def list_sessions(
+    async def list_sessions(
         self, namespace: str, status: str | None = None, limit: int = 20
     ) -> list[Session]:
         query = (
@@ -416,7 +426,7 @@ class SqliteFsBackend(StorageBackend):
             is_debug_capture=bool(row["is_debug_capture"]),
         )
 
-    def store_artifact(self, artifact: Artifact, content: bytes) -> Artifact:
+    async def store_artifact(self, artifact: Artifact, content: bytes) -> Artifact:
         digest = hashlib.sha256(content).hexdigest()
         rel_path = f"{digest[:2]}/{digest}"
         blob_path = self.blobs_dir / rel_path
@@ -451,22 +461,24 @@ class SqliteFsBackend(StorageBackend):
             self._conn.commit()
         return artifact
 
-    def get_artifact(self, artifact_id: str) -> Artifact | None:
+    async def get_artifact(self, artifact_id: str) -> Artifact | None:
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM artifacts WHERE artifact_id=?", (artifact_id,)
             ).fetchone()
         return self._row_to_artifact(row) if row else None
 
-    def read_artifact_bytes(self, artifact_id: str, offset: int, length: int) -> bytes:
-        artifact = self.get_artifact(artifact_id)
+    async def read_artifact_bytes(
+        self, artifact_id: str, offset: int, length: int
+    ) -> bytes:
+        artifact = await self.get_artifact(artifact_id)
         if artifact is None:
             raise ToolFault(NOT_FOUND, f"artifact {artifact_id!r} not found")
         with open(self.blobs_dir / artifact.storage_path, "rb") as f:
             f.seek(offset)
             return f.read(length)
 
-    def list_artifacts(
+    async def list_artifacts(
         self, namespace: str | None = None, session_id: str | None = None
     ) -> list[Artifact]:
         query = "SELECT * FROM artifacts WHERE 1=1"

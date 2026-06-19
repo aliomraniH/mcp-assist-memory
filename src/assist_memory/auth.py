@@ -6,8 +6,13 @@ Two ways to present the same MCP_AUTH_TOKEN:
 - ?token=<token> query parameter  (fallback for clients that cannot send
   custom headers, e.g. the claude.ai web connector UI)
 
-The only anonymous route is GET/HEAD / (health probe). Token values are never
-logged; the access log omits query strings entirely.
+The anonymous routes are GET/HEAD / and GET/HEAD /healthz (liveness/health
+probes) and the /admin dashboard (which enforces its own password session).
+Token values are never logged; the access log omits query strings entirely.
+
+The expected token is read on every request via ``token_provider`` so a
+rotation in the /admin dashboard takes effect immediately. A fixed ``token`` is
+still accepted for the static case and the test suite.
 """
 
 from __future__ import annotations
@@ -26,14 +31,6 @@ QUERY_TOKEN_PARAM = "token"
 
 
 class BearerAuthMiddleware:
-    """Reject anything but GET/HEAD ``/`` and the ``/admin`` dashboard unless it
-    presents the current MCP token.
-
-    ``token_provider`` returns the live token on every request so a rotation in
-    the admin dashboard takes effect immediately. A fixed ``token`` is still
-    accepted for the simple/static case (and the test suite).
-    """
-
     def __init__(
         self,
         app: ASGIApp,
@@ -67,7 +64,7 @@ class BearerAuthMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope["path"]
-        if path == "/" and scope["method"] in ("GET", "HEAD"):
+        if path in ("/", "/healthz") and scope["method"] in ("GET", "HEAD"):
             await self.app(scope, receive, send)
             return
         # The /admin dashboard enforces its own password-based session auth.

@@ -7,10 +7,13 @@ names, codes, sizes, and durations.
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
+import sys
 import time
 from typing import Any, Callable
 
+import structlog
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .models import ToolFault
@@ -20,10 +23,38 @@ tool_logger = logging.getLogger("assist_memory.tools")
 
 
 def setup_logging(level: str = "INFO") -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    """Render all logs as structlog JSON to stdout.
+
+    Both structlog calls (app.py lifespan/healthz) and the stdlib loggers used
+    here (access/tools/auth) flow through one JSON ProcessorFormatter, so the
+    Replit/Reserved-VM stdout stream is uniformly structured.
+    """
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    shared: list[Any] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+    ]
+    structlog.configure(
+        processors=[*shared, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.make_filtering_bound_logger(lvl),
+        cache_logger_on_first_use=True,
     )
+    formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared,
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.processors.JSONRenderer(),
+        ],
+    )
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(lvl)
 
 
 class AccessLogMiddleware:
@@ -68,8 +99,41 @@ class AccessLogMiddleware:
             )
 
 
+def _log_outcome(name: str, start: float, fault: ToolFault | None, crashed: bool) -> None:
+    elapsed = (time.perf_counter() - start) * 1000
+    if fault is not None:
+        tool_logger.warning(
+            "tool=%s outcome=error code=%s duration_ms=%.1f", name, fault.code, elapsed
+        )
+    elif crashed:
+        tool_logger.exception("tool=%s outcome=crash duration_ms=%.1f", name, elapsed)
+    else:
+        tool_logger.info("tool=%s outcome=ok duration_ms=%.1f", name, elapsed)
+
+
 def logged(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Wraps an MCP tool: logs name, outcome, and duration; never argument values."""
+    """Wraps an MCP tool: logs name, outcome, and duration; never argument values.
+
+    Supports both sync and async tool functions (the Postgres-backed tools are
+    async; the sentinel preserves the original signature for FastMCP).
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def awrapper(*args: Any, **kwargs: Any) -> Any:
+            start = time.perf_counter()
+            try:
+                result = await fn(*args, **kwargs)
+            except ToolFault as fault:
+                _log_outcome(fn.__name__, start, fault, False)
+                raise
+            except Exception:
+                _log_outcome(fn.__name__, start, None, True)
+                raise
+            _log_outcome(fn.__name__, start, None, False)
+            return result
+
+        return awrapper
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -77,25 +141,12 @@ def logged(fn: Callable[..., Any]) -> Callable[..., Any]:
         try:
             result = fn(*args, **kwargs)
         except ToolFault as fault:
-            tool_logger.warning(
-                "tool=%s outcome=error code=%s duration_ms=%.1f",
-                fn.__name__,
-                fault.code,
-                (time.perf_counter() - start) * 1000,
-            )
+            _log_outcome(fn.__name__, start, fault, False)
             raise
         except Exception:
-            tool_logger.exception(
-                "tool=%s outcome=crash duration_ms=%.1f",
-                fn.__name__,
-                (time.perf_counter() - start) * 1000,
-            )
+            _log_outcome(fn.__name__, start, None, True)
             raise
-        tool_logger.info(
-            "tool=%s outcome=ok duration_ms=%.1f",
-            fn.__name__,
-            (time.perf_counter() - start) * 1000,
-        )
+        _log_outcome(fn.__name__, start, None, False)
         return result
 
     return wrapper

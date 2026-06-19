@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import html
-import os
 import secrets
 import time
 
@@ -23,10 +22,6 @@ from .admin_store import AdminStore
 
 SESSION_COOKIE = "admin_session"
 SESSION_TTL = 12 * 60 * 60  # 12 hours
-
-
-def _admin_password() -> str:
-    return os.environ.get("ADMIN_PASSWORD", "").strip()
 
 
 def _sign(secret: str, msg: str) -> str:
@@ -192,7 +187,9 @@ bearer header, or <code>?token=&lt;token&gt;</code> if headers aren't supported.
     return HTMLResponse(body)
 
 
-def build_routes(admin: AdminStore, session_secret: str) -> list[Route]:
+def build_routes(
+    admin: AdminStore, session_secret: str, admin_password: str = ""
+) -> list[Route]:
     async def login_get(request: Request) -> Response:
         if valid_session(session_secret, request.cookies.get(SESSION_COOKIE)):
             return RedirectResponse("/admin", status_code=303)
@@ -201,7 +198,7 @@ def build_routes(admin: AdminStore, session_secret: str) -> list[Route]:
     async def login_post(request: Request) -> Response:
         form = await request.form()
         supplied = str(form.get("password", ""))
-        expected = _admin_password()
+        expected = admin_password
         if not expected:
             return _login_page("ADMIN_PASSWORD is not configured on the server.")
         if not secrets.compare_digest(supplied, expected):
