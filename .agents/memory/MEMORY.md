@@ -1,1 +1,2 @@
 - [Admin token dashboard](admin-token-dashboard.md) — MCP bearer token is dashboard-managed in a separate Postgres DB; cache has a 5s TTL (never cache indefinitely) and one active row enforced by a partial unique index.
+- [Git push past corrupt ref / diverged remote](git-push-corrupt-ref.md) — clone --single-branch to a temp repo to push past a corrupt unrelated ref; reconcile a diverged remote with merge -s ours (no force).
