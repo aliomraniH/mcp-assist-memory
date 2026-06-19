@@ -1,107 +1,131 @@
-# Replit Agent prompt — deploy mcp-assist-memory
+# Replit Agent prompt — deploy mcp-assist-memory (Phase 0, Postgres backend)
 
 Copy everything below the line into Replit Agent after importing this
-repository (branch with the latest code).
+repository on branch **`claude/stoic-gauss-83afam`**.
 
 ---
 
-You are deploying an **already-built, already-tested** application. Your job
-is configuration, deployment, and verification — **nothing else**.
+You are deploying an **already-built, already-tested** application. Your job is
+configuration, migration, deployment, and verification — **nothing else**.
 
 ## What this app is
 
-A remote MCP (Model Context Protocol) server using Streamable HTTP, built
-with Python 3.11+ and FastMCP (the official `mcp` SDK). It provides shared
-memory, session tracking, handoffs, and artifact storage for AI coding
-agents. It will be consumed by several different MCP clients:
+A remote MCP (Model Context Protocol) server using Streamable HTTP, Python
+3.11+, FastAPI + FastMCP. It provides shared memory, session tracking,
+handoffs, and artifact storage for AI coding agents, consumed by several MCP
+clients:
 
-- Claude Code CLI and Claude Code Desktop (auth via `Authorization: Bearer`
-  header)
-- claude.ai web custom connectors (auth via `?token=` query parameter,
-  because the web UI can't send custom headers)
-- Cursor, Windsurf, and other MCP-compatible agent tools (header auth)
+- Claude Code CLI / Desktop and Cursor/Windsurf (auth via `Authorization: Bearer`)
+- claude.ai web custom connectors (auth via `?token=` query param — the web UI
+  can't send custom headers)
 
-Both auth paths are **already implemented and tested** in the code. The MCP
-endpoint is `POST /mcp`; the only anonymous route is `GET /` (health check).
-Data lives in SQLite plus a file blob store under `DATA_DIR`.
+Both auth paths are already implemented and tested. The MCP endpoint is
+`POST /mcp`; the only anonymous routes are `GET /healthz` and `GET /`.
+
+**Storage is PostgreSQL (Neon) with the `vector` extension** — not SQLite. All
+state (memory revisions, sessions, handoffs, and artifact blobs as `bytea`)
+lives in Postgres, so data is durable across redeploys. There is no local data
+directory to preserve.
 
 ## Hard rules — do not violate
 
-1. **Do not modify any source code, tests, or `pyproject.toml`.** The code
-   is complete; 44 tests pass. If something looks broken, STOP and report
-   the exact error instead of "fixing" it.
-2. **Do not add features, dependencies, databases, OAuth, GitHub/LLM
-   integrations, or analytics.** This server is memory-only by design and
-   makes no outbound API calls.
-3. **Do not weaken auth.** Never expose an unauthenticated endpoint other
-   than `GET /`. Never print, log, or commit the value of `MCP_AUTH_TOKEN`.
-4. **Do not commit `data/`, `.env`, or any runtime files.** They are
-   gitignored; keep it that way.
-5. **Do not change `.replit`** unless the Run button genuinely fails, and
-   if so change only what is needed to execute `python main.py`.
+1. **Do not modify any source code, tests, `pyproject.toml`, or
+   `migrations/0001_init.sql`.** The code is complete and live-validated. If
+   something looks broken, STOP and report the exact error instead of "fixing"
+   it. `migrations/0001_init.sql` is frozen.
+2. **Do not add features, dependencies, OAuth, GitHub/LLM integrations, or
+   analytics.** No outbound API calls.
+3. **Do not weaken auth.** Never expose an unauthenticated endpoint other than
+   `GET /healthz` and `GET /`. Never print, log, or commit `MCP_AUTH_TOKEN` or
+   `DATABASE_URL`.
+4. **Never run the test suite with `DATABASE_URL` set against the production
+   database.** The Postgres integration tests `TRUNCATE` tables between tests —
+   pointing them at prod would wipe memory. Run the deploy-gate tests
+   **without** `DATABASE_URL` (see step 2).
+5. **Deploy as a Reserved VM, not Autoscale.** The process holds one long-lived
+   connection pool; Phase 0's durability gate requires a persistent process.
 
 ## Steps
 
-1. **Install dependencies** for Python 3.11+:
+1. **Provision Postgres.** Use a Neon Postgres database (Replit's Postgres
+   integration or an external Neon project) that supports the `pgvector`
+   extension. You need its **pooled (PgBouncer)** connection string.
+
+2. **Install dependencies and run the deploy gate (no DATABASE_URL):**
    ```bash
    pip install -e ".[dev]"
+   pytest        # run with DATABASE_URL UNSET
    ```
+   Expect **50 passed, 12 skipped** (the 12 skipped are Postgres tests, which
+   are intentionally skipped without a scratch database — they were already
+   validated upstream). If anything *fails*, STOP and report the pytest output
+   verbatim. Do not deploy and do not edit code.
 
-2. **Run the test suite as a deploy gate:**
+3. **Configure Secrets** (Replit Secrets, not files):
+   - `DATABASE_URL`: the Neon **pooled** connection string
+     (`...-pooler...neon.tech/...?sslmode=require`).
+   - `MCP_AUTH_TOKEN`: generate with
+     `python -c "import secrets; print(secrets.token_urlsafe(32))"` and store as
+     a Secret. Tell the user only where to read it (the Secrets pane) — never
+     echo it into chat, logs, or files.
+   - Optional overrides: `MAX_ARTIFACT_BYTES` (default 26214400 = 25 MB),
+     `MAX_UPLOAD_MB` (25), `MAX_TOTAL_STORAGE_MB` (500), `LOG_LEVEL` (INFO).
+     `PORT` is provided by Replit automatically.
+
+4. **Apply the migration once** (creates the `vector` extension + tables). Run
+   with the database owner/migrator `DATABASE_URL`:
    ```bash
-   pytest
+   make migrate          # == psql "$DATABASE_URL" -f migrations/0001_init.sql
    ```
-   Expect **44 passed**. If anything fails, STOP and report the pytest
-   output verbatim. Do not deploy and do not edit code.
+   It is idempotent (everything is `IF NOT EXISTS`). If `psql` isn't available,
+   run the file's SQL through any client connected to the same database. Confirm
+   the tables exist: `memory_entry, session, session_event, artifact_blob,
+   artifact`.
 
-3. **Configure secrets** (Replit Secrets, not files):
-   - `MCP_AUTH_TOKEN`: generate one with
-     `python -c "import secrets; print(secrets.token_urlsafe(32))"` and
-     store it as a Secret. Show the user only an instruction for where to
-     read it (the Secrets pane) — do not echo it into chat, logs, or files.
-   - Optional overrides: `DATA_DIR` (default `./data`), `MAX_UPLOAD_MB`
-     (default 25), `MAX_TOTAL_STORAGE_MB` (default 500), `LOG_LEVEL`
-     (default INFO). `PORT` is provided by Replit automatically.
+5. **Deploy** (Reserved VM). The Run command is `python main.py`, which starts
+   the FastAPI app (`assist_memory.app:app`) on `$PORT`. On startup it opens the
+   pool, runs a bounded `SELECT 1` readiness probe, and logs `ready`. If the DB
+   is unreachable the process exits on purpose (so the VM restarts) — that is
+   correct, not a bug to patch.
 
-4. **Persistence (important):** the server's value is durable memory.
-   Deploy as a **Reserved VM** (the app is stateful and long-running;
-   Autoscale would cold-start and could run multiple instances against one
-   SQLite file, which is unsupported). Point `DATA_DIR` at storage that
-   survives redeploys; if the Reserved VM's disk is reset on redeploy, tell
-   the user explicitly that memory resets on redeploy and which directory
-   to back up. Do not silently ignore this step.
-
-5. **Deploy**, then **verify** all three of these against the public URL
-   (replace `$URL` and use the real token from Secrets):
+6. **Verify** against the public URL (replace `$URL`; use the real token from
+   Secrets):
    ```bash
-   # 1. health check is open and bare:
-   curl -s $URL/                      # expect {"status":"ok"}
+   # 1. health probe is open and reports DB connectivity:
+   curl -s $URL/healthz            # expect {"status":"ok","db":"ok"}
 
    # 2. MCP endpoint rejects anonymous requests:
    curl -s -o /dev/null -w '%{http_code}' -X POST $URL/mcp   # expect 401
 
-   # 3. authenticated MCP initialize succeeds (expect a JSON-RPC result
-   #    with serverInfo.name "assist-memory"):
+   # 3. authenticated MCP initialize succeeds (JSON-RPC result with
+   #    serverInfo.name "assist-memory"):
    curl -s -X POST "$URL/mcp" \
      -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
      -H "Content-Type: application/json" \
      -H "Accept: application/json, text/event-stream" \
      -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"verify","version":"0"}}}'
 
-   # 4. query-param auth also works (for claude.ai web connectors):
-   #    repeat check 3 against "$URL/mcp?token=$MCP_AUTH_TOKEN" without
-   #    the Authorization header — expect the same result.
+   # 4. query-param auth also works (claude.ai web): repeat check 3 against
+   #    "$URL/mcp?token=$MCP_AUTH_TOKEN" with no Authorization header.
    ```
    If any check fails, report the response body and status code and stop.
 
-6. **Report back** with exactly:
+7. **Durability proof (Phase 0 done-gate).** After verification, **redeploy the
+   Reserved VM** and confirm data persists:
+   - Before redeploy, save a marker via an authenticated `tools/call` to
+     `memory_save` (key `deploy/marker`, any value), or note an existing key.
+   - After redeploy, `GET $URL/healthz` is `ok` and a `memory_get` for that key
+     still returns the value. Because storage is Neon Postgres, it must survive.
+   Report whether the marker persisted.
+
+8. **Report back** with exactly:
    - the public base URL and the MCP endpoint URL (`https://.../mcp`)
-   - confirmation that all four verification checks passed
-   - where the token is stored (Secrets pane), without revealing it
-   - the persistence situation from step 4 (where `DATA_DIR` lives and
-     whether it survives redeploys)
-   - this registration cheat-sheet for the user, with the real URL filled
-     in and `<token>` left as a placeholder:
+   - confirmation that all four checks in step 6 passed and the step-7 marker
+     persisted across a redeploy
+   - where the secrets are stored (Secrets pane), without revealing them
+   - confirmation the deployment target is **Reserved VM**
+   - this registration cheat-sheet, real URL filled in, `<token>` left as a
+     placeholder:
 
      **Claude Code CLI / Desktop:**
      ```
@@ -119,6 +143,7 @@ Data lives in SQLite plus a file blob store under `DATA_DIR`.
 
 ## Success criteria
 
-Run button works; tests pass (44/44); the four endpoint checks pass on the
-deployed URL; the user has the registration cheat-sheet; no source files
-were modified.
+Run button works; deploy-gate tests pass (50 passed / 12 skipped, no
+`DATABASE_URL`); the migration applied; the four endpoint checks pass on the
+deployed URL; data persists across a Reserved-VM redeploy; the user has the
+registration cheat-sheet; no source files were modified.

@@ -78,6 +78,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     setup_logging(settings.log_level)
     log.info("startup", **settings.as_log_safe())
 
+    if not settings.auth_token:
+        raise RuntimeError("MCP_AUTH_TOKEN is required; refusing to start")
+
     pool = create_pool(settings.database_url_str())
     await pool.open()  # returns immediately (min_size=0)
     try:
