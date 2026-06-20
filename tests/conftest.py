@@ -1,70 +1,65 @@
-import json
-import re
+"""Test fixtures. These run against a REAL Postgres (the Phase 0 gate is live,
+not mock). Set DATABASE_URL to a throwaway Neon branch or local PG; tests skip
+cleanly if it is absent.
+
+The neutral test project is ``proj-test`` (never a real project name) — each
+test gets a unique ``proj-test-<rand>`` namespace so cases don't collide on a
+shared Postgres.
+"""
+from __future__ import annotations
+
+import os
+import uuid
 
 import pytest
-from mcp.shared.memory import (
-    create_connected_server_and_client_session as connect,
-)
+import pytest_asyncio
+from psycopg_pool import AsyncConnectionPool
 
-from assist_memory.config import Config
-from assist_memory.server import build_mcp
-from assist_memory.storage.sqlite_fs import SqliteFsBackend
+from storage.postgres import PostgresBackend
 
-TEST_TOKEN = "test-token-123"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
+# Mirrors migrations/0001_init.sql (kept inline so the suite is self-contained).
+SCHEMA = """
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE TABLE IF NOT EXISTS memory_entry (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    namespace text NOT NULL, key text NOT NULL, revision integer NOT NULL,
+    kind text NOT NULL CHECK (kind IN ('note','decision','todo','handoff','config')),
+    value jsonb NOT NULL, source_surface text, tags text[] NOT NULL DEFAULT '{}',
+    event_id uuid, tombstone boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now(), UNIQUE (namespace, key, revision));
+CREATE UNIQUE INDEX IF NOT EXISTS memory_entry_event_id_uq
+    ON memory_entry (event_id) WHERE event_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS session (
+    session_id uuid PRIMARY KEY DEFAULT gen_random_uuid(), namespace text NOT NULL,
+    surface text, metadata jsonb NOT NULL DEFAULT '{}',
+    created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS session_event (
+    session_id uuid NOT NULL REFERENCES session(session_id) ON DELETE CASCADE,
+    namespace text NOT NULL, seq integer NOT NULL, kind text NOT NULL, payload jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (session_id, seq));
+CREATE TABLE IF NOT EXISTS artifact (
+    sha256 char(64) PRIMARY KEY, bytes bytea NOT NULL, size integer NOT NULL,
+    content_type text, created_at timestamptz NOT NULL DEFAULT now());
+"""
 
-class ToolFailure(Exception):
-    """Parsed {"code", "message"} from an isError tool result."""
-
-    def __init__(self, code: str, message: str, raw: str):
-        super().__init__(raw)
-        self.code = code
-        self.message = message
-        self.raw = raw
-
-
-def make_config(tmp_path, **overrides) -> Config:
-    defaults = dict(
-        auth_token=TEST_TOKEN,
-        data_dir=tmp_path / "data",
-        max_upload_mb=25,
-        max_total_storage_mb=500,
-    )
-    defaults.update(overrides)
-    return Config(**defaults)
-
-
-def make_mcp(config: Config):
-    backend = SqliteFsBackend(config.data_dir, config.max_total_storage_bytes)
-    return build_mcp(config, backend)
-
-
-async def call_tool(mcp, name: str, **args):
-    async with connect(mcp._mcp_server) as client:
-        result = await client.call_tool(name, args)
-    text = "".join(getattr(c, "text", "") for c in result.content)
-    if result.isError:
-        match = re.search(r"\{.*\}", text, re.S)
-        payload = json.loads(match.group(0)) if match else {}
-        raise ToolFailure(payload.get("code", "UNKNOWN"), payload.get("message", text), text)
-    if result.structuredContent is not None:
-        return result.structuredContent
-    return json.loads(text)
+@pytest_asyncio.fixture
+async def backend():
+    # A module-level `pytestmark` in conftest.py does NOT propagate to other test
+    # modules, so gate at the fixture: any test needing Postgres skips cleanly
+    # when DATABASE_URL is unset. (Pure tests like test_sanitize still run.)
+    if DATABASE_URL is None:
+        pytest.skip("DATABASE_URL not set")
+    pool = AsyncConnectionPool(DATABASE_URL, open=False, min_size=0, max_size=4)
+    await pool.open()
+    async with pool.connection() as conn:
+        await conn.execute(SCHEMA)
+    yield PostgresBackend(pool)
+    await pool.close()
 
 
-@pytest.fixture
-def config(tmp_path):
-    return make_config(tmp_path)
-
-
-@pytest.fixture
-def mcp(config):
-    return make_mcp(config)
-
-
-@pytest.fixture
-def call(mcp):
-    async def _call(name, **args):
-        return await call_tool(mcp, name, **args)
-
-    return _call
+@pytest_asyncio.fixture
+def ns():
+    """A unique neutral-project namespace per test (project == namespace)."""
+    return f"proj-test-{uuid.uuid4().hex[:12]}"

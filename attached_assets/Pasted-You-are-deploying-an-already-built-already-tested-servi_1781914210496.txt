@@ -1,0 +1,94 @@
+You are deploying an already-built, already-tested service. Your job is
+configuration, deployment, and verification — NOT writing features.
+
+## Source
+
+Deploy the branch `claude/canonical-tier1` of aliomraniH/mcp-assist-memory
+(PR #2). If that PR has already been merged, deploy the default branch instead.
+This is the canonical Tier-1 service: a generic, project-agnostic MCP memory
+server. Flat layout — `app.py`, `config.py`, `server/`, `storage/`,
+`scripts/`, `migrations/`. Entry point is `uvicorn app:app`.
+
+## What it is
+
+A remote MCP (Streamable HTTP) server, Python 3.11, FastAPI + FastMCP, storage
+in PostgreSQL + pgvector. It exposes 18 tools at `/mcp` (bearer-authed),
+`GET /healthz` (open liveness), a streamed `GET /artifact/{sha256}`, and a
+password-gated `/admin` dashboard that shows and rotates the live MCP token.
+Every per-project tool takes a `namespace` (the project/tenant). Data is durable
+across redeploys because everything lives in Postgres.
+
+## Hard rules — do not violate
+
+1. Do NOT modify any source file, test, `pyproject.toml`, or
+   `migrations/0001_init.sql` (it is frozen). If something looks broken, STOP
+   and report the exact error.
+2. Do NOT add features, tools, dependencies, OAuth, or analytics. This repo is
+   Tier-1 only — no Canvas/FHIR/SDK logic belongs here.
+3. Do NOT weaken auth or expose anything unauthenticated other than
+   `GET /healthz`, `GET /`, `GET /artifact/{sha256}`, and the self-authenticating
+   `/admin`. Never print, log, or commit `DATABASE_URL`, `ADMIN_PASSWORD`, or any
+   token.
+4. Deploy as a Reserved VM, NOT Autoscale (the durability gate needs a
+   persistent process).
+
+## Steps
+
+1. Postgres: use Replit's managed Postgres (it injects `DATABASE_URL`). Confirm
+   the database supports `pgvector` — startup migration runs
+   `CREATE EXTENSION IF NOT EXISTS vector`. If unavailable, STOP and report it
+   (do not edit the migration).
+
+2. Secrets (Replit Secrets, never files):
+   - `ADMIN_PASSWORD` — REQUIRED to use `/admin`. Generate a strong value
+     (`python -c "import secrets; print(secrets.token_urlsafe(24))"`). Tell me
+     where to read it; never echo it.
+   - `MCP_AUTH_TOKEN` — REQUIRED. Seeds the first MCP token on initial boot
+     (the live token is owned by `/admin` afterward). Generate a strong value.
+   - `DATABASE_URL` — leave to managed Postgres; do not set by hand.
+   - Optional: `SESSION_SECRET`, `MAX_ARTIFACT_BYTES`. `PORT` is provided by
+     Replit.
+
+3. Deploy gate (run WITHOUT a database so tests don't touch any real data):
+       pip install -e ".[test]"
+       pytest          # run with DATABASE_URL UNSET
+   Expect "8 passed, 21 skipped" (the 21 are real-Postgres tests, validated
+   upstream). If anything FAILS, STOP and report the output verbatim.
+
+4. Deploy (Reserved VM). The `.replit` run command already does the right thing:
+       python scripts/migrate.py && uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}
+   Migration is idempotent. If the DB is unreachable at boot the process exits
+   on purpose so the VM restarts — that is correct, not a bug to patch.
+
+5. Get the token + verify (replace $URL, and $TOKEN with the value shown in the
+   dashboard):
+   - Open `https://$URL/admin`, sign in with `ADMIN_PASSWORD`, copy the live token.
+       curl -s $URL/healthz                                   # {"status":"ok","db":"ok"}
+       curl -s -o /dev/null -w '%{http_code}' -X POST $URL/mcp/   # 401 (anonymous)
+       curl -s -X POST "$URL/mcp/" \
+         -H "Authorization: Bearer $TOKEN" \
+         -H "Content-Type: application/json" \
+         -H "Accept: application/json, text/event-stream" \
+         -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"verify","version":"0"}}}'
+       # expect a JSON-RPC result naming server "assist-memory"; NOT a 401
+   If any check fails, report the response body and status and stop.
+
+6. Durability proof (the done-gate). Using the token, call tools/call
+   `memory_save` with namespace `proj-deploy-check`, key `marker`, value
+   `{"ok": true}`. Then REDEPLOY the Reserved VM and call `memory_get` for the
+   same namespace+key — it must still return the value. Report the result.
+
+7. Report back: the public base URL and `https://.../mcp`; that step-5 checks
+   passed and the step-6 marker persisted across redeploy; that the token is
+   read from `/admin` (and `ADMIN_PASSWORD` lives in Secrets, unrevealed); and
+   that the deployment target is Reserved VM.
+
+## Notes
+
+- Tokens: every client registration snippet (Claude Code CLI, claude.ai web,
+  Cursor) is pre-filled on the `/admin` page — point me there.
+- Tenancy: every memory/handoff/session tool takes a `namespace` (the project).
+  Different projects pass different namespaces; there are no cross-project reads.
+- Success = run button works, deploy-gate tests pass (8/21, no DATABASE_URL),
+  the four endpoint checks pass, data survives a Reserved-VM redeploy, and the
+  token is manageable at `/admin` — with no source files modified.
