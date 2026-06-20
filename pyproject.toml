@@ -1,35 +1,36 @@
 [project]
 name = "mcp-assist-memory"
 version = "0.1.0"
-description = "Shared memory, session, handoff, and artifact MCP server for cross-surface Claude workflows"
+description = "Generic, project-agnostic shared memory / coordination / artifact MCP server over Streamable HTTP (Postgres + pgvector). Tier 1 — no domain terms."
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.9",
-    "starlette>=0.37",
     "fastapi>=0.115",
-    "uvicorn>=0.30",
+    "uvicorn[standard]>=0.30",
+    "fastmcp>=2.3",
     "psycopg[binary]>=3.2",
-    "psycopg_pool>=3.2",
-    "pgvector>=0.3",
-    "pydantic-settings>=2.5",
-    "structlog>=24",
+    "psycopg-pool>=3.2",
+    "pydantic-settings>=2.4",
+    "structlog>=24.1",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8",
+test = [
+    "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "anyio>=4.0",
     "httpx>=0.27",
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src"]
 asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/assist_memory"]
+# Top-level service modules (app.py, config.py, admin_store.py, dashboard.py) are
+# imported from the repo root (editable install / `uvicorn app:app`); the
+# packaged code is the reusable storage + server tiers.
+packages = ["server", "storage"]

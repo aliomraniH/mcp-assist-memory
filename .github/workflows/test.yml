@@ -1,0 +1,72 @@
+name: test
+
+# Runs the real-Postgres pytest suite against an EPHEMERAL Neon branch created
+# per run and deleted afterward — the Phase 0 gate is live, never mocked.
+#
+# Requires two repo secrets:
+#   NEON_API_KEY      — Neon API key (Account settings → API keys)
+#   NEON_PROJECT_ID   — the Neon project that hosts the throwaway branches
+# If they are absent (e.g. on a fork), the job no-ops cleanly instead of failing.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Neon secrets
+        id: gate
+        run: |
+          if [ -n "${{ secrets.NEON_API_KEY }}" ] && [ -n "${{ secrets.NEON_PROJECT_ID }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::NEON_API_KEY / NEON_PROJECT_ID not set — skipping the live Postgres suite."
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          python-version: "3.11"
+
+      - name: Create ephemeral Neon branch
+        id: neon
+        if: steps.gate.outputs.enabled == 'true'
+        uses: neondatabase/create-branch-action@v5
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID }}
+          branch_name: ci/${{ github.run_id }}-${{ github.run_attempt }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+
+      - name: Install
+        if: steps.gate.outputs.enabled == 'true'
+        run: pip install -e ".[test]"
+
+      - name: Migrate + test (direct endpoint, no PgBouncer)
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          # Direct (unpooled) URL: the test pool does not disable prepared
+          # statements, so it must not run through PgBouncer transaction pooling.
+          DATABASE_URL: ${{ steps.neon.outputs.db_url }}
+          MCP_AUTH_TOKEN: ci-seed-token
+          ADMIN_PASSWORD: ci-admin-pw
+        run: |
+          python scripts/migrate.py
+          pytest -q
+
+      - name: Delete ephemeral Neon branch
+        if: always() && steps.gate.outputs.enabled == 'true'
+        uses: neondatabase/delete-branch-action@v3
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID }}
+          branch: ci/${{ github.run_id }}-${{ github.run_attempt }}
+          api_key: ${{ secrets.NEON_API_KEY }}

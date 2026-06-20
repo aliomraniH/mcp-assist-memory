@@ -1,8 +1,7 @@
-data/
-.env
 __pycache__/
-*.pyc
-.pytest_cache/
-*.egg-info/
-dist/
+*.py[cod]
+.env
 .venv/
+venv/
+*.egg-info/
+.pytest_cache/

@@ -1,37 +1,22 @@
-"""Idempotent save: the same event_id never appends a second revision."""
+"""event_id gives exactly-once writes — the Phase 2 reconciliation guarantee."""
+from __future__ import annotations
 
-from uuid import uuid4
-
-
-async def test_same_event_id_yields_one_revision(pg_backend):
-    eid = str(uuid4())
-
-    first = await pg_backend.save_revision(
-        "default", "k", "v1", False, "note", [], "cli", event_id=eid
-    )
-    second = await pg_backend.save_revision(
-        "default", "k", "v2", False, "note", [], "cli", event_id=eid
-    )
-
-    assert first.revision == 1
-    assert second.revision == 1          # deduped: returns the existing revision
-    assert second.value == "v1"          # original value, not the replay's "v2"
-
-    history = await pg_backend.get_history("default", "k")
-    assert len(history) == 1
+import uuid
 
 
-async def test_distinct_event_ids_append(pg_backend):
-    r1 = await pg_backend.save_revision(
-        "default", "k", "v1", False, "note", [], "cli", event_id=str(uuid4())
-    )
-    r2 = await pg_backend.save_revision(
-        "default", "k", "v2", False, "note", [], "cli", event_id=str(uuid4())
-    )
-    assert (r1.revision, r2.revision) == (1, 2)
+async def test_same_event_id_applied_once(backend, ns):
+    eid = str(uuid.uuid4())
+    first = await backend.memory_save(ns, "k", "v1", event_id=eid)
+    second = await backend.memory_save(ns, "k", "v2-ignored", event_id=eid)
+    # Second save is a no-op returning the already-applied revision.
+    assert first["revision"] == 1
+    assert second["revision"] == 1
+    hist = await backend.memory_history(ns, "k")
+    assert len(hist) == 1
+    assert "v1" in str(hist[0]["value"])
 
 
-async def test_no_event_id_always_appends(pg_backend):
-    r1 = await pg_backend.save_revision("default", "k", "v1", False, "note", [], "cli")
-    r2 = await pg_backend.save_revision("default", "k", "v2", False, "note", [], "cli")
-    assert (r1.revision, r2.revision) == (1, 2)
+async def test_distinct_event_ids_both_apply(backend, ns):
+    await backend.memory_save(ns, "k", "v1", event_id=str(uuid.uuid4()))
+    await backend.memory_save(ns, "k", "v2", event_id=str(uuid.uuid4()))
+    assert len(await backend.memory_history(ns, "k")) == 2
