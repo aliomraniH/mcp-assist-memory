@@ -9,6 +9,20 @@ This is **Tier 1** of the [reusability contract](./REUSABILITY.md): every projec
 reuses it as-is. It carries **zero domain terms** — project identity lives in
 namespace *values*, never in tool names, tables, columns, or code.
 
+### Capabilities at a glance
+
+- **18-tool MCP** over Streamable HTTP (memory, handoff, session, artifact, admin).
+- **Namespace-scoped multi-tenancy** — every per-project query filters on `namespace`.
+- **Resilient to transient DB drops** — the server transparently retries genuine
+  connection losses (Neon scale-down / PgBouncer recycle, SQLSTATE `57P01`/`08xxx`)
+  on a fresh pooled connection, and validates connections at checkout, so callers
+  no longer have to retry. Retries are idempotency-gated, so they never double-write.
+- **Prompt-injection hardening** — values are sanitized on write and returned wrapped
+  in `<<<UNTRUSTED_DATA>>>` markers; `storage.sanitize.unwrap_value` recovers the raw
+  value when a consumer needs it (e.g. to `json.loads`).
+- **Content-addressed artifacts** (sha256, global dedup), 50 MB cap, ranged reads.
+- **Rotatable bearer token** managed from a password-gated `/admin` dashboard.
+
 ## The 18 tools
 
 | Group | Tools |
