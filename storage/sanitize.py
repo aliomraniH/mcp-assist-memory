@@ -50,3 +50,33 @@ def wrap_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: wrap_value(v) for k, v in value.items()}
     return value
+
+
+# Matches one leading <<<UNTRUSTED_DATA>>> and one trailing <<<END>>> so a wrapped
+# value can be recovered (e.g. before json.loads). Mirrors wrap_untrusted exactly.
+_WRAP_RE = re.compile(
+    rf"^{re.escape(UNTRUSTED_OPEN)}(.*){re.escape(UNTRUSTED_CLOSE)}$", re.DOTALL
+)
+
+
+def strip_untrusted(text: str) -> str:
+    """Remove the wrapping markers from a single wrapped string (inverse of
+    ``wrap_untrusted``). Returns the text unchanged if it isn't wrapped."""
+    m = _WRAP_RE.match(text)
+    return m.group(1) if m else text
+
+
+def unwrap_value(value: Any) -> Any:
+    """Recursively strip read-boundary markers added by ``wrap_value``.
+
+    Use this when a consumer needs the raw stored value back (for example to
+    ``json.loads`` a value that was a JSON string before it was wrapped). The
+    wrapping is still applied on every read; this is the supported way to undo it
+    at the point of parsing, not a way to disable the prompt-injection guard."""
+    if isinstance(value, str):
+        return strip_untrusted(value)
+    if isinstance(value, list):
+        return [unwrap_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: unwrap_value(v) for k, v in value.items()}
+    return value

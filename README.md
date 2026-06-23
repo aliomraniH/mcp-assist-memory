@@ -61,12 +61,30 @@ token on initial boot; after that the dashboard is the source of truth.
 ## Architecture
 
 - One `AsyncConnectionPool` created in the FastAPI `lifespan` (`app.py`), injected
-  via `deps`. Nothing else opens a connection.
+  via `deps`. Nothing else opens a connection. The pool is built with
+  `check=AsyncConnectionPool.check_connection`, so a connection terminated
+  server-side while idle is validated and discarded on checkout, never handed to a
+  caller.
 - One `config.py` (`pydantic-settings`) — the **only** place secrets are read.
 - `StorageBackend` ABC (`storage/base.py`) implemented by `PostgresBackend`; the
   18 tools map 1:1 onto it.
+- **Transparent reconnect:** reads and idempotent writes retry on a connection
+  drop (`_retry_on_disconnect`), so e.g. `OperationalError: terminating connection
+  due to administrator command` (SQLSTATE 57P01, Neon scale-down / PgBouncer) is
+  retried on a fresh pooled connection instead of surfacing to the caller. Only
+  genuine disconnects (`08xxx` / `57P0x` / an already-closed connection) are
+  retried — other operational errors (lock timeout, too-many-connections) surface
+  unchanged. Writes retry only when a replay is safe: `artifact_put`
+  (content-addressed) always, and `memory_save`/`handoff_save`/`memory_delete`
+  only when given an `event_id` (exactly-once). Non-idempotent writes (`session_*`,
+  or a save with no `event_id`) run once and surface the error, so a transparent
+  retry can never cause a silent double-write.
 - Write-path `sanitize` strips forged delimiters/control chars; reads wrap values
-  in `<<<UNTRUSTED_DATA>>>` markers (lethal-trifecta defense).
+  in `<<<UNTRUSTED_DATA>>>` markers (lethal-trifecta defense). **Note:** the
+  `value` (and session-event `payload`) fields come back wrapped, so a consumer
+  that needs the raw value — e.g. to `json.loads` a value that was a JSON string —
+  must strip the markers first. Use `storage.sanitize.unwrap_value` (or
+  `strip_untrusted` for a single string); the wrapping stays applied on every read.
 - Bounded lifespan readiness (no unbounded `pool.wait()`), 50 MB artifact cap,
   ranged blob reads, idempotent `event_id` writes, idempotent blob backfill.
 

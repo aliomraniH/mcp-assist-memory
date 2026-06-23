@@ -7,10 +7,11 @@ description: How the live MCP auth token is managed (separate DB, dashboard, cac
 
 The MCP bearer token is NOT a static env var at runtime. It lives in a separate
 PostgreSQL DB (`DATABASE_URL`, table `admin_auth_tokens`), managed via a
-password-protected dashboard at `/admin`. The MCP memory store stays in SQLite
-under `DATA_DIR` — the two stores are deliberately kept separate.
+password-protected dashboard at `/admin`. Agent memory lives in the same managed
+Postgres but in separate tables (`admin_auth_tokens` vs the memory schema) — the
+two concerns are deliberately kept apart.
 
-**Why separate DB:** token-management data must never mingle with agent memory.
+**Why separate table:** token-management data must never mingle with agent memory.
 
 - `MCP_AUTH_TOKEN` is optional now — only used to *seed* the first token on first
   boot (`AdminStore.ensure_token(seed=...)`). After that the dashboard is the
@@ -31,5 +32,5 @@ exactly one active row.
 re-read (or switch to LISTEN/NOTIFY) — never cache the token indefinitely.
 
 **Deployment:** Reserved VM (`deploymentTarget = "vm"`), single process, port
-5000→80. VM is required because of the local SQLite store and always-on MCP
-clients; autoscale would lose SQLite data and cold-start.
+5000→80. State is in managed Postgres (durable across redeploys); the VM target
+is for always-on MCP clients without autoscale cold-starts.

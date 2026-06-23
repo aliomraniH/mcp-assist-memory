@@ -59,6 +59,10 @@ def _build_pool() -> AsyncConnectionPool:
         timeout=settings.pool_timeout,                 # caller checkout cap
         reconnect_timeout=settings.pool_reconnect_timeout,
         max_idle=settings.pool_max_idle,
+        # Validate each connection on checkout so one terminated server-side while
+        # idle (Neon scale-down / "terminating connection due to administrator
+        # command") is discarded and replaced instead of handed to a caller.
+        check=AsyncConnectionPool.check_connection,
         num_workers=1,
         kwargs={
             "connect_timeout": settings.db_connect_timeout,

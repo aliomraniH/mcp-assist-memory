@@ -13,10 +13,12 @@ shared global handoff space). Artifacts are content-addressed and global.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import uuid
 from typing import Any
 
+import psycopg
 from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -25,6 +27,60 @@ from storage.base import StorageBackend
 from storage.sanitize import sanitize, wrap_value
 
 _MAX_RETRIES = 3
+
+# How many times a transient connection drop is retried (on a fresh connection).
+_CONN_RETRIES = 3
+# psycopg raises one of these when a connection is lost or already closed.
+_CONN_EXC = (psycopg.OperationalError, psycopg.InterfaceError)
+
+
+def _is_disconnect(exc: BaseException) -> bool:
+    """True only for genuine connection-loss errors (not every OperationalError).
+
+    Covers client-side "connection is closed" (no SQLSTATE), the 08xxx connection
+    class, and operator-intervention shutdowns 57P01/57P02/57P03 — e.g. Neon
+    scale-down's "terminating connection due to administrator command" (57P01).
+    A non-connection OperationalError (lock timeout, too-many-connections, …) is
+    left to surface unchanged.
+    """
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate is None:
+        return isinstance(exc, _CONN_EXC)
+    return sqlstate.startswith("08") or sqlstate in {"57P01", "57P02", "57P03"}
+
+
+def _retry_on_disconnect(fn):
+    """Retry a backend op on a dropped connection. Each call re-enters
+    ``self.pool.connection()``, so the retry runs on a fresh (pool-validated)
+    connection. Apply only to reads and idempotent writes: a terminated backend
+    rolls an in-flight transaction back, but a drop in the narrow
+    commit-but-before-ack window would otherwise replay a non-idempotent write.
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        last: Exception | None = None
+        for _ in range(_CONN_RETRIES):
+            try:
+                return await fn(*args, **kwargs)
+            except _CONN_EXC as exc:
+                if not _is_disconnect(exc):
+                    raise
+                last = exc
+        raise last  # exhausted reconnect attempts
+    return wrapper
+
+
+def _retry_if_idempotent(fn):
+    """Disconnect-retry a write only when it carries an ``event_id`` (exactly-once):
+    a replay then collapses to a no-op. Without one, the op runs once and a
+    disconnect surfaces to the caller, so there is never a silent double-write."""
+    retrying = _retry_on_disconnect(fn)
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        target = retrying if kwargs.get("event_id") else fn
+        return await target(*args, **kwargs)
+    return wrapper
 
 
 def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
@@ -120,11 +176,13 @@ class PostgresBackend(StorageBackend):
                     continue
             raise last_exc  # exhausted retries
 
+    @_retry_if_idempotent
     async def memory_save(
         self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None
     ) -> dict:
         return await self._append(namespace, key, value, kind, tags, source_surface, event_id, False)
 
+    @_retry_on_disconnect
     async def memory_get(self, namespace, key) -> dict | None:
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -137,6 +195,7 @@ class PostgresBackend(StorageBackend):
             return None
         return _row_to_entry(row)
 
+    @_retry_on_disconnect
     async def memory_list(self, namespace, *, kind=None, tag=None, limit=100) -> list[dict]:
         clauses = ["namespace = %s"]
         params: list[Any] = [namespace]
@@ -162,6 +221,7 @@ class PostgresBackend(StorageBackend):
         live = [_row_to_entry(r) for r in rows if not r["tombstone"]]
         return live[:limit]
 
+    @_retry_on_disconnect
     async def memory_history(self, namespace, key, *, limit=50) -> list[dict]:
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -173,6 +233,7 @@ class PostgresBackend(StorageBackend):
             rows = await cur.fetchall()
         return [_row_to_entry(r) for r in rows]
 
+    @_retry_if_idempotent
     async def memory_delete(self, namespace, key, *, source_surface=None, event_id=None) -> dict:
         # Tombstone = append a deleting revision (history is preserved).
         async with self.pool.connection() as conn:
@@ -186,6 +247,7 @@ class PostgresBackend(StorageBackend):
         kind = latest["kind"] if latest else "note"
         return await self._append(namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True)
 
+    @_retry_on_disconnect
     async def memory_search(self, namespace, query, *, limit=20) -> list[dict]:
         # Tenant-scoped: search always filters on a single namespace. No
         # implicit cross-project reads. (pgvector semantic recall arrives Phase 3.)
@@ -207,6 +269,7 @@ class PostgresBackend(StorageBackend):
     # ---------------------------------------------------------------- handoff
     # Handoffs are cross-surface (web/cli/desktop) within ONE project: stored as
     # kind='handoff' rows inside the caller's namespace, never a shared space.
+    @_retry_if_idempotent
     async def handoff_save(self, namespace, key, value, *, source_surface=None, event_id=None) -> dict:
         return await self._append(namespace, key, value, "handoff", [], source_surface, event_id, False)
 
@@ -259,6 +322,7 @@ class PostgresBackend(StorageBackend):
                 continue
         raise last_exc
 
+    @_retry_on_disconnect
     async def session_get(self, namespace, session_id) -> dict | None:
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -271,6 +335,7 @@ class PostgresBackend(StorageBackend):
             return None
         return _session_to_dict(row)
 
+    @_retry_on_disconnect
     async def session_list(self, namespace, *, limit=50) -> list[dict]:
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -281,6 +346,7 @@ class PostgresBackend(StorageBackend):
             rows = await cur.fetchall()
         return [_session_to_dict(r) for r in rows]
 
+    @_retry_on_disconnect
     async def session_events(self, namespace, session_id, *, limit=200) -> list[dict]:
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -293,6 +359,7 @@ class PostgresBackend(StorageBackend):
         return [_event_to_dict(r) for r in rows]
 
     # -------------------------------------------------------------- artifacts
+    @_retry_on_disconnect  # content-addressed + ON CONFLICT DO NOTHING → safe to replay
     async def artifact_put(self, data: bytes, *, content_type=None) -> dict:
         sha = hashlib.sha256(data).hexdigest()
         size = len(data)
@@ -311,6 +378,7 @@ class PostgresBackend(StorageBackend):
             inserted = await cur.fetchone()
         return {"sha256": sha, "size": size, "content_type": content_type, "deduped": inserted is None}
 
+    @_retry_on_disconnect
     async def artifact_get(self, sha256) -> dict | None:
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -328,6 +396,7 @@ class PostgresBackend(StorageBackend):
             "created_at": row["created_at"].isoformat(),
         }
 
+    @_retry_on_disconnect
     async def artifact_read_range(self, sha256, offset: int, length: int) -> bytes | None:
         # Ranged read keeps peak memory to one window, never the whole blob.
         # Use dict_row consistently — pooled connections retain whatever
@@ -344,6 +413,7 @@ class PostgresBackend(StorageBackend):
         chunk = row["chunk"]
         return bytes(chunk) if chunk is not None else b""
 
+    @_retry_on_disconnect
     async def artifact_list(self, *, limit=100) -> list[dict]:
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -363,6 +433,7 @@ class PostgresBackend(StorageBackend):
         ]
 
     # ------------------------------------------------------------------ admin
+    @_retry_on_disconnect
     async def stats(self) -> dict:
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -380,6 +451,7 @@ class PostgresBackend(StorageBackend):
             row = await cur.fetchone()
         return dict(row)
 
+    @_retry_on_disconnect
     async def health(self) -> bool:
         async with self.pool.connection() as conn:
             await conn.execute("SELECT 1")
