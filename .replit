@@ -1,14 +1,12 @@
 modules = ["python-3.11", "postgresql-16"]
-run = "python main.py"
-entrypoint = "main.py"
+# The service entrypoint is the FastAPI app (app.py); there is no main.py.
+run = ["sh", "-c", "python scripts/migrate.py && uvicorn app:app --host 0.0.0.0 --port 5000"]
+entrypoint = "app.py"
 
 [deployment]
 run = ["sh", "-c", "python scripts/migrate.py && uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
 deploymentTarget = "vm"
 build = ["sh", "-c", "pip install -e ."]
-
-[env]
-DATA_DIR = "./data"
 
 [nix]
 channel = "stable-25_05"
