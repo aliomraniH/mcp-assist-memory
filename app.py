@@ -39,6 +39,7 @@ from admin_store import AdminStore
 from config import settings
 from dashboard import SURFACE_LABELS, build_routes
 from server.mcp_server import deps, mcp
+from storage.embeddings import build_embedder
 from storage.postgres import PostgresBackend
 
 structlog.configure(
@@ -112,8 +113,9 @@ async def lifespan(app: FastAPI):
         log.warning("admin_password_unset")  # /admin login disabled until set
 
     app.state.pool = pool
-    deps.backend = PostgresBackend(pool)
-    log.info("startup_ok", max_size=settings.pool_max_size)
+    embedder = build_embedder(settings)  # Voyage when keyed, else disabled (keyword-only)
+    deps.backend = PostgresBackend(pool, embedder=embedder)
+    log.info("startup_ok", max_size=settings.pool_max_size, embeddings=embedder.enabled)
     try:
         async with mcp_app.lifespan(app):  # run the MCP session manager
             yield
