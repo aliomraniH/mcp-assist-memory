@@ -21,7 +21,7 @@ namespace *values*, never in tool names, tables, columns, or code.
   in `<<<UNTRUSTED_DATA>>>` markers; `storage.sanitize.unwrap_value` recovers the raw
   value when a consumer needs it (e.g. to `json.loads`).
 - **Content-addressed artifacts** (sha256, global dedup), 50 MB cap, ranged reads.
-- **Rotatable bearer token** managed from a password-gated `/admin` dashboard.
+- **Per-surface rotatable tokens** (web vs. desktop-cli) managed from a password-gated `/admin` dashboard.
 
 ## The 18 tools
 
@@ -50,9 +50,10 @@ and dedup globally, so they are not tenant-scoped — the hash is the capability
 
 ### Honest limit (and the v2 fix)
 
-Under a **single shared `MCP_AUTH_TOKEN`**, namespace is a **soft** boundary: any
-client holding the token can pass any namespace. It is real isolation for honest
-clients, not enforced against a misbehaving one.
+The per-surface tokens scope **which client surface** connects, not **which
+project** it may touch: any holder of any active token can pass any namespace, so
+namespace remains a **soft** boundary — real isolation for honest clients, not
+enforced against a misbehaving one.
 
 > **v2 auth roadmap — per-project tokens/roles.** A token scoped to
 > `acme-billing` must not be able to read or write `other-project`. Until then,
@@ -61,16 +62,32 @@ clients, not enforced against a misbehaving one.
 
 ## Auth & the /admin dashboard
 
-The live MCP bearer token is stored in Postgres (`admin_auth_tokens`) and
-**rotatable from `/admin`** without a redeploy. `MCP_AUTH_TOKEN` seeds the first
-token on initial boot; after that the dashboard is the source of truth.
+MCP tokens are stored in Postgres (`admin_auth_tokens`) and **rotatable from
+`/admin`** without a redeploy. There is **one active token per surface**:
+
+| surface | label | how the client sends it |
+| --- | --- | --- |
+| claude.ai web connector | `web` | `?token=<token>` in the URL (the web connector can't send headers) |
+| Claude Desktop **and** the Claude Code CLI | `desktop-cli` | `Authorization: Bearer <token>` |
+
+The gate accepts **any** active token, so each surface can be **rotated or
+revoked independently** — rotating `web` never disturbs `desktop-cli`. The
+`/admin` page shows one card per surface with a ready-to-paste URL/command and
+its own rotate button.
+
+`MCP_AUTH_TOKEN` seeds the **`web`** token on initial boot (so an existing
+claude.ai connector keeps working); `desktop-cli` is auto-generated. After first
+boot the dashboard is the source of truth.
 
 - `/admin` is password-gated by **`ADMIN_PASSWORD`** (signed, HttpOnly session
   cookie, CSRF-protected). Without it the dashboard refuses logins.
-- Present the token on `/mcp` as `Authorization: Bearer <token>` or, for
-  headerless clients, `?token=<token>`.
 - The only routes not behind the bearer gate are `GET /healthz`, the streamed
   `GET /artifact/{sha256}`, and `/admin` (which self-authenticates).
+
+**Stateless transport.** `/mcp` runs in stateless HTTP mode
+(`http_app(stateless_http=True)`): every request is self-contained, with no
+in-memory session affinity. Client sessions therefore survive VM
+restarts/redeploys, and the three surfaces share no server-side session state.
 
 ## Architecture
 
@@ -90,9 +107,12 @@ token on initial boot; after that the dashboard is the source of truth.
   retried — other operational errors (lock timeout, too-many-connections) surface
   unchanged. Writes retry only when a replay is safe: `artifact_put`
   (content-addressed) always, and `memory_save`/`handoff_save`/`memory_delete`
-  only when given an `event_id` (exactly-once). Non-idempotent writes (`session_*`,
-  or a save with no `event_id`) run once and surface the error, so a transparent
-  retry can never cause a silent double-write.
+  only when given an `event_id` (exactly-once). The `session_*` writes also retry,
+  with an explicit tradeoff: a drop in the narrow commit-ack window means
+  `session_create` may orphan an empty, unreferenced session row, and
+  `session_append_event` is **at-least-once** (a replay can append one duplicate
+  event). For an append-only session log that beats failing the call outright; a
+  save with no `event_id` still runs once and surfaces the error.
 - Write-path `sanitize` strips forged delimiters/control chars; reads wrap values
   in `<<<UNTRUSTED_DATA>>>` markers (lethal-trifecta defense). **Note:** the
   `value` (and session-event `payload`) fields come back wrapped, so a consumer

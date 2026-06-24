@@ -23,6 +23,48 @@ from admin_store import AdminStore
 SESSION_COOKIE = "admin_session"
 SESSION_TTL = 12 * 60 * 60  # 12 hours
 
+# One MCP token per surface. Each surface gets its own card on the dashboard with
+# a ready-to-use URL/token and the right setup snippet, and rotates independently.
+# (Claude Desktop and the Claude Code CLI share one token — both send a Bearer
+# header — so there are two surfaces, not three.)
+SURFACES = [
+    {
+        "label": "web",
+        "title": "claude.ai (web connector)",
+        "blurb": "Add a custom connector in claude.ai → Settings → Connectors. "
+                 "The web connector can't send headers, so the token rides in the URL.",
+    },
+    {
+        "label": "desktop-cli",
+        "title": "Claude Desktop & Claude Code CLI",
+        "blurb": "Both send an Authorization: Bearer header. Use the CLI command, "
+                 "or paste the JSON into claude_desktop_config.json.",
+    },
+]
+SURFACE_LABELS = [s["label"] for s in SURFACES]
+
+
+def _snippets_for(label: str, mcp_url: str, token: str) -> list[tuple[str, str]]:
+    """(heading, copyable-content) blocks shown for a surface."""
+    if label == "web":
+        return [("Connector URL (paste into claude.ai)", f"{mcp_url}?token={token}")]
+    # desktop-cli
+    cli = (
+        f'claude mcp add -s user --transport http assist-memory {mcp_url} '
+        f'-H "Authorization: Bearer {token}"'
+    )
+    desktop = (
+        '{\n  "mcpServers": {\n    "assist-memory": {\n'
+        '      "type": "http",\n'
+        f'      "url": "{mcp_url}",\n'
+        f'      "headers": {{ "Authorization": "Bearer {token}" }}\n'
+        '    }\n  }\n}'
+    )
+    return [
+        ("Claude Code CLI", cli),
+        ("Claude Desktop (claude_desktop_config.json)", desktop),
+    ]
+
 
 def _sign(secret: str, msg: str) -> str:
     return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
@@ -121,32 +163,54 @@ def _login_page(error: str = "") -> HTMLResponse:
     return HTMLResponse(body)
 
 
-def _dashboard_page(request: Request, admin: AdminStore, session_secret: str,
-                    session_cookie: str) -> HTMLResponse:
-    info = admin.info()
+def _block(title: str, content: str) -> str:
+    esc = html.escape(content)
+    return (
+        f'<div class="topbar" style="margin-top:14px"><h2>{html.escape(title)}</h2>'
+        f'<button class="btn secondary copy" type="button" data-copy="{esc}" '
+        f'onclick="copyText(this)">Copy</button></div>'
+        f'<pre>{esc}</pre>'
+    )
+
+
+def _surface_card(surface: dict, info, mcp_url: str, csrf: str) -> str:
+    label = surface["label"]
     token = info.token if info else ""
     created = info.created_at.strftime("%Y-%m-%d %H:%M UTC") if info else "—"
+    esc_token = html.escape(token)
+    snippets = "".join(_block(h, c) for h, c in _snippets_for(label, mcp_url, token))
+    confirm = (
+        f"Rotate the {label} token? Every {html.escape(surface['title'])} client "
+        "using the current token will stop working until updated."
+    )
+    return f"""<div class="card">
+<div class="topbar"><h2>{html.escape(surface['title'])}</h2>
+<form method="post" action="/admin/rotate" style="margin:0"
+ onsubmit="return confirm('{confirm}');">
+<input type="hidden" name="csrf" value="{csrf}">
+<input type="hidden" name="label" value="{html.escape(label)}">
+<button class="btn danger" type="submit">Rotate</button></form></div>
+<p class="muted" style="margin:0 0 12px">{html.escape(surface['blurb'])}</p>
+<div class="row">
+<div class="token" id="tok-{html.escape(label)}">{esc_token}</div>
+<button class="btn" type="button" data-copy="{esc_token}" onclick="copyText(this)">Copy token</button>
+</div>
+<div class="meta">Created {created}</div>
+{snippets}
+</div>"""
+
+
+def _dashboard_page(request: Request, admin: AdminStore, session_secret: str,
+                    session_cookie: str) -> HTMLResponse:
     base = _base_url(request)
     mcp_url = f"{base}/mcp"
     csrf = csrf_token(session_secret, session_cookie)
-    esc_token = html.escape(token)
     esc_mcp = html.escape(mcp_url)
 
-    cli = f'claude mcp add -s user --transport http assist-memory {mcp_url} -H "Authorization: Bearer {token}"'
-    web = f"{mcp_url}?token={token}"
-    cursor = (
-        '{"mcpServers": {"assist-memory": {"url": "%s", '
-        '"headers": {"Authorization": "Bearer %s"}}}}' % (mcp_url, token)
+    active = {t.label: t for t in admin.list_tokens()}
+    cards = "".join(
+        _surface_card(s, active.get(s["label"]), mcp_url, csrf) for s in SURFACES
     )
-
-    def block(title: str, content: str) -> str:
-        esc = html.escape(content)
-        return (
-            f'<div class="card"><div class="topbar"><h2>{title}</h2>'
-            f'<button class="btn secondary copy" type="button" data-copy="{esc}" '
-            f'onclick="copyText(this)">Copy</button></div>'
-            f'<pre>{esc}</pre></div>'
-        )
 
     body = f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -157,32 +221,19 @@ def _dashboard_page(request: Request, admin: AdminStore, session_secret: str,
 <form method="post" action="/admin/logout" style="margin:0">
 <input type="hidden" name="csrf" value="{csrf}">
 <button class="btn secondary" type="submit">Sign out</button></form></div>
-<p class="sub">This is the live token. Rotating it immediately invalidates the old one.</p>
-
-<div class="card"><h2>Live auth token</h2>
-<div class="row">
-<div class="token" id="tok">{esc_token}</div>
-<button class="btn" type="button" data-copy="{esc_token}" onclick="copyText(this)">Copy token</button>
-</div>
-<div class="meta">Created {created}</div>
-<form method="post" action="/admin/rotate" style="margin-top:16px"
- onsubmit="return confirm('Rotate the token? Every client using the current token will stop working until updated.');">
-<input type="hidden" name="csrf" value="{csrf}">
-<button class="btn danger" type="submit">Rotate token</button>
-</form>
-</div>
+<p class="sub">One token per surface — rotate any one independently; the others keep
+working. Rotating immediately invalidates that surface's old token.</p>
 
 <div class="card"><h2>Endpoint</h2>
 <div class="row"><div class="token">{esc_mcp}</div>
 <button class="btn secondary" type="button" data-copy="{esc_mcp}" onclick="copyText(this)">Copy</button></div>
 </div>
 
-{block("Claude Code CLI / Desktop", cli)}
-{block("claude.ai web connector URL", web)}
-{block("Cursor (~/.cursor/mcp.json)", cursor)}
+{cards}
 
-<p class="muted">Other clients: streamable-http transport to {esc_mcp} with the
-bearer header, or <code>?token=&lt;token&gt;</code> if headers aren't supported.</p>
+<p class="muted">Other header-capable clients: streamable-http transport to
+{esc_mcp} with <code>Authorization: Bearer &lt;token&gt;</code>, or
+<code>?token=&lt;token&gt;</code> if headers aren't supported.</p>
 </div></body></html>"""
     return HTMLResponse(body)
 
@@ -227,7 +278,10 @@ def build_routes(admin: AdminStore, session_secret: str, admin_password: str = "
         form = await request.form()
         if not _check(request, form):
             return RedirectResponse("/admin/login", status_code=303)
-        admin.rotate()
+        label = str(form.get("label", ""))
+        if label not in SURFACE_LABELS:
+            return RedirectResponse("/admin", status_code=303)
+        admin.rotate(label)
         return RedirectResponse("/admin", status_code=303)
 
     async def logout_post(request: Request) -> Response:

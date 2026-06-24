@@ -13,21 +13,33 @@ two concerns are deliberately kept apart.
 
 **Why separate table:** token-management data must never mingle with agent memory.
 
-- `MCP_AUTH_TOKEN` is optional now — only used to *seed* the first token on first
-  boot (`AdminStore.ensure_token(seed=...)`). After that the dashboard is the
-  source of truth. Rotation takes effect with no redeploy.
-- Auth reads the live token via a `token_provider` callable passed into
-  `BearerAuthMiddleware`; `/admin*` paths are exempt from bearer auth and gated
-  by their own ADMIN_PASSWORD session instead.
+**One token PER SURFACE (label), not one global token.** Each row has a `label`;
+there is one active token per label. Surfaces: `web` (claude.ai connector — sends
+the token as `?token=` because it can't set headers) and `desktop-cli` (Claude
+Desktop + Claude Code CLI — both send `Authorization: Bearer`). The gate accepts
+ANY active token, so each surface rotates/revokes independently. `/admin` shows
+one card per surface (URL/command + its own rotate button, hidden `label` field;
+`rotate_post` validates `label` against `SURFACE_LABELS` to block injection).
+
+- `MCP_AUTH_TOKEN` only *seeds* the `web` token on first boot (so an existing
+  claude.ai connector keeps working); `desktop-cli` is auto-generated.
+  `AdminStore.ensure_tokens(labels, seed={"web": ...})` — never overwrites an
+  existing label. After first boot the dashboard is the source of truth; rotation
+  takes effect with no redeploy.
+- Auth middleware accepts any value in `AdminStore.get_active_tokens()` (a set)
+  via constant-time `hmac.compare_digest`, Bearer header OR `?token=`. `/admin*`
+  is exempt from bearer auth and gated by its own ADMIN_PASSWORD session.
 - `/admin` session = HMAC-signed cookie (SESSION_SECRET); CSRF token is bound to
   the session cookie and enforced on `/admin/rotate`.
 
-**Cache + multi-worker rule:** `AdminStore.get_active_token()` caches the active
-token for `CACHE_TTL_SECONDS` (5s), then re-reads Postgres. A permanent cache
+**Cache + multi-worker rule:** `AdminStore.get_active_tokens()` caches the active
+token set for `CACHE_TTL_SECONDS` (5s), then re-reads Postgres. A permanent cache
 would cause auth split-brain under multiple uvicorn workers (rotation on one
-worker never reaches the others). The DB also has a partial unique index
-(`uniq_admin_auth_token_active` on `active WHERE active`) so there is always
-exactly one active row.
+worker never reaches the others). The DB has a partial unique index
+(`uniq_admin_auth_token_active_label` on `(label) WHERE active`) so there is
+exactly one active row PER LABEL. `init()` upgrades an old single-token table by
+adding `label` (default `web`, preserving the live token) and dropping the old
+global `uniq_admin_auth_token_active` index.
 **How to apply:** if you ever add more cache layers or workers, preserve the TTL
 re-read (or switch to LISTEN/NOTIFY) — never cache the token indefinitely.
 

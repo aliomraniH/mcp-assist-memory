@@ -15,18 +15,25 @@ replay is safe. Two independent gates:
    command"). Other operational errors (lock timeout `55P03`, too-many-connections
    `53300`, …) must surface unchanged.
 
-2. **Idempotency gate** — auto-retry reads and *idempotent* writes only.
+2. **Idempotency gate** — auto-retry reads and *idempotent* writes always; retry
+   the session writes too but with eyes open about the tradeoff.
    - Reads: always retry.
    - `artifact_put`: always (content-addressed + `ON CONFLICT DO NOTHING`).
    - `memory_save` / `handoff_save` / `memory_delete`: retry only when an
      `event_id` is supplied (exactly-once, so a replay collapses to a no-op).
-   - `session_create`, `session_append_event`, and any save WITHOUT an
-     `event_id`: never auto-retry — run once and surface the error.
+   - `session_create` / `session_append_event`: **DO retry** — production
+     failures were all 57P01 drops on exactly these two paths. Accepted tradeoff:
+     a drop in the commit-ack window means `session_create` may orphan an empty
+     unreferenced session row, and `session_append_event` is **at-least-once**
+     (a replay can append one duplicate event). For an append-only session log
+     that is strictly better than failing the call.
+   - A save WITHOUT an `event_id`: still never auto-retry — run once, surface.
 
 **Why:** a backend terminated mid-transaction rolls back (safe to replay), but a
-drop in the narrow commit-but-before-ack window would replay a non-idempotent
-write and double it. Gating on idempotency means a transparent retry can never
-cause a silent double-write.
+drop in the narrow commit-but-before-ack window would replay a write and double
+it. For most writes we avoid that by gating on `event_id`; for `session_*` we
+deliberately accept the at-least-once duplicate because a hard failure mid-tool-
+call is worse than a rare duplicate event in an append-only log.
 
 **How to apply:** when adding a new backend method, decide read vs write and
 whether it is idempotent BEFORE wiring retries. Decorate reads + idempotent

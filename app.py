@@ -7,11 +7,17 @@ explicit timeouts, opened immediately, and a single SELECT 1 readiness probe is
 wrapped in asyncio.timeout(). On failure we raise — a terminal crash lets the
 Reserved VM restart instead of hanging forever.
 
-Auth: the live MCP bearer token is managed in Postgres (admin_auth_tokens) and
-rotatable via /admin without a redeploy. The middleware reads it on every
-request (5s cache). Single shared token today; per-project tokens are the v2
-roadmap item (see REUSABILITY.md). /healthz, /artifact, and /admin are not
-behind the bearer gate (/admin enforces its own password session).
+Auth: the live MCP tokens are managed in Postgres (admin_auth_tokens) and
+rotatable via /admin without a redeploy. One active token per surface label
+(``web`` for the claude.ai connector, ``desktop-cli`` for Claude Desktop + the
+Claude Code CLI); the gate accepts ANY active token, so surfaces rotate/revoke
+independently. The middleware reads them on every request (5s cache). /healthz,
+/artifact, and /admin are not behind the bearer gate (/admin enforces its own
+password session).
+
+Transport: the MCP app runs in stateless HTTP mode — every request is
+self-contained, so client sessions survive VM restarts/redeploys and there is no
+in-memory session affinity to lose across the three surfaces.
 """
 from __future__ import annotations
 
@@ -30,7 +36,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from admin_store import AdminStore
 from config import settings
-from dashboard import build_routes
+from dashboard import SURFACE_LABELS, build_routes
 from server.mcp_server import deps, mcp
 from storage.postgres import PostgresBackend
 
@@ -77,9 +83,10 @@ def _build_pool() -> AsyncConnectionPool:
     )
 
 
-# The MCP ASGI app (Streamable HTTP). Its lifespan runs the session manager and
-# must be entered while serving.
-mcp_app = mcp.http_app(path="/")
+# The MCP ASGI app (Streamable HTTP), stateless: each request is self-contained,
+# so the three surfaces share no in-memory session state and survive restarts.
+# Its lifespan still runs the session manager and must be entered while serving.
+mcp_app = mcp.http_app(path="/", stateless_http=True)
 
 
 @asynccontextmanager
@@ -95,9 +102,11 @@ async def lifespan(app: FastAPI):
         await pool.close()
         raise  # terminal crash -> supervised restart, never a hung lifespan
 
-    # Token table + seed the live token from MCP_AUTH_TOKEN on first boot.
+    # Token table + ensure one active token per surface. The web token is seeded
+    # from MCP_AUTH_TOKEN on first boot (so existing connector registrations keep
+    # working); the desktop-cli token is generated and managed via /admin.
     admin.init()
-    admin.ensure_token(seed=settings.mcp_auth_token or None)
+    admin.ensure_tokens(SURFACE_LABELS, seed={"web": settings.mcp_auth_token or None})
     if not _admin_password:
         log.warning("admin_password_unset")  # /admin login disabled until set
 
@@ -123,19 +132,24 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path.startswith("/mcp"):
-            expected = admin.get_active_token()
-            if not expected or not _request_has_token(request, expected):
+            active = admin.get_active_tokens()
+            if not active or not _request_has_token(request, active):
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 
 
-def _request_has_token(request: Request, expected: str) -> bool:
+def _matches_any(presented: str, active: set[str]) -> bool:
+    # Constant-time compare against each active token; any match authorizes.
+    return any(hmac.compare_digest(presented.encode(), t.encode()) for t in active)
+
+
+def _request_has_token(request: Request, active: set[str]) -> bool:
     auth = request.headers.get("authorization", "")
-    if auth and hmac.compare_digest(auth.encode(), f"Bearer {expected}".encode()):
+    if auth.startswith("Bearer ") and _matches_any(auth[len("Bearer ") :], active):
         return True
     # Fallback for headerless clients (e.g. the claude.ai web connector): ?token=
     for candidate in parse_qs(request.url.query).get("token", []):
-        if hmac.compare_digest(candidate.encode(), expected.encode()):
+        if _matches_any(candidate, active):
             return True
     return False
 

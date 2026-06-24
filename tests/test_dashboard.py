@@ -68,22 +68,32 @@ def test_admin_login_rotate_and_mcp_auth():
         assert r.status_code == 303
 
         page = client.get("/admin").text
-        token = re.search(r'id="tok">([^<]+)<', page).group(1)
+        web = re.search(r'id="tok-web">([^<]+)<', page).group(1)
+        desktop = re.search(r'id="tok-desktop-cli">([^<]+)<', page).group(1)
         csrf = re.search(r'name="csrf" value="([^"]+)"', page).group(1)
-        assert token
+        assert web and desktop and web != desktop  # one distinct token per surface
 
-        # bearer gate on /mcp uses the live token
+        # bearer gate on /mcp: no token rejected, EITHER active token accepted
         assert client.post("/mcp/", json=INIT, headers=MCP_HEADERS).status_code == 401
-        ok = client.post("/mcp/", json=INIT, headers={**MCP_HEADERS, "Authorization": f"Bearer {token}"})
-        assert ok.status_code != 401
+        for tok in (web, desktop):
+            ok = client.post("/mcp/", json=INIT, headers={**MCP_HEADERS, "Authorization": f"Bearer {tok}"})
+            assert ok.status_code != 401
+        # web surface can't send headers -> ?token= must also be accepted
+        assert client.post(f"/mcp/?token={web}", json=INIT, headers=MCP_HEADERS).status_code != 401
 
-        # rotate → token changes, old rejected, new accepted
-        assert client.post("/admin/rotate", data={"csrf": csrf}, follow_redirects=False).status_code == 303
-        new_token = re.search(r'id="tok">([^<]+)<', client.get("/admin").text).group(1)
-        assert new_token != token
+        # rotate ONLY web → web token changes & old web rejected, desktop untouched
         assert client.post(
-            "/mcp/", json=INIT, headers={**MCP_HEADERS, "Authorization": f"Bearer {token}"}
+            "/admin/rotate", data={"csrf": csrf, "label": "web"}, follow_redirects=False
+        ).status_code == 303
+        page2 = client.get("/admin").text
+        new_web = re.search(r'id="tok-web">([^<]+)<', page2).group(1)
+        same_desktop = re.search(r'id="tok-desktop-cli">([^<]+)<', page2).group(1)
+        assert new_web != web
+        assert same_desktop == desktop  # rotating one surface leaves the other intact
+        assert client.post(
+            "/mcp/", json=INIT, headers={**MCP_HEADERS, "Authorization": f"Bearer {web}"}
         ).status_code == 401
-        assert client.post(
-            "/mcp/", json=INIT, headers={**MCP_HEADERS, "Authorization": f"Bearer {new_token}"}
-        ).status_code != 401
+        for tok in (new_web, same_desktop):
+            assert client.post(
+                "/mcp/", json=INIT, headers={**MCP_HEADERS, "Authorization": f"Bearer {tok}"}
+            ).status_code != 401

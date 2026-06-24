@@ -1,5 +1,6 @@
-- [Admin token dashboard](admin-token-dashboard.md) — MCP bearer token is dashboard-managed in a separate Postgres DB; cache has a 5s TTL (never cache indefinitely) and one active row enforced by a partial unique index.
+- [Admin token dashboard](admin-token-dashboard.md) — one dashboard-managed MCP token PER SURFACE label (web/desktop-cli); gate accepts any active token; 5s cache; one active row per label via partial unique index.
 - [Git push past corrupt ref / diverged remote](git-push-corrupt-ref.md) — clone --single-branch to a temp repo to push past a corrupt unrelated ref; reconcile a diverged remote with merge -s ours (no force).
-- [MCP auth token: seed vs live](mcp-auth-token-seed.md) — env MCP_AUTH_TOKEN only seeds the FIRST token; live token lives in Postgres, owned by /admin.
-- [Reconnect retry policy](reconnect-retry-policy.md) — transparent disconnect-retry is idempotency-gated: retry reads + idempotent writes only, never blanket-wrap; gate writes on event_id.
+- [MCP auth token: seed vs live](mcp-auth-token-seed.md) — env MCP_AUTH_TOKEN only seeds the `web` token; live per-label tokens live in Postgres, owned by /admin; verify with list_tokens().
+- [Reconnect retry policy](reconnect-retry-policy.md) — disconnect-retry: reads + event_id-gated writes always; session_* writes retry too (accepted at-least-once tradeoff); saves w/o event_id never retry.
+- [MCP stateless transport](mcp-stateless-transport.md) — /mcp runs stateless_http=True so sessions survive VM restart/redeploy; never revert to stateful to "fix" a session bug.
 - [Publish DB migration validation](publish-db-migration-validation.md) — "Failed to validate database migrations" on republish = legacy/shared Neon dev DB; fix = republish with "Create production database" + copy dev data (user action, can't be disabled).

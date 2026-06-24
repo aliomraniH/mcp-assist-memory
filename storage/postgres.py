@@ -280,6 +280,8 @@ class PostgresBackend(StorageBackend):
         return await self.memory_list(namespace, kind="handoff", limit=limit)
 
     # --------------------------------------------------------------- sessions
+    @_retry_on_disconnect  # a drop in the commit-ack window at worst orphans an
+                           # unreferenced empty session row — harmless vs. a hard failure.
     async def session_create(self, namespace, *, surface=None, metadata=None) -> dict:
         sid = uuid.uuid4()
         async with self.pool.connection() as conn:
@@ -292,6 +294,9 @@ class PostgresBackend(StorageBackend):
             row = await cur.fetchone()
         return _session_to_dict(row)
 
+    @_retry_on_disconnect  # at-least-once under a mid-failover drop: a replay in the
+                           # narrow commit-ack window may append one duplicate event —
+                           # acceptable for an append-only log vs. failing the call.
     async def session_append_event(self, namespace, session_id, kind, payload) -> dict:
         last_exc: Exception | None = None
         for _ in range(_MAX_RETRIES):
