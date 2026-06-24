@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>assist-memory · MCP Capabilities</title>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#111722; --panel2:#0e141d; --line:#1e2836;
+    --ink:#e6edf3; --mut:#8b98a9; --dim:#5d6b7d;
+    --cyan:#39d3e6; --violet:#a78bfa; --green:#4ade80; --amber:#fbbf24; --rose:#fb7185;
+    --mono:'SF Mono',ui-monospace,'JetBrains Mono','Fira Code',Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:
+      radial-gradient(900px 500px at 12% -8%,rgba(57,211,230,.10),transparent 60%),
+      radial-gradient(800px 600px at 100% 0%,rgba(167,139,250,.10),transparent 55%),
+      var(--bg);
+    color:var(--ink);font-family:var(--sans);line-height:1.6;
+    -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+  a{color:var(--cyan);text-decoration:none}
+
+  /* hero */
+  header.hero{padding:72px 0 40px;border-bottom:1px solid var(--line)}
+  .badge{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);
+    font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--cyan);
+    background:rgba(57,211,230,.08);border:1px solid rgba(57,211,230,.25);
+    padding:5px 12px;border-radius:999px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--green);
+    box-shadow:0 0 0 3px rgba(74,222,128,.18)}
+  h1{font-size:clamp(34px,5vw,52px);line-height:1.05;margin:20px 0 10px;
+    letter-spacing:-.02em;font-weight:800}
+  h1 .grad{background:linear-gradient(100deg,var(--cyan),var(--violet));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .lede{font-size:19px;color:var(--mut);max-width:680px}
+  .meta-row{display:flex;flex-wrap:wrap;gap:10px;margin-top:24px}
+  .pill{font-family:var(--mono);font-size:12.5px;color:var(--mut);
+    border:1px solid var(--line);background:var(--panel);padding:6px 11px;border-radius:8px}
+  .pill b{color:var(--ink);font-weight:600}
+
+  section{padding:48px 0;border-bottom:1px solid var(--line)}
+  .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--violet);margin:0 0 6px}
+  h2{font-size:27px;margin:0 0 6px;letter-spacing:-.01em;font-weight:700}
+  .sub{color:var(--mut);margin:0 0 26px;max-width:720px}
+
+  .grid{display:grid;gap:16px}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .g2{grid-template-columns:repeat(2,1fr)}
+  @media(max-width:820px){.g3,.g2{grid-template-columns:1fr}}
+
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel2));
+    border:1px solid var(--line);border-radius:14px;padding:20px 20px 18px;
+    position:relative;overflow:hidden}
+  .card:before{content:"";position:absolute;inset:0 0 auto 0;height:2px;
+    background:linear-gradient(90deg,transparent,var(--accent,var(--cyan)),transparent);opacity:.7}
+  .card h3{margin:2px 0 8px;font-size:16.5px;display:flex;align-items:center;gap:9px}
+  .card p{margin:0;color:var(--mut);font-size:14.5px}
+  .ico{font-size:18px}
+
+  /* tool group */
+  .tool-group{background:var(--panel2);border:1px solid var(--line);border-radius:14px;
+    padding:18px 20px 8px;margin-bottom:16px}
+  .tool-group>.gh{display:flex;align-items:baseline;gap:12px;margin-bottom:6px}
+  .tool-group .gh h3{margin:0;font-size:17px}
+  .tool-group .gh .tag{font-family:var(--mono);font-size:11.5px;color:var(--dim)}
+  .tool-group .gh .desc{color:var(--mut);font-size:14px;margin-left:auto;text-align:right}
+  .tools{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--line);
+    border:1px solid var(--line);border-radius:10px;overflow:hidden;margin:12px 0 14px}
+  @media(max-width:680px){.tools{grid-template-columns:1fr}}
+  .tool{background:var(--panel);padding:11px 14px}
+  .tool code{font-family:var(--mono);font-size:13.5px;color:var(--cyan)}
+  .tool span{display:block;color:var(--mut);font-size:13px;margin-top:2px}
+
+  ul.clean{list-style:none;padding:0;margin:0}
+  ul.clean li{padding:10px 0;border-bottom:1px solid var(--line);color:var(--mut)}
+  ul.clean li:last-child{border-bottom:0}
+  ul.clean b{color:var(--ink)}
+
+  /* demo */
+  .demo{background:#070a0f;border:1px solid var(--line);border-radius:14px;overflow:hidden}
+  .demo .bar{display:flex;align-items:center;gap:8px;padding:11px 16px;
+    border-bottom:1px solid var(--line);background:var(--panel2)}
+  .demo .bar .b{width:11px;height:11px;border-radius:50%}
+  .b.r{background:#ff5f57}.b.y{background:#febc2e}.b.g{background:#28c840}
+  .demo .bar .t{font-family:var(--mono);font-size:12.5px;color:var(--dim);margin-left:8px}
+  .step{padding:16px 18px;border-bottom:1px solid var(--line)}
+  .step:last-child{border-bottom:0}
+  .step .lbl{font-family:var(--mono);font-size:12px;letter-spacing:.06em;
+    text-transform:uppercase;color:var(--violet);margin-bottom:8px}
+  pre{margin:0;font-family:var(--mono);font-size:13px;line-height:1.55;color:var(--ink);
+    overflow-x:auto;white-space:pre-wrap;word-break:break-word}
+  .req{color:var(--cyan)} .k{color:var(--violet)} .s{color:var(--green)}
+  .n{color:var(--amber)} .warnv{color:var(--rose)}
+  .note{font-size:13.5px;color:var(--mut);margin-top:10px}
+  .note b{color:var(--amber)}
+
+  .statgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:6px}
+  @media(max-width:680px){.statgrid{grid-template-columns:repeat(2,1fr)}}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .stat .v{font-size:26px;font-weight:800;font-family:var(--mono);
+    background:linear-gradient(120deg,var(--cyan),var(--violet));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .stat .l{font-size:12.5px;color:var(--mut);margin-top:2px;font-family:var(--mono)}
+
+  footer{padding:34px 0 60px;color:var(--dim);font-size:13.5px}
+  footer code{font-family:var(--mono);color:var(--mut)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <span class="badge"><span class="dot"></span> Live · Tier-1 MCP server</span>
+    <h1><span class="grad">assist-memory</span><br>a shared brain for Claude</h1>
+    <p class="lede">A persistent memory, handoff &amp; artifact layer exposed over the
+      Model Context Protocol. Write a decision in the web app, recall it from the CLI
+      tomorrow — with full history, file attachments and session timelines, scoped per project.</p>
+    <div class="meta-row">
+      <span class="pill"><b>18</b> MCP tools</span>
+      <span class="pill"><b>Python 3.11</b> · FastAPI + FastMCP</span>
+      <span class="pill"><b>Postgres</b> + pgvector</span>
+      <span class="pill"><b>Stateless</b> Streamable HTTP</span>
+      <span class="pill">Reserved VM</span>
+    </div>
+  </header>
+
+  <!-- CONNECTION LAYER -->
+  <section>
+    <p class="kicker">Connection layer</p>
+    <h2>How clients connect</h2>
+    <p class="sub">The transport and auth model we hardened so three surfaces —
+      claude.ai, Claude Desktop and the Claude Code CLI — connect reliably and survive restarts.</p>
+    <div class="grid g3">
+      <div class="card" style="--accent:var(--cyan)">
+        <h3><span class="ico">🔑</span> Two managed tokens</h3>
+        <p>One token per surface — <b>web</b> (token in the URL, for the headerless
+          claude.ai connector) and <b>desktop-cli</b> (Bearer header, shared by Desktop + CLI).
+          Each rotates independently from the password-gated <code>/admin</code> page.</p>
+      </div>
+      <div class="card" style="--accent:var(--violet)">
+        <h3><span class="ico">♾️</span> Stateless transport</h3>
+        <p>Every request is self-contained — no in-memory session affinity — so client
+          sessions <b>survive VM restarts &amp; redeploys</b>. This fixed the earlier
+          intermittent "session" failures.</p>
+      </div>
+      <div class="card" style="--accent:var(--green)">
+        <h3><span class="ico">🛡️</span> Transparent retries</h3>
+        <p>A dropped Postgres connection mid-call (Neon scale-down, <code>57P01</code>)
+          is retried on a fresh connection instead of erroring out to Claude — including
+          the session-write path.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- TOOLS -->
+  <section>
+    <p class="kicker">The surface</p>
+    <h2>18 tools, five groups</h2>
+    <p class="sub">Every per-project tool takes a required <code>namespace</code>
+      (namespace = project = tenant); the backend filters every query on it. Artifacts
+      are the exception — content-addressed and global.</p>
+
+    <div class="tool-group">
+      <div class="gh"><h3>🧠 Memory</h3><span class="tag">durable · versioned</span>
+        <span class="desc">Append-only key/value notes with full revision history</span></div>
+      <div class="tools">
+        <div class="tool"><code>memory_save</code><span>Append a new revision (note / decision / todo / handoff / config)</span></div>
+        <div class="tool"><code>memory_get</code><span>Latest live value for a key</span></div>
+        <div class="tool"><code>memory_list</code><span>All live entries, filter by kind / tag</span></div>
+        <div class="tool"><code>memory_history</code><span>Full revision trail, incl. deletions</span></div>
+        <div class="tool"><code>memory_delete</code><span>Soft-delete (tombstone; history kept)</span></div>
+        <div class="tool"><code>memory_search</code><span>Substring search within one project</span></div>
+      </div>
+    </div>
+
+    <div class="tool-group">
+      <div class="gh"><h3>🤝 Handoff</h3><span class="tag">cross-surface</span>
+        <span class="desc">Pass context between web, desktop &amp; CLI</span></div>
+      <div class="tools">
+        <div class="tool"><code>handoff_save</code><span>Write context under a shared key</span></div>
+        <div class="tool"><code>handoff_load</code><span>Read the latest handoff for a key</span></div>
+        <div class="tool"><code>handoff_list</code><span>List active handoffs in a project</span></div>
+      </div>
+    </div>
+
+    <div class="tool-group">
+      <div class="gh"><h3>📼 Session</h3><span class="tag">episodic</span>
+        <span class="desc">Ordered timelines of what happened</span></div>
+      <div class="tools">
+        <div class="tool"><code>session_create</code><span>Start a session, returns session_id</span></div>
+        <div class="tool"><code>session_append_event</code><span>Append an ordered event (seq)</span></div>
+        <div class="tool"><code>session_get</code><span>Fetch session metadata</span></div>
+        <div class="tool"><code>session_list</code><span>Recent sessions, newest first</span></div>
+        <div class="tool"><code>session_events</code><span>Replay events in seq order</span></div>
+      </div>
+    </div>
+
+    <div class="tool-group">
+      <div class="gh"><h3>📦 Artifact</h3><span class="tag">immutable · global</span>
+        <span class="desc">Content-addressed blob storage (sha256)</span></div>
+      <div class="tools">
+        <div class="tool"><code>artifact_put</code><span>Store a blob (base64, 50&nbsp;MB cap) → sha256</span></div>
+        <div class="tool"><code>artifact_get</code><span>Metadata; small inline, large streamed</span></div>
+        <div class="tool"><code>artifact_list</code><span>List stored artifacts</span></div>
+      </div>
+    </div>
+
+    <div class="tool-group">
+      <div class="gh"><h3>⚙️ Admin</h3><span class="tag">observability</span>
+        <span class="desc">Store-wide health &amp; counts</span></div>
+      <div class="tools">
+        <div class="tool"><code>stats</code><span>Memory revisions/keys, sessions, events, artifacts, bytes</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- LIVE DEMO -->
+  <section>
+    <p class="kicker">Proof · captured live</p>
+    <h2>A real round-trip</h2>
+    <p class="sub">Run just now against the running server over the MCP Streamable HTTP
+      endpoint with the <code>desktop-cli</code> Bearer token — save a decision, read it
+      back, list it, and pull store stats.</p>
+
+    <div class="demo">
+      <div class="bar"><span class="b r"></span><span class="b y"></span><span class="b g"></span>
+        <span class="t">POST /mcp/ · tools/call</span></div>
+
+      <div class="step">
+        <div class="lbl">① memory_save → proj-demo</div>
+<pre><span class="req">→</span> <span class="k">"name"</span>: <span class="s">"memory_save"</span>, <span class="k">"arguments"</span>: {
+    <span class="k">"namespace"</span>: <span class="s">"proj-demo"</span>,
+    <span class="k">"key"</span>: <span class="s">"launch-decision"</span>,
+    <span class="k">"value"</span>: <span class="s">"Ship the two-token auth model before GA."</span>,
+    <span class="k">"kind"</span>: <span class="s">"decision"</span>, <span class="k">"tags"</span>: [<span class="s">"auth"</span>,<span class="s">"launch"</span>]
+}
+<span class="req">←</span> { <span class="k">"revision"</span>: <span class="n">1</span>, <span class="k">"tombstone"</span>: false,
+    <span class="k">"value"</span>: <span class="warnv">"&lt;&lt;&lt;UNTRUSTED_DATA&gt;&gt;&gt;Ship the two-token auth model before GA.&lt;&lt;&lt;END&gt;&gt;&gt;"</span>,
+    <span class="k">"created_at"</span>: <span class="s">"2026-06-24T01:43:27Z"</span> }</pre>
+        <p class="note"><b>↑ See the wrapping?</b> That's the prompt-injection defense in
+          action — stored values are returned inside <code>&lt;&lt;&lt;UNTRUSTED_DATA&gt;&gt;&gt;</code>
+          markers so a model reading memory back can't be hijacked by its contents.</p>
+      </div>
+
+      <div class="step">
+        <div class="lbl">② memory_get → reads it straight back</div>
+<pre><span class="req">←</span> { <span class="k">"key"</span>: <span class="s">"launch-decision"</span>, <span class="k">"revision"</span>: <span class="n">1</span>, <span class="k">"kind"</span>: <span class="s">"decision"</span>,
+    <span class="k">"tags"</span>: [<span class="s">"auth"</span>, <span class="s">"launch"</span>] }</pre>
+      </div>
+
+      <div class="step">
+        <div class="lbl">③ memory_list → kind=decision</div>
+<pre><span class="req">←</span> [ { <span class="k">"key"</span>: <span class="s">"launch-decision"</span>, <span class="k">"kind"</span>: <span class="s">"decision"</span>, <span class="k">"revision"</span>: <span class="n">1</span> } ]</pre>
+      </div>
+
+      <div class="step">
+        <div class="lbl">④ stats → store-wide health</div>
+        <div class="statgrid">
+          <div class="stat"><div class="v">127</div><div class="l">memory_revisions</div></div>
+          <div class="stat"><div class="v">96</div><div class="l">memory_keys</div></div>
+          <div class="stat"><div class="v">12</div><div class="l">sessions</div></div>
+          <div class="stat"><div class="v">18</div><div class="l">session_events</div></div>
+          <div class="stat"><div class="v">11</div><div class="l">artifacts</div></div>
+          <div class="stat"><div class="v">1.36&nbsp;MB</div><div class="l">artifact_bytes</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CROSS-CUTTING -->
+  <section>
+    <p class="kicker">What makes it trustworthy</p>
+    <h2>Cross-cutting guarantees</h2>
+    <p class="sub">Properties that hold across every tool, not bolted onto any one of them.</p>
+    <ul class="clean">
+      <li><b>Namespace = project = tenant.</b> Every memory / handoff / session call is
+        filtered by namespace — no implicit cross-project reads. A <i>soft</i> boundary
+        today (any token holder can pass any namespace); per-project tokens are the v2 roadmap.</li>
+      <li><b>Append-only history.</b> Writes never overwrite — every change is a new
+        revision and deletes are tombstones, so the full trail is always recoverable.</li>
+      <li><b>Prompt-injection hardening.</b> Values are sanitized on write and returned
+        wrapped in <code>&lt;&lt;&lt;UNTRUSTED_DATA&gt;&gt;&gt;</code> markers — a defense
+        against the "lethal trifecta." Use <code>unwrap_value</code> for the raw string.</li>
+      <li><b>Content-addressed artifacts.</b> A blob's sha256 <i>is</i> its identity, so
+        identical content is stored once and shared globally; the hash is the capability.</li>
+      <li><b>Idempotent writes.</b> Pass a stable <code>event_id</code> for exactly-once
+        saves during offline reconcile, so a retried write collapses to a no-op.</li>
+    </ul>
+  </section>
+
+  <footer class="wrap">
+    <p><b style="color:var(--ink)">assist-memory</b> ·
+      <code>github.com/aliomraniH/mcp-assist-memory</code><br>
+      Endpoint <code>/mcp</code> (Bearer or <code>?token=</code>) ·
+      Admin <code>/admin</code> · Health <code>/healthz</code> ·
+      Generated 2026-06-24 from a live round-trip.</p>
+  </footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "E0jr4qV9OgvcCiI09Pbcr"
+uri = "file://screenshots/mcp-capabilities.jpg"
+type = "image"
+title = "assist-memory · MCP Capabilities (live at /capabilities)"
