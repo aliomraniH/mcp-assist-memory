@@ -34,6 +34,7 @@ class StorageBackend(abc.ABC):
         tags: list[str] | None = None,
         source_surface: str | None = None,
         event_id: str | None = None,
+        meta: dict | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod
@@ -49,7 +50,8 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     async def memory_delete(
-        self, namespace: str, key: str, *, source_surface: str | None = None, event_id: str | None = None
+        self, namespace: str, key: str, *, source_surface: str | None = None, event_id: str | None = None,
+        meta: dict | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod
@@ -60,7 +62,8 @@ class StorageBackend(abc.ABC):
     # ---------------- handoff: cross-surface convention, scoped to a project ----------------
     @abc.abstractmethod
     async def handoff_save(
-        self, namespace: str, key: str, value: Any, *, source_surface: str | None = None, event_id: str | None = None
+        self, namespace: str, key: str, value: Any, *, source_surface: str | None = None, event_id: str | None = None,
+        meta: dict | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod

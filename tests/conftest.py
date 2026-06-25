@@ -26,15 +26,25 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS memory_entry (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     namespace text NOT NULL, key text NOT NULL, revision integer NOT NULL,
-    kind text NOT NULL CHECK (kind IN ('note','decision','todo','handoff','config')),
+    kind text NOT NULL CHECK (kind IN ('note','decision','todo','handoff','config','claim','knowledge')),
     value jsonb NOT NULL, source_surface text, tags text[] NOT NULL DEFAULT '{}',
     event_id uuid, tombstone boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT now(), UNIQUE (namespace, key, revision));
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS embedding vector(1024);
+-- 0003_provenance.sql columns (mirrored inline so the suite is self-contained).
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS repo_sha   text;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS base_sha   text;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS branch     text;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS dirty      boolean;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS session_id text;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS meta       jsonb;
 CREATE UNIQUE INDEX IF NOT EXISTS memory_entry_event_id_uq
     ON memory_entry (event_id) WHERE event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS memory_entry_embedding_hnsw
     ON memory_entry USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS memory_entry_ns_repo_sha ON memory_entry (namespace, repo_sha);
+CREATE INDEX IF NOT EXISTS memory_entry_session_id  ON memory_entry (session_id);
+CREATE INDEX IF NOT EXISTS memory_entry_meta_gin    ON memory_entry USING gin (meta jsonb_path_ops);
 CREATE TABLE IF NOT EXISTS session (
     session_id uuid PRIMARY KEY DEFAULT gen_random_uuid(), namespace text NOT NULL,
     surface text, metadata jsonb NOT NULL DEFAULT '{}',

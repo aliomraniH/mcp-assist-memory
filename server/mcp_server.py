@@ -54,13 +54,20 @@ async def memory_save(
     tags: list[str] | None = None,
     source_surface: str | None = None,
     event_id: str | None = None,
+    meta: dict | None = None,
 ) -> dict:
     """Append a new revision of a memory entry in a project namespace.
-    kind ∈ note|decision|todo|handoff|config. Pass a stable event_id (uuid) for
-    exactly-once writes during offline reconcile."""
+    kind ∈ note|decision|todo|handoff|config|claim|knowledge (claim = a verifiable
+    assertion about external mutable state that expires; knowledge = a durable fact).
+    Pass a stable event_id (uuid) for exactly-once writes during offline reconcile.
+
+    meta is an optional coordination envelope: its repo_sha/base_sha/branch/dirty/
+    session_id keys are projected into indexed columns (the rest kept as-is) so a
+    reader can mechanically ask "is this still current?" instead of parsing prose.
+    Best-effort — omit it and the entry stores exactly as before."""
     return await _backend().memory_save(
         namespace, key, value, kind=kind, tags=tags,
-        source_surface=source_surface, event_id=event_id,
+        source_surface=source_surface, event_id=event_id, meta=meta,
     )
 
 
@@ -86,11 +93,13 @@ async def memory_history(namespace: str, key: str, limit: int = 50) -> list[dict
 
 @mcp.tool
 async def memory_delete(
-    namespace: str, key: str, source_surface: str | None = None, event_id: str | None = None
+    namespace: str, key: str, source_surface: str | None = None, event_id: str | None = None,
+    meta: dict | None = None,
 ) -> dict:
-    """Soft-delete a key by appending a tombstone revision (history preserved)."""
+    """Soft-delete a key by appending a tombstone revision (history preserved).
+    meta optionally records the provenance of the deletion (repo_sha/session_id…)."""
     return await _backend().memory_delete(
-        namespace, key, source_surface=source_surface, event_id=event_id
+        namespace, key, source_surface=source_surface, event_id=event_id, meta=meta,
     )
 
 
@@ -107,12 +116,14 @@ async def memory_search(namespace: str, query: str, limit: int = 20) -> list[dic
 # ------------------------------------------------------------------ handoff
 @mcp.tool
 async def handoff_save(
-    namespace: str, key: str, value: Any, source_surface: str | None = None, event_id: str | None = None
+    namespace: str, key: str, value: Any, source_surface: str | None = None, event_id: str | None = None,
+    meta: dict | None = None,
 ) -> dict:
     """Save a cross-surface handoff under a shared key within a project namespace
-    (read it back with handoff_load)."""
+    (read it back with handoff_load). meta is the optional coordination envelope
+    (see memory_save)."""
     return await _backend().handoff_save(
-        namespace, key, value, source_surface=source_surface, event_id=event_id
+        namespace, key, value, source_surface=source_surface, event_id=event_id, meta=meta,
     )
 
 

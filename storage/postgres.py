@@ -85,6 +85,23 @@ def _retry_if_idempotent(fn):
     return wrapper
 
 
+# Coordination-envelope keys projected out of `meta` into indexed columns. The
+# full envelope is still stored in the `meta` jsonb column, losslessly.
+_META_COLS = ("repo_sha", "base_sha", "branch", "dirty", "session_id")
+
+
+def _split_meta(meta: dict | None) -> tuple[Any, Any, Any, Any, Any, Any]:
+    """Return ``(repo_sha, base_sha, branch, dirty, session_id, meta_jsonb)``.
+
+    The five well-known keys become indexed columns; the whole envelope is kept
+    as jsonb (None when empty) so nothing the caller sent is dropped. A non-dict
+    ``meta`` is ignored (treated as absent) rather than failing the write."""
+    if not isinstance(meta, dict) or not meta:
+        return (None, None, None, None, None, None)
+    repo_sha, base_sha, branch, dirty, session_id = (meta.get(c) for c in _META_COLS)
+    return repo_sha, base_sha, branch, dirty, session_id, Jsonb(meta)
+
+
 def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
     value = row["value"]
     return {
@@ -97,6 +114,14 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         "source_surface": row.get("source_surface"),
         "tombstone": row.get("tombstone", False),
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        # Coordination provenance (0003). All optional — null when the writer
+        # supplied no envelope (e.g. a surface that can't compute a SHA).
+        "repo_sha": row.get("repo_sha"),
+        "base_sha": row.get("base_sha"),
+        "branch": row.get("branch"),
+        "dirty": row.get("dirty"),
+        "session_id": row.get("session_id"),
+        "meta": row.get("meta"),
     }
 
 
@@ -201,11 +226,12 @@ class PostgresBackend(StorageBackend):
         return await cur.fetchone()
 
     async def _append(
-        self, namespace, key, value, kind, tags, source_surface, event_id, tombstone
+        self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None
     ) -> dict:
         # Embed BEFORE taking a pooled connection so the (network) embedding call
         # never holds a connection, and compute it once so retries don't re-embed.
         embedding = await self._maybe_embed(key, value, tombstone)
+        repo_sha, base_sha, branch, dirty, session_id, meta_json = _split_meta(meta)
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
             # Exactly-once: if this event already landed, return it unchanged.
@@ -223,15 +249,19 @@ class PostgresBackend(StorageBackend):
                         cur = await conn.execute(
                             """
                             INSERT INTO memory_entry
-                                (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding)
+                                (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding,
+                                 repo_sha, base_sha, branch, dirty, session_id, meta)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
-                                   %s, %s, %s, %s, %s, %s, %s::vector
+                                   %s, %s, %s, %s, %s, %s, %s::vector,
+                                   %s, %s, %s, %s, %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
                             (namespace, key, kind, payload, source_surface, tags, event_id,
-                             tombstone, embedding, namespace, key),
+                             tombstone, embedding,
+                             repo_sha, base_sha, branch, dirty, session_id, meta_json,
+                             namespace, key),
                         )
                         row = await cur.fetchone()
                         return _row_to_entry(row)
@@ -250,9 +280,9 @@ class PostgresBackend(StorageBackend):
 
     @_retry_if_idempotent
     async def memory_save(
-        self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None
+        self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None, meta=None
     ) -> dict:
-        return await self._append(namespace, key, value, kind, tags, source_surface, event_id, False)
+        return await self._append(namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta)
 
     @_retry_on_disconnect
     async def memory_get(self, namespace, key) -> dict | None:
@@ -306,8 +336,9 @@ class PostgresBackend(StorageBackend):
         return [_row_to_entry(r) for r in rows]
 
     @_retry_if_idempotent
-    async def memory_delete(self, namespace, key, *, source_surface=None, event_id=None) -> dict:
-        # Tombstone = append a deleting revision (history is preserved).
+    async def memory_delete(self, namespace, key, *, source_surface=None, event_id=None, meta=None) -> dict:
+        # Tombstone = append a deleting revision (history is preserved). `meta`
+        # lets a delete record the provenance of the deletion (who/at-what-sha).
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
             cur = await conn.execute(
@@ -317,7 +348,7 @@ class PostgresBackend(StorageBackend):
             )
             latest = await cur.fetchone()
         kind = latest["kind"] if latest else "note"
-        return await self._append(namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True)
+        return await self._append(namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True, meta=meta)
 
     @_retry_on_disconnect
     async def memory_search(self, namespace, query, *, limit=20) -> list[dict]:
@@ -411,8 +442,8 @@ class PostgresBackend(StorageBackend):
     # Handoffs are cross-surface (web/cli/desktop) within ONE project: stored as
     # kind='handoff' rows inside the caller's namespace, never a shared space.
     @_retry_if_idempotent
-    async def handoff_save(self, namespace, key, value, *, source_surface=None, event_id=None) -> dict:
-        return await self._append(namespace, key, value, "handoff", [], source_surface, event_id, False)
+    async def handoff_save(self, namespace, key, value, *, source_surface=None, event_id=None, meta=None) -> dict:
+        return await self._append(namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta)
 
     async def handoff_load(self, namespace, key) -> dict | None:
         return await self.memory_get(namespace, key)
