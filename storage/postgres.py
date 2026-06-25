@@ -23,7 +23,9 @@ from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from config import settings
 from storage.base import StorageBackend
+from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
 from storage.sanitize import sanitize, wrap_value
 
 _MAX_RETRIES = 3
@@ -98,6 +100,32 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
     }
 
 
+_RRF_K = 60
+
+
+def _rrf_fuse(semantic_rows, keyword_rows, limit, *, k: int = _RRF_K) -> list[dict]:
+    """Reciprocal Rank Fusion of the meaning and keyword legs into one ranked list.
+
+    Each leg contributes ``1 / (k + rank)`` (rank is 1-based) to a key's score, so
+    a key present in BOTH legs sums two contributions and floats above one that
+    only tops a single leg — a true blended ranking rather than concatenating the
+    cosine list with keyword backfill. Ties break on the better (smaller)
+    individual rank, then key, for a deterministic order. The row payload comes
+    from whichever leg saw the key first (semantic, then keyword)."""
+    scores: dict[str, float] = {}
+    best_rank: dict[str, int] = {}
+    rows_by_key: dict[str, dict] = {}
+    for leg in (semantic_rows, keyword_rows):
+        for rank, row in enumerate(leg, start=1):
+            key = row["key"]
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+            if key not in best_rank or rank < best_rank[key]:
+                best_rank[key] = rank
+            rows_by_key.setdefault(key, row)
+    ordered = sorted(scores, key=lambda key: (-scores[key], best_rank[key], key))
+    return [_row_to_entry(rows_by_key[key]) for key in ordered[:limit]]
+
+
 def _session_to_dict(row: dict) -> dict:
     return {
         "session_id": str(row["session_id"]),
@@ -120,8 +148,49 @@ def _event_to_dict(row: dict) -> dict:
 
 
 class PostgresBackend(StorageBackend):
-    def __init__(self, pool) -> None:
+    def __init__(self, pool, embedder: Embedder | None = None) -> None:
         self.pool = pool
+        # Best-effort semantic recall. Defaults to disabled so the backend works
+        # with no provider key (keyword-only search, no embeddings written).
+        self.embedder: Embedder = embedder or DisabledEmbedder()
+
+    async def _maybe_embed(self, key, value, tombstone) -> str | None:
+        """Embed an entry's text for storage. Best-effort: returns None when
+        embeddings are disabled, the row is a tombstone, or the provider fails —
+        never raises, so a write is never blocked by the embedding path."""
+        if not self.embedder.enabled or tombstone:
+            return None
+        try:
+            vecs = await self.embedder.embed([embed_text(key, value)], input_type="document")
+        except Exception:  # noqa: BLE001 - embedding is best-effort, fall back to None
+            return None
+        return self._safe_literal(vecs)
+
+    async def _maybe_embed_query(self, query: str) -> str | None:
+        """Embed a search query. Best-effort: None falls search back to keyword."""
+        if not self.embedder.enabled:
+            return None
+        try:
+            vecs = await self.embedder.embed([query], input_type="query")
+        except Exception:  # noqa: BLE001 - fall back to keyword search
+            return None
+        return self._safe_literal(vecs)
+
+    def _safe_literal(self, vecs) -> str | None:
+        """Turn an embedder result into a pgvector literal, or None on anything
+        unexpected. Guards the best-effort contract: a wrong-length / malformed
+        vector returns None (keyword-only) instead of failing the ::vector cast
+        inside the write transaction and blocking the write."""
+        if not vecs:
+            return None
+        vec = vecs[0]
+        expected = getattr(self.embedder, "dim", None)
+        if not vec or (expected is not None and len(vec) != expected):
+            return None
+        try:
+            return to_vector_literal(vec)
+        except (TypeError, ValueError):  # non-numeric entries
+            return None
 
     # ----------------------------------------------------------------- memory
     async def _seen_event(self, conn, event_id: str) -> dict | None:
@@ -134,6 +203,9 @@ class PostgresBackend(StorageBackend):
     async def _append(
         self, namespace, key, value, kind, tags, source_surface, event_id, tombstone
     ) -> dict:
+        # Embed BEFORE taking a pooled connection so the (network) embedding call
+        # never holds a connection, and compute it once so retries don't re-embed.
+        embedding = await self._maybe_embed(key, value, tombstone)
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
             # Exactly-once: if this event already landed, return it unchanged.
@@ -151,15 +223,15 @@ class PostgresBackend(StorageBackend):
                         cur = await conn.execute(
                             """
                             INSERT INTO memory_entry
-                                (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone)
+                                (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
-                                   %s, %s, %s, %s, %s, %s
+                                   %s, %s, %s, %s, %s, %s, %s::vector
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
                             (namespace, key, kind, payload, source_surface, tags, event_id,
-                             tombstone, namespace, key),
+                             tombstone, embedding, namespace, key),
                         )
                         row = await cur.fetchone()
                         return _row_to_entry(row)
@@ -249,22 +321,91 @@ class PostgresBackend(StorageBackend):
 
     @_retry_on_disconnect
     async def memory_search(self, namespace, query, *, limit=20) -> list[dict]:
-        # Tenant-scoped: search always filters on a single namespace. No
-        # implicit cross-project reads. (pgvector semantic recall arrives Phase 3.)
+        # Tenant-scoped: every leg filters on a single namespace first — no
+        # implicit cross-project reads.
+        #
+        # Hybrid recall: embed the query and rank live entries two ways — by
+        # meaning (cosine over pgvector) and by keyword (substring) — then fuse the
+        # two rankings into ONE list with Reciprocal Rank Fusion (see _rrf_fuse) so
+        # an entry that scores on both signals can outrank one that only tops a
+        # single leg. When embeddings are disabled or the provider fails, `qvec` is
+        # None and we degrade to pure keyword search — the exact pre-Phase-3
+        # behavior (no fusion, keyword order preserved).
+        qvec = await self._maybe_embed_query(query)
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
+
+            if qvec is None:
+                # Pure-keyword fallback: latest revision per key first, then keep
+                # non-tombstoned substring matches (filtering before the DISTINCT ON
+                # would resurface a deleted key whose earlier revision matched).
+                cur = await conn.execute(
+                    """
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (key) *
+                        FROM memory_entry
+                        WHERE namespace = %s
+                        ORDER BY key, revision DESC
+                    ) latest
+                    WHERE NOT tombstone AND value::text ILIKE %s
+                    LIMIT %s
+                    """,
+                    (namespace, f"%{query}%", limit),
+                )
+                rows = await cur.fetchall()
+                return [_row_to_entry(r) for r in rows[:limit]]
+
+            # Semantic leg. Tune HNSW recall for this query only via
+            # set_config(..., is_local=true): the value is scoped to the
+            # surrounding transaction, so ef_search never leaks onto the pooled
+            # connection's later reuse (e.g. the keyword leg below). Higher
+            # ef_search inspects more index candidates → better recall on large
+            # stores, at a little latency; small stores return the same rows
+            # regardless. See settings.hnsw_ef_search for the tradeoff.
+            #
+            # Pick the TRUE latest revision per key first, THEN keep only the live
+            # ones that carry an embedding. Filtering embeddings before the
+            # DISTINCT ON would let a tombstone's prior (embedded) revision
+            # resurface, leaking deleted keys.
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT set_config('hnsw.ef_search', %s, true)",
+                    (str(settings.hnsw_ef_search),),
+                )
+                cur = await conn.execute(
+                    """
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (key) *
+                        FROM memory_entry
+                        WHERE namespace = %s
+                        ORDER BY key, revision DESC
+                    ) latest
+                    WHERE NOT tombstone AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (namespace, qvec, limit),
+                )
+                semantic_rows = await cur.fetchall()
+
+            # Keyword leg. Same latest-then-filter shape: take the latest revision
+            # per key first, then keep non-tombstoned substring matches.
             cur = await conn.execute(
                 """
-                SELECT DISTINCT ON (key) *
-                FROM memory_entry
-                WHERE namespace = %s AND value::text ILIKE %s
-                ORDER BY key, revision DESC
+                SELECT * FROM (
+                    SELECT DISTINCT ON (key) *
+                    FROM memory_entry
+                    WHERE namespace = %s
+                    ORDER BY key, revision DESC
+                ) latest
+                WHERE NOT tombstone AND value::text ILIKE %s
                 LIMIT %s
                 """,
                 (namespace, f"%{query}%", limit),
             )
-            rows = await cur.fetchall()
-        return [_row_to_entry(r) for r in rows if not r["tombstone"]]
+            keyword_rows = await cur.fetchall()
+
+        return _rrf_fuse(semantic_rows, keyword_rows, limit)
 
     # ---------------------------------------------------------------- handoff
     # Handoffs are cross-surface (web/cli/desktop) within ONE project: stored as

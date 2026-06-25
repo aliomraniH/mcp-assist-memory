@@ -53,6 +53,20 @@ def test_csrf_is_bound_to_session():
 
 
 @pytest.mark.skipif(os.environ.get("DATABASE_URL") is None, reason="DATABASE_URL not set")
+async def test_capabilities_page_serves_html():
+    # The public capabilities page lives at /capabilities (NOT /docs, which
+    # FastAPI reserves for Swagger UI). Serve the fixed file as text/html.
+    from fastapi.responses import FileResponse
+
+    import app as appmod
+
+    resp = await appmod.capabilities_page()
+    assert isinstance(resp, FileResponse)
+    assert resp.media_type == "text/html"
+    assert str(resp.path).endswith("docs/mcp-capabilities.html")
+
+
+@pytest.mark.skipif(os.environ.get("DATABASE_URL") is None, reason="DATABASE_URL not set")
 def test_admin_login_rotate_and_mcp_auth():
     from starlette.testclient import TestClient
 

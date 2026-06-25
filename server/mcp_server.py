@@ -96,8 +96,11 @@ async def memory_delete(
 
 @mcp.tool
 async def memory_search(namespace: str, query: str, limit: int = 20) -> list[dict]:
-    """Substring search over memory values within ONE namespace (no cross-project
-    reads; pgvector semantic recall arrives in Phase 3)."""
+    """Search memory within ONE namespace (no cross-project reads).
+
+    Ranks live entries by meaning using embeddings (pgvector cosine) and backfills
+    keyword/substring matches. When no embedding provider is configured it degrades
+    to pure substring search."""
     return await _backend().memory_search(namespace, query, limit=limit)
 
 

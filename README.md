@@ -121,6 +121,26 @@ restarts/redeploys, and the three surfaces share no server-side session state.
   `strip_untrusted` for a single string); the wrapping stays applied on every read.
 - Bounded lifespan readiness (no unbounded `pool.wait()`), 50 MB artifact cap,
   ranged blob reads, idempotent `event_id` writes, idempotent blob backfill.
+- **Semantic recall (`memory_search`):** when a `VOYAGE_API_KEY` is set, every
+  `memory_save` embeds the entry (Voyage, `voyage-3.5-lite`, 1024-dim) into a
+  nullable `embedding vector(1024)` column with an HNSW cosine index, and
+  `memory_search` ranks live entries by meaning (`embedding <=> query`), then
+  backfills keyword/substring matches up to `limit`. Embedding is **best-effort**:
+  it runs before a connection is taken and never blocks (or fails) a write, and
+  with no key the column stays NULL and search degrades to pure keyword — the
+  pre-Phase-3 behavior. Every leg filters on `namespace` first (no cross-project
+  recall). After enabling a key on an existing DB, embed old rows once with
+  `python scripts/backfill_embeddings.py` (idempotent, only touches NULL rows).
+- **Recall tuning (`hnsw.ef_search`):** the HNSW index is approximate, so a larger
+  store can miss relevant hits unless its query-time recall parameter is tuned.
+  `memory_search` sets `hnsw.ef_search` per-statement (transaction-local, semantic
+  leg only) from `HNSW_EF_SEARCH` (default `100`; pgvector's own default is `40`).
+  Higher = better recall, slightly slower search; it must be `>=` the search limit
+  to take effect. Small stores return the same rows regardless, so the default is
+  safe to leave alone — raise it (e.g. `200`) if a large tenant reports missing
+  results, lower it toward `40` to shave latency. Very large tenants can also tune
+  the index **build** parameters (`m`, `ef_construction`); see
+  `migrations/0002_embeddings.sql` (changing those requires recreating the index).
 
 ## Run locally
 

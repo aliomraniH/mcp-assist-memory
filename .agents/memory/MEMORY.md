@@ -4,3 +4,5 @@
 - [Reconnect retry policy](reconnect-retry-policy.md) — disconnect-retry: reads + event_id-gated writes always; session_* writes retry too (accepted at-least-once tradeoff); saves w/o event_id never retry.
 - [MCP stateless transport](mcp-stateless-transport.md) — /mcp runs stateless_http=True so sessions survive VM restart/redeploy; never revert to stateful to "fix" a session bug.
 - [Publish DB migration validation](publish-db-migration-validation.md) — "Failed to validate database migrations" on republish = legacy/shared Neon dev DB; fix = republish with "Create production database" + copy dev data (user action, can't be disabled).
+- [Dashboard e2e test vs real secrets](dashboard-e2e-test-secrets.md) — login test uses setdefault; real ADMIN_PASSWORD/MCP_AUTH_TOKEN in env make it fail (not a regression).
+- [pgvector memory_search](pgvector-memory-search.md) — search the append-only revisioned store: reduce to latest-revision-per-key BEFORE filtering, or deleted/stale rows leak; pgvector text-literal ::vector cast; pooled conn row_factory sticks.

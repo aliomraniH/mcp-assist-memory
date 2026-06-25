@@ -22,6 +22,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 # Mirrors migrations/0001_init.sql (kept inline so the suite is self-contained).
 SCHEMA = """
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS memory_entry (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     namespace text NOT NULL, key text NOT NULL, revision integer NOT NULL,
@@ -29,8 +30,11 @@ CREATE TABLE IF NOT EXISTS memory_entry (
     value jsonb NOT NULL, source_surface text, tags text[] NOT NULL DEFAULT '{}',
     event_id uuid, tombstone boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT now(), UNIQUE (namespace, key, revision));
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS embedding vector(1024);
 CREATE UNIQUE INDEX IF NOT EXISTS memory_entry_event_id_uq
     ON memory_entry (event_id) WHERE event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS memory_entry_embedding_hnsw
+    ON memory_entry USING hnsw (embedding vector_cosine_ops);
 CREATE TABLE IF NOT EXISTS session (
     session_id uuid PRIMARY KEY DEFAULT gen_random_uuid(), namespace text NOT NULL,
     surface text, metadata jsonb NOT NULL DEFAULT '{}',
@@ -56,6 +60,47 @@ async def backend():
     async with pool.connection() as conn:
         await conn.execute(SCHEMA)
     yield PostgresBackend(pool)
+    await pool.close()
+
+
+class FakeEmbedder:
+    """Deterministic offline embedder for tests. Hashes word tokens into a
+    1024-dim bag-of-words vector and L2-normalizes it, so entries that share
+    vocabulary with a query get a higher cosine similarity (lower distance).
+    This exercises the real pgvector ranking path without a network call."""
+
+    enabled = True
+
+    def __init__(self, dim: int = 1024) -> None:
+        self.dim = dim
+
+    async def embed(self, texts, *, input_type: str = "document"):
+        import hashlib
+        import math
+        import re
+
+        out: list[list[float]] = []
+        for text in texts:
+            vec = [0.0] * self.dim
+            for tok in re.findall(r"\w+", text.lower()):
+                idx = int(hashlib.md5(tok.encode()).hexdigest(), 16) % self.dim
+                vec[idx] += 1.0
+            norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+            out.append([x / norm for x in vec])
+        return out
+
+
+@pytest_asyncio.fixture
+async def semantic_backend():
+    """Like ``backend`` but with the deterministic FakeEmbedder wired in, so
+    memory_search exercises the embedding write + pgvector ranking path."""
+    if DATABASE_URL is None:
+        pytest.skip("DATABASE_URL not set")
+    pool = AsyncConnectionPool(DATABASE_URL, open=False, min_size=0, max_size=4)
+    await pool.open()
+    async with pool.connection() as conn:
+        await conn.execute(SCHEMA)
+    yield PostgresBackend(pool, embedder=FakeEmbedder())
     await pool.close()
 
 
