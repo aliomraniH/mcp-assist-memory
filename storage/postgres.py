@@ -23,6 +23,7 @@ from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from config import settings
 from storage.base import StorageBackend
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
 from storage.sanitize import sanitize, wrap_value
@@ -354,25 +355,38 @@ class PostgresBackend(StorageBackend):
                 rows = await cur.fetchall()
                 return [_row_to_entry(r) for r in rows[:limit]]
 
-            # Semantic leg. Pick the TRUE latest revision per key first, THEN keep
-            # only the live ones that carry an embedding. Filtering embeddings
-            # before the DISTINCT ON would let a tombstone's prior (embedded)
-            # revision resurface, leaking deleted keys.
-            cur = await conn.execute(
-                """
-                SELECT * FROM (
-                    SELECT DISTINCT ON (key) *
-                    FROM memory_entry
-                    WHERE namespace = %s
-                    ORDER BY key, revision DESC
-                ) latest
-                WHERE NOT tombstone AND embedding IS NOT NULL
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (namespace, qvec, limit),
-            )
-            semantic_rows = await cur.fetchall()
+            # Semantic leg. Tune HNSW recall for this query only via
+            # set_config(..., is_local=true): the value is scoped to the
+            # surrounding transaction, so ef_search never leaks onto the pooled
+            # connection's later reuse (e.g. the keyword leg below). Higher
+            # ef_search inspects more index candidates → better recall on large
+            # stores, at a little latency; small stores return the same rows
+            # regardless. See settings.hnsw_ef_search for the tradeoff.
+            #
+            # Pick the TRUE latest revision per key first, THEN keep only the live
+            # ones that carry an embedding. Filtering embeddings before the
+            # DISTINCT ON would let a tombstone's prior (embedded) revision
+            # resurface, leaking deleted keys.
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT set_config('hnsw.ef_search', %s, true)",
+                    (str(settings.hnsw_ef_search),),
+                )
+                cur = await conn.execute(
+                    """
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (key) *
+                        FROM memory_entry
+                        WHERE namespace = %s
+                        ORDER BY key, revision DESC
+                    ) latest
+                    WHERE NOT tombstone AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (namespace, qvec, limit),
+                )
+                semantic_rows = await cur.fetchall()
 
             # Keyword leg. Same latest-then-filter shape: take the latest revision
             # per key first, then keep non-tombstoned substring matches.

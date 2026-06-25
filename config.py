@@ -34,6 +34,16 @@ class Settings(BaseSettings):
     embedding_model: str = "voyage-3.5-lite"
     embedding_dim: int = 1024
 
+    # hnsw.ef_search tunes the HNSW recall/latency tradeoff for the semantic leg
+    # of memory_search: higher = the index inspects more candidates, so recall
+    # climbs as namespaces grow into the thousands, at the cost of a little query
+    # latency. pgvector's default is 40; we raise it so large stores don't silently
+    # drop relevant hits. For small stores the index returns the same rows either
+    # way, so behavior is unchanged. Applied per-statement (transaction-local) on
+    # the cosine query only — never the keyword fallback. Must be >= the search
+    # limit to be effective. Set HNSW_EF_SEARCH to override.
+    hnsw_ef_search: int = 100
+
     # --- artifact / bytea safety ---
     max_artifact_bytes: int = 50 * 1024 * 1024          # hard write cap: 50 MB
     artifact_inline_limit: int = 1 * 1024 * 1024        # MCP returns base64 inline only below this;
