@@ -99,6 +99,32 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
     }
 
 
+_RRF_K = 60
+
+
+def _rrf_fuse(semantic_rows, keyword_rows, limit, *, k: int = _RRF_K) -> list[dict]:
+    """Reciprocal Rank Fusion of the meaning and keyword legs into one ranked list.
+
+    Each leg contributes ``1 / (k + rank)`` (rank is 1-based) to a key's score, so
+    a key present in BOTH legs sums two contributions and floats above one that
+    only tops a single leg — a true blended ranking rather than concatenating the
+    cosine list with keyword backfill. Ties break on the better (smaller)
+    individual rank, then key, for a deterministic order. The row payload comes
+    from whichever leg saw the key first (semantic, then keyword)."""
+    scores: dict[str, float] = {}
+    best_rank: dict[str, int] = {}
+    rows_by_key: dict[str, dict] = {}
+    for leg in (semantic_rows, keyword_rows):
+        for rank, row in enumerate(leg, start=1):
+            key = row["key"]
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+            if key not in best_rank or rank < best_rank[key]:
+                best_rank[key] = rank
+            rows_by_key.setdefault(key, row)
+    ordered = sorted(scores, key=lambda key: (-scores[key], best_rank[key], key))
+    return [_row_to_entry(rows_by_key[key]) for key in ordered[:limit]]
+
+
 def _session_to_dict(row: dict) -> dict:
     return {
         "session_id": str(row["session_id"]),
@@ -297,45 +323,21 @@ class PostgresBackend(StorageBackend):
         # Tenant-scoped: every leg filters on a single namespace first — no
         # implicit cross-project reads.
         #
-        # Hybrid recall: embed the query and rank live entries by meaning
-        # (cosine over pgvector), then backfill any keyword (substring) matches
-        # not already surfaced, up to `limit`. When embeddings are disabled or the
-        # provider fails, `qvec` is None and we degrade to pure keyword search —
-        # the exact pre-Phase-3 behavior.
+        # Hybrid recall: embed the query and rank live entries two ways — by
+        # meaning (cosine over pgvector) and by keyword (substring) — then fuse the
+        # two rankings into ONE list with Reciprocal Rank Fusion (see _rrf_fuse) so
+        # an entry that scores on both signals can outrank one that only tops a
+        # single leg. When embeddings are disabled or the provider fails, `qvec` is
+        # None and we degrade to pure keyword search — the exact pre-Phase-3
+        # behavior (no fusion, keyword order preserved).
         qvec = await self._maybe_embed_query(query)
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
-            results: list[dict] = []
-            seen: set[str] = set()
 
-            if qvec is not None:
-                # Pick the TRUE latest revision per key first, THEN keep only the
-                # live ones that carry an embedding. Filtering embeddings before the
-                # DISTINCT ON would let a tombstone's prior (embedded) revision
-                # resurface, leaking deleted keys.
-                cur = await conn.execute(
-                    """
-                    SELECT * FROM (
-                        SELECT DISTINCT ON (key) *
-                        FROM memory_entry
-                        WHERE namespace = %s
-                        ORDER BY key, revision DESC
-                    ) latest
-                    WHERE NOT tombstone AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                    """,
-                    (namespace, qvec, limit),
-                )
-                for row in await cur.fetchall():
-                    seen.add(row["key"])
-                    results.append(row)
-
-            if len(results) < limit:
-                # Substring leg matches the LIVE value only: take the latest
-                # revision per key first, then keep non-tombstoned matches. Doing
-                # the ILIKE before DISTINCT ON would resurface a deleted key whose
-                # earlier revision happened to match.
+            if qvec is None:
+                # Pure-keyword fallback: latest revision per key first, then keep
+                # non-tombstoned substring matches (filtering before the DISTINCT ON
+                # would resurface a deleted key whose earlier revision matched).
                 cur = await conn.execute(
                     """
                     SELECT * FROM (
@@ -349,15 +351,47 @@ class PostgresBackend(StorageBackend):
                     """,
                     (namespace, f"%{query}%", limit),
                 )
-                for row in await cur.fetchall():
-                    if row["key"] in seen:
-                        continue
-                    seen.add(row["key"])
-                    results.append(row)
-                    if len(results) >= limit:
-                        break
+                rows = await cur.fetchall()
+                return [_row_to_entry(r) for r in rows[:limit]]
 
-        return [_row_to_entry(r) for r in results[:limit]]
+            # Semantic leg. Pick the TRUE latest revision per key first, THEN keep
+            # only the live ones that carry an embedding. Filtering embeddings
+            # before the DISTINCT ON would let a tombstone's prior (embedded)
+            # revision resurface, leaking deleted keys.
+            cur = await conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT DISTINCT ON (key) *
+                    FROM memory_entry
+                    WHERE namespace = %s
+                    ORDER BY key, revision DESC
+                ) latest
+                WHERE NOT tombstone AND embedding IS NOT NULL
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (namespace, qvec, limit),
+            )
+            semantic_rows = await cur.fetchall()
+
+            # Keyword leg. Same latest-then-filter shape: take the latest revision
+            # per key first, then keep non-tombstoned substring matches.
+            cur = await conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT DISTINCT ON (key) *
+                    FROM memory_entry
+                    WHERE namespace = %s
+                    ORDER BY key, revision DESC
+                ) latest
+                WHERE NOT tombstone AND value::text ILIKE %s
+                LIMIT %s
+                """,
+                (namespace, f"%{query}%", limit),
+            )
+            keyword_rows = await cur.fetchall()
+
+        return _rrf_fuse(semantic_rows, keyword_rows, limit)
 
     # ---------------------------------------------------------------- handoff
     # Handoffs are cross-surface (web/cli/desktop) within ONE project: stored as

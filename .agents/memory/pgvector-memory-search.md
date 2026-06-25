@@ -30,6 +30,20 @@ Pass vectors as a text literal `'[0.1,0.2,...]'` and cast `::vector` in SQL
 registration. `_row_to_entry` reads specific keys, so `SELECT *` returning the
 embedding column is harmless.
 
+## Ranking: RRF fusion, not concatenation
+`memory_search` runs the meaning (cosine) leg and keyword (ILIKE substring) leg
+independently, then fuses them with Reciprocal Rank Fusion (`_rrf_fuse`, k=60):
+each leg adds `1/(k+rank)`, so a key in BOTH legs outranks a single-leg top hit.
+Ties break on best individual rank, then key (deterministic).
+
+**Why:** plain "cosine results then keyword backfill" can never let a dual-signal
+match beat a cosine-#1 single-signal one. RRF can.
+
+**How to apply:** only the embedded path fuses. When `qvec is None` (embeddings
+disabled / provider failed) it stays pure-keyword, original order, no fusion —
+do NOT route the fallback through `_rrf_fuse`. Each leg still fetches only
+`limit` rows before fusion (candidate-pool overfetch is a known follow-up).
+
 ## Pooled connection row_factory persists
 `PostgresBackend` sets `conn.row_factory = dict_row` per use, but that setting
 **sticks on the pooled connection** after checkin. A test/script that grabs

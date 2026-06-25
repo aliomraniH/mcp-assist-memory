@@ -34,6 +34,25 @@ async def test_search_ranks_by_meaning(semantic_backend, ns):
     assert keys[0] == "db"
 
 
+async def test_hybrid_fuses_dual_signal_above_single_leg(semantic_backend, ns):
+    # RRF must reorder the two legs, not just concatenate cosine then keyword.
+    # "sem" shares the query's exact word set (reordered, so the literal substring
+    # is absent) -> it is the cosine-nearest entry, topping the MEANING leg only.
+    # "both" carries the exact query substring AND those words, diluted by extra
+    # tokens so its cosine rank is LOWER than "sem" -> it appears in BOTH legs.
+    # Plain concatenation would surface "sem" first (cosine rank 1); fusion lifts
+    # "both" above it because it scores on two signals at once.
+    await semantic_backend.memory_save(ns, "sem", {"note": "alpha gamma beta"})
+    await semantic_backend.memory_save(
+        ns, "both", {"note": "alpha beta gamma plus extra words here"}
+    )
+    results = await semantic_backend.memory_search(ns, "alpha beta gamma", limit=10)
+    keys = [r["key"] for r in results]
+    assert "sem" in keys and "both" in keys
+    # The dual-signal entry wins despite ranking second on meaning alone.
+    assert keys[0] == "both"
+
+
 async def test_search_excludes_tombstoned_latest(semantic_backend, ns):
     await semantic_backend.memory_save(ns, "gone", {"note": "ephemeral database record"})
     await semantic_backend.memory_delete(ns, "gone")
