@@ -27,6 +27,23 @@ CURRENT = "current"
 STALE = "stale"
 UNVERIFIABLE = "unverifiable"
 
+# Shortest abbreviation we treat as a real SHA reference (git's default is 7).
+_MIN_SHA_LEN = 7
+
+
+def sha_match(a: str | None, b: str | None) -> bool:
+    """True if two commit SHAs refer to the same commit, tolerating abbreviation.
+
+    Claims/humans record SHORT shas (e.g. ``6e942ca``); the GitHub API returns the
+    FULL 40-char sha. Exact equality would mark almost every real merged claim
+    stale, so — like git itself — we treat one as a match when it is a
+    case-insensitive prefix of the other (min length 7 to avoid coincidences)."""
+    if not a or not b:
+        return False
+    a, b = a.lower(), b.lower()
+    short, full = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= _MIN_SHA_LEN and full.startswith(short)
+
 
 @runtime_checkable
 class Resolver(Protocol):
@@ -151,7 +168,7 @@ async def reconcile_claim(entry: dict, resolver: Resolver) -> dict:
         recorded = meta.get("merge_sha")
         if resolved["merged"]:
             # Merged upstream: current only if the claim already recorded that merge.
-            state = CURRENT if recorded and recorded == resolved.get("merge_sha") else STALE
+            state = CURRENT if sha_match(recorded, resolved.get("merge_sha")) else STALE
         else:
             # Not merged upstream: current only if the claim didn't assert a merge.
             state = STALE if recorded else CURRENT
@@ -163,7 +180,7 @@ async def reconcile_claim(entry: dict, resolver: Resolver) -> dict:
         if head is None:
             return {**base, "subject": f"branch:{branch}", "state": UNVERIFIABLE,
                     "reason": "could not resolve branch head"}
-        state = CURRENT if repo_sha and repo_sha == head else STALE
+        state = CURRENT if sha_match(repo_sha, head) else STALE
         return {**base, "subject": f"branch:{branch}", "state": state,
                 "resolved": {"head": head}, "claim_repo_sha": repo_sha}
 
