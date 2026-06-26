@@ -34,6 +34,7 @@ class StorageBackend(abc.ABC):
         tags: list[str] | None = None,
         source_surface: str | None = None,
         event_id: str | None = None,
+        meta: dict | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod
@@ -49,7 +50,8 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     async def memory_delete(
-        self, namespace: str, key: str, *, source_surface: str | None = None, event_id: str | None = None
+        self, namespace: str, key: str, *, source_surface: str | None = None, event_id: str | None = None,
+        meta: dict | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod
@@ -60,7 +62,8 @@ class StorageBackend(abc.ABC):
     # ---------------- handoff: cross-surface convention, scoped to a project ----------------
     @abc.abstractmethod
     async def handoff_save(
-        self, namespace: str, key: str, value: Any, *, source_surface: str | None = None, event_id: str | None = None
+        self, namespace: str, key: str, value: Any, *, source_surface: str | None = None, event_id: str | None = None,
+        meta: dict | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod
@@ -101,6 +104,21 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     async def artifact_list(self, *, limit: int = 100) -> list[dict]: ...
+
+    # ---------------- coordination (drift detection) ----------------
+    @abc.abstractmethod
+    async def coord_health(self, namespace: str, *, limit: int = 200) -> dict: ...
+
+    @abc.abstractmethod
+    async def coord_drift_scan(self, *, limit: int = 50) -> dict: ...
+
+    @abc.abstractmethod
+    async def coord_reconcile(self, namespace: str, *, limit: int = 100) -> dict: ...
+
+    @abc.abstractmethod
+    async def coord_reconcile_repo(
+        self, repo: str, *, pr: int | None = None, branch: str | None = None, limit: int = 500
+    ) -> dict: ...
 
     # ---------------- admin ----------------
     @abc.abstractmethod

@@ -1,4 +1,4 @@
-"""FastMCP instance and the 18 tools.
+"""FastMCP instance and the 21 tools.
 
 The tools are thin: they validate/relay to the injected ``StorageBackend``.
 The backend is set on ``deps`` during the FastAPI lifespan (one pool, injected),
@@ -6,13 +6,15 @@ so tools never open connections or read config themselves.
 
 Tenancy: every per-project tool takes a required ``namespace`` (namespace ==
 project == tenant) and the backend filters every query on it — there are no
-implicit cross-project reads. Artifacts are content-addressed and global.
+implicit cross-project reads. Artifacts are content-addressed and global, and
+``coord_drift_scan``/``stats`` are deliberately store-wide coordination/admin views.
 
-Tool surface (18):
+Tool surface (21):
   memory:   memory_save, memory_get, memory_list, memory_history, memory_delete, memory_search
   handoff:  handoff_save, handoff_load, handoff_list
   session:  session_create, session_append_event, session_get, session_list, session_events
   artifact: artifact_put, artifact_get, artifact_list
+  coord:    coord_health, coord_drift_scan, coord_reconcile
   admin:    stats
 """
 from __future__ import annotations
@@ -54,13 +56,20 @@ async def memory_save(
     tags: list[str] | None = None,
     source_surface: str | None = None,
     event_id: str | None = None,
+    meta: dict | None = None,
 ) -> dict:
     """Append a new revision of a memory entry in a project namespace.
-    kind ∈ note|decision|todo|handoff|config. Pass a stable event_id (uuid) for
-    exactly-once writes during offline reconcile."""
+    kind ∈ note|decision|todo|handoff|config|claim|knowledge (claim = a verifiable
+    assertion about external mutable state that expires; knowledge = a durable fact).
+    Pass a stable event_id (uuid) for exactly-once writes during offline reconcile.
+
+    meta is an optional coordination envelope: its repo_sha/base_sha/branch/dirty/
+    session_id keys are projected into indexed columns (the rest kept as-is) so a
+    reader can mechanically ask "is this still current?" instead of parsing prose.
+    Best-effort — omit it and the entry stores exactly as before."""
     return await _backend().memory_save(
         namespace, key, value, kind=kind, tags=tags,
-        source_surface=source_surface, event_id=event_id,
+        source_surface=source_surface, event_id=event_id, meta=meta,
     )
 
 
@@ -86,11 +95,13 @@ async def memory_history(namespace: str, key: str, limit: int = 50) -> list[dict
 
 @mcp.tool
 async def memory_delete(
-    namespace: str, key: str, source_surface: str | None = None, event_id: str | None = None
+    namespace: str, key: str, source_surface: str | None = None, event_id: str | None = None,
+    meta: dict | None = None,
 ) -> dict:
-    """Soft-delete a key by appending a tombstone revision (history preserved)."""
+    """Soft-delete a key by appending a tombstone revision (history preserved).
+    meta optionally records the provenance of the deletion (repo_sha/session_id…)."""
     return await _backend().memory_delete(
-        namespace, key, source_surface=source_surface, event_id=event_id
+        namespace, key, source_surface=source_surface, event_id=event_id, meta=meta,
     )
 
 
@@ -107,12 +118,14 @@ async def memory_search(namespace: str, query: str, limit: int = 20) -> list[dic
 # ------------------------------------------------------------------ handoff
 @mcp.tool
 async def handoff_save(
-    namespace: str, key: str, value: Any, source_surface: str | None = None, event_id: str | None = None
+    namespace: str, key: str, value: Any, source_surface: str | None = None, event_id: str | None = None,
+    meta: dict | None = None,
 ) -> dict:
     """Save a cross-surface handoff under a shared key within a project namespace
-    (read it back with handoff_load)."""
+    (read it back with handoff_load). meta is the optional coordination envelope
+    (see memory_save)."""
     return await _backend().handoff_save(
-        namespace, key, value, source_surface=source_surface, event_id=event_id
+        namespace, key, value, source_surface=source_surface, event_id=event_id, meta=meta,
     )
 
 
@@ -195,6 +208,38 @@ async def artifact_get(sha256: str) -> dict | None:
 async def artifact_list(limit: int = 100) -> list[dict]:
     """List stored artifacts (newest first)."""
     return await _backend().artifact_list(limit=limit)
+
+
+# ------------------------------------------------------------- coordination
+@mcp.tool
+async def coord_health(namespace: str, limit: int = 200) -> dict:
+    """Drift report for ONE namespace, computed from stored provenance (no git
+    required): `stale` entries whose repo_sha is behind the namespace's latest,
+    `duplicate_content` (distinct keys holding an identical fact), and
+    `claim_collisions` (multiple live claims about the same subject/PR). Read it
+    at session start to see what needs re-verifying before trusting the store."""
+    return await _backend().coord_health(namespace, limit=limit)
+
+
+@mcp.tool
+async def coord_drift_scan(limit: int = 50) -> dict:
+    """Store-wide scan for the same fact living under more than one namespace
+    (namespace drift, e.g. a project split across two namespaces). Like `stats`,
+    this is a deliberately cross-tenant coordination/admin view, not a per-project
+    read. Returns content hashes that span >1 namespace, worst first."""
+    return await _backend().coord_drift_scan(limit=limit)
+
+
+@mcp.tool
+async def coord_reconcile(namespace: str, limit: int = 100) -> dict:
+    """Reconcile every live claim in a namespace against GitHub and record an
+    append-only verdict (current | stale | unverifiable) per claim under
+    coord/_reconcile/<key> — the user's entry is never rewritten. Resolution is
+    derived from each claim's provenance (meta.repo + meta.pr / meta.branch), not
+    its prose. When the backend has no GitHub token the resolver is disabled and
+    every verdict is `unverifiable` (never silently `current`). Run it at session
+    start to learn which claims need re-verifying."""
+    return await _backend().coord_reconcile(namespace, limit=limit)
 
 
 # -------------------------------------------------------------------- admin

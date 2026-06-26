@@ -29,6 +29,16 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     langsmith_api_key: str | None = None
 
+    # --- coordination reconciler (Phase 3): only active when github_token is set ---
+    # A READ-ONLY GitHub token lets the backend resolve a claim's truth (is PR #N
+    # merged? what is branch X's head?) off the agent's critical path. Without it
+    # the reconciler is disabled and claims reconcile to "unverifiable" — the server
+    # runs identically. github_webhook_secret gates POST /webhook/github (HMAC over
+    # the raw body); without it the webhook returns 503.
+    github_token: str | None = None
+    github_api_url: str = "https://api.github.com"
+    github_webhook_secret: str | None = None
+
     # --- semantic recall (Phase 3): only active when voyage_api_key is set ---
     # embedding_dim MUST match the vector(N) column in migrations/0002_embeddings.sql.
     embedding_model: str = "voyage-3.5-lite"

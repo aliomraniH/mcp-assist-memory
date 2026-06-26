@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import json
 import uuid
 from typing import Any
 
@@ -26,6 +27,7 @@ from psycopg.types.json import Jsonb
 from config import settings
 from storage.base import StorageBackend
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
+from storage.reconcile import DisabledResolver, Resolver, reconcile_claim
 from storage.sanitize import sanitize, wrap_value
 
 _MAX_RETRIES = 3
@@ -85,6 +87,33 @@ def _retry_if_idempotent(fn):
     return wrapper
 
 
+# Coordination-envelope keys projected out of `meta` into indexed columns. The
+# full envelope is still stored in the `meta` jsonb column, losslessly.
+_META_COLS = ("repo_sha", "base_sha", "branch", "dirty", "session_id")
+
+
+def _content_hash(value: Any) -> str:
+    """sha256 over a canonical JSON encoding of the (already-sanitized) value.
+
+    The always-present, git-free dimension of the version vector: identical
+    facts hash identically regardless of surface or namespace, which is what the
+    coordination detectors group on. Sort keys so dict ordering doesn't matter."""
+    canon = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def _split_meta(meta: dict | None) -> tuple[Any, Any, Any, Any, Any, Any]:
+    """Return ``(repo_sha, base_sha, branch, dirty, session_id, meta_jsonb)``.
+
+    The five well-known keys become indexed columns; the whole envelope is kept
+    as jsonb (None when empty) so nothing the caller sent is dropped. A non-dict
+    ``meta`` is ignored (treated as absent) rather than failing the write."""
+    if not isinstance(meta, dict) or not meta:
+        return (None, None, None, None, None, None)
+    repo_sha, base_sha, branch, dirty, session_id = (meta.get(c) for c in _META_COLS)
+    return repo_sha, base_sha, branch, dirty, session_id, Jsonb(meta)
+
+
 def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
     value = row["value"]
     return {
@@ -97,6 +126,15 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         "source_surface": row.get("source_surface"),
         "tombstone": row.get("tombstone", False),
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        # Coordination provenance (0003). All optional — null when the writer
+        # supplied no envelope (e.g. a surface that can't compute a SHA).
+        "repo_sha": row.get("repo_sha"),
+        "base_sha": row.get("base_sha"),
+        "branch": row.get("branch"),
+        "dirty": row.get("dirty"),
+        "session_id": row.get("session_id"),
+        "meta": row.get("meta"),
+        "content_hash": row.get("content_hash"),
     }
 
 
@@ -148,11 +186,14 @@ def _event_to_dict(row: dict) -> dict:
 
 
 class PostgresBackend(StorageBackend):
-    def __init__(self, pool, embedder: Embedder | None = None) -> None:
+    def __init__(self, pool, embedder: Embedder | None = None, resolver: Resolver | None = None) -> None:
         self.pool = pool
         # Best-effort semantic recall. Defaults to disabled so the backend works
         # with no provider key (keyword-only search, no embeddings written).
         self.embedder: Embedder = embedder or DisabledEmbedder()
+        # Best-effort claim reconciliation. Defaults to disabled so the backend
+        # works with no GitHub token (claims reconcile to "unverifiable").
+        self.resolver: Resolver = resolver or DisabledResolver()
 
     async def _maybe_embed(self, key, value, tombstone) -> str | None:
         """Embed an entry's text for storage. Best-effort: returns None when
@@ -201,11 +242,15 @@ class PostgresBackend(StorageBackend):
         return await cur.fetchone()
 
     async def _append(
-        self, namespace, key, value, kind, tags, source_surface, event_id, tombstone
+        self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None
     ) -> dict:
         # Embed BEFORE taking a pooled connection so the (network) embedding call
         # never holds a connection, and compute it once so retries don't re-embed.
         embedding = await self._maybe_embed(key, value, tombstone)
+        repo_sha, base_sha, branch, dirty, session_id, meta_json = _split_meta(meta)
+        sanitized = sanitize(value)
+        # Tombstones carry no content hash (the value is a delete marker, not a fact).
+        content_hash = None if tombstone else _content_hash(sanitized)
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
             # Exactly-once: if this event already landed, return it unchanged.
@@ -214,7 +259,7 @@ class PostgresBackend(StorageBackend):
                 if existing is not None:
                     return _row_to_entry(existing)
 
-            payload = Jsonb(sanitize(value))
+            payload = Jsonb(sanitized)
             tags = tags or []
             last_exc: Exception | None = None
             for _ in range(_MAX_RETRIES):
@@ -223,15 +268,19 @@ class PostgresBackend(StorageBackend):
                         cur = await conn.execute(
                             """
                             INSERT INTO memory_entry
-                                (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding)
+                                (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding,
+                                 repo_sha, base_sha, branch, dirty, session_id, meta, content_hash)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
-                                   %s, %s, %s, %s, %s, %s, %s::vector
+                                   %s, %s, %s, %s, %s, %s, %s::vector,
+                                   %s, %s, %s, %s, %s, %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
                             (namespace, key, kind, payload, source_surface, tags, event_id,
-                             tombstone, embedding, namespace, key),
+                             tombstone, embedding,
+                             repo_sha, base_sha, branch, dirty, session_id, meta_json, content_hash,
+                             namespace, key),
                         )
                         row = await cur.fetchone()
                         return _row_to_entry(row)
@@ -250,9 +299,9 @@ class PostgresBackend(StorageBackend):
 
     @_retry_if_idempotent
     async def memory_save(
-        self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None
+        self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None, meta=None
     ) -> dict:
-        return await self._append(namespace, key, value, kind, tags, source_surface, event_id, False)
+        return await self._append(namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta)
 
     @_retry_on_disconnect
     async def memory_get(self, namespace, key) -> dict | None:
@@ -306,8 +355,9 @@ class PostgresBackend(StorageBackend):
         return [_row_to_entry(r) for r in rows]
 
     @_retry_if_idempotent
-    async def memory_delete(self, namespace, key, *, source_surface=None, event_id=None) -> dict:
-        # Tombstone = append a deleting revision (history is preserved).
+    async def memory_delete(self, namespace, key, *, source_surface=None, event_id=None, meta=None) -> dict:
+        # Tombstone = append a deleting revision (history is preserved). `meta`
+        # lets a delete record the provenance of the deletion (who/at-what-sha).
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
             cur = await conn.execute(
@@ -317,7 +367,7 @@ class PostgresBackend(StorageBackend):
             )
             latest = await cur.fetchone()
         kind = latest["kind"] if latest else "note"
-        return await self._append(namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True)
+        return await self._append(namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True, meta=meta)
 
     @_retry_on_disconnect
     async def memory_search(self, namespace, query, *, limit=20) -> list[dict]:
@@ -407,12 +457,195 @@ class PostgresBackend(StorageBackend):
 
         return _rrf_fuse(semantic_rows, keyword_rows, limit)
 
+    # ----------------------------------------------------------- coordination
+    @_retry_on_disconnect
+    async def coord_health(self, namespace, *, limit=200) -> dict:
+        """Drift report for ONE namespace — computed from stored provenance, no
+        git required. Surfaces three things a reader would otherwise eyeball:
+
+        * ``stale``       — live entries whose repo_sha is behind the namespace's
+                            most-recently-observed repo_sha (a git-free proxy for
+                            "this predates current code → re-verify").
+        * ``duplicate_content`` — distinct keys holding an identical fact
+                            (same content_hash) — a restate/fork to reconcile.
+        * ``claim_collisions``  — multiple live claims about the same subject
+                            (meta.subject, or meta.pr) — the rev2-vs-rev3 class,
+                            caught before a human has to.
+        """
+        from collections import defaultdict
+
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                """
+                SELECT DISTINCT ON (key) key, revision, kind, repo_sha,
+                       content_hash, value, meta, tombstone, created_at
+                FROM memory_entry WHERE namespace = %s
+                ORDER BY key, revision DESC
+                """,
+                (namespace,),
+            )
+            rows = [r for r in await cur.fetchall() if not r["tombstone"]]
+
+        with_sha = [r for r in rows if r["repo_sha"]]
+        latest_repo_sha = (
+            max(with_sha, key=lambda r: r["created_at"])["repo_sha"] if with_sha else None
+        )
+        stale = [
+            {"key": r["key"], "repo_sha": r["repo_sha"], "revision": r["revision"]}
+            for r in with_sha
+            if r["repo_sha"] != latest_repo_sha
+        ]
+
+        by_hash: dict[str, list[str]] = defaultdict(list)
+        for r in rows:
+            by_hash[r["content_hash"] or _content_hash(r["value"])].append(r["key"])
+        duplicate_content = [
+            {"content_hash": h, "keys": sorted(keys)}
+            for h, keys in by_hash.items() if len(keys) > 1
+        ]
+
+        by_subject: dict[str, set] = defaultdict(set)
+        for r in rows:
+            if r["kind"] != "claim":
+                continue
+            meta = r["meta"] or {}
+            subject = meta.get("subject")
+            if subject is None and meta.get("pr") is not None:
+                subject = f"pr:{meta['pr']}"
+            if subject is not None:
+                by_subject[str(subject)].add(r["key"])
+        claim_collisions = [
+            {"subject": s, "keys": sorted(keys)}
+            for s, keys in by_subject.items() if len(keys) > 1
+        ]
+
+        return {
+            "namespace": namespace,
+            "entry_count": len(rows),
+            "latest_repo_sha": latest_repo_sha,
+            "stale": stale[:limit],
+            "duplicate_content": duplicate_content[:limit],
+            "claim_collisions": claim_collisions[:limit],
+        }
+
+    @_retry_on_disconnect
+    async def coord_drift_scan(self, *, limit=50) -> dict:
+        """Store-wide: the same fact living under more than one namespace — the
+        namespace-drift class (e.g. canvas-case vs canvas-glp1). DELIBERATELY
+        cross-tenant, like ``stats``: a coordination/admin scan, not a per-project
+        read. Groups live entries by content_hash (computed on the fly for legacy
+        rows that predate the column) and returns hashes spanning >1 namespace."""
+        from collections import defaultdict
+
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                """
+                SELECT DISTINCT ON (namespace, key) namespace, key, content_hash, value, tombstone
+                FROM memory_entry
+                ORDER BY namespace, key, revision DESC
+                """
+            )
+            rows = await cur.fetchall()
+
+        groups: dict[str, list[tuple]] = defaultdict(list)
+        for r in rows:
+            if r["tombstone"]:
+                continue
+            h = r["content_hash"] or _content_hash(r["value"])
+            groups[h].append((r["namespace"], r["key"]))
+
+        drift = []
+        for h, items in groups.items():
+            namespaces = {ns for ns, _ in items}
+            if len(namespaces) > 1:
+                drift.append({
+                    "content_hash": h,
+                    "namespaces": sorted(namespaces),
+                    "entries": sorted(f"{ns}/{k}" for ns, k in items),
+                })
+        drift.sort(key=lambda d: (-len(d["namespaces"]), d["content_hash"]))
+        return {"suspected_namespace_drift": drift[:limit]}
+
+    # --------------------------------------------------------- reconciliation
+    _RECONCILE_PREFIX = "coord/_reconcile/"
+
+    async def _reconcile_rows(self, rows: list[dict]) -> list[dict]:
+        """Reconcile a set of live claim rows and write each verdict to its own
+        append-only ``coord/_reconcile/<key>`` record. Never touches the claim."""
+        verdicts = []
+        for r in rows:
+            entry = _row_to_entry(r, wrap=False)
+            verdict = await reconcile_claim(entry, self.resolver)
+            await self.memory_save(
+                r["namespace"], f"{self._RECONCILE_PREFIX}{r['key']}", verdict,
+                kind="config", tags=["reconcile", verdict["state"]],
+            )
+            verdicts.append(verdict)
+        return verdicts
+
+    @_retry_on_disconnect
+    async def coord_reconcile(self, namespace, *, limit=100) -> dict:
+        """Reconcile every live claim in a namespace against GitHub (off the
+        agent's critical path) and record an append-only verdict per claim. When
+        the resolver is disabled every verdict is ``unverifiable`` — never
+        silently ``current``. Returns the verdicts and whether the resolver ran."""
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                """
+                SELECT DISTINCT ON (key) * FROM memory_entry
+                WHERE namespace = %s AND kind = 'claim'
+                ORDER BY key, revision DESC
+                """,
+                (namespace,),
+            )
+            rows = [r for r in await cur.fetchall() if not r["tombstone"]][:limit]
+        verdicts = await self._reconcile_rows(rows)
+        return {
+            "namespace": namespace,
+            "resolver_enabled": self.resolver.enabled,
+            "reconciled": len(verdicts),
+            "verdicts": verdicts,
+        }
+
+    @_retry_on_disconnect
+    async def coord_reconcile_repo(self, repo, *, pr=None, branch=None, limit=500) -> dict:
+        """Store-wide (admin, like drift_scan): reconcile every live claim whose
+        ``meta.repo`` matches ``repo`` — optionally narrowed to a PR or branch.
+        Used by the GitHub webhook so a merge/push reconciles affected claims
+        across all namespaces at once."""
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                """
+                SELECT DISTINCT ON (namespace, key) * FROM memory_entry
+                WHERE kind = 'claim' AND meta->>'repo' = %s
+                ORDER BY namespace, key, revision DESC
+                """,
+                (repo,),
+            )
+            rows = []
+            for r in await cur.fetchall():
+                if r["tombstone"]:
+                    continue
+                meta = r.get("meta") or {}
+                if pr is not None and str(meta.get("pr")) != str(pr):
+                    continue
+                if branch is not None and meta.get("branch") != branch:
+                    continue
+                rows.append(r)
+        verdicts = await self._reconcile_rows(rows[:limit])
+        return {"repo": repo, "resolver_enabled": self.resolver.enabled,
+                "reconciled": len(verdicts), "verdicts": verdicts}
+
     # ---------------------------------------------------------------- handoff
     # Handoffs are cross-surface (web/cli/desktop) within ONE project: stored as
     # kind='handoff' rows inside the caller's namespace, never a shared space.
     @_retry_if_idempotent
-    async def handoff_save(self, namespace, key, value, *, source_surface=None, event_id=None) -> dict:
-        return await self._append(namespace, key, value, "handoff", [], source_surface, event_id, False)
+    async def handoff_save(self, namespace, key, value, *, source_surface=None, event_id=None, meta=None) -> dict:
+        return await self._append(namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta)
 
     async def handoff_load(self, namespace, key) -> dict | None:
         return await self.memory_get(namespace, key)
