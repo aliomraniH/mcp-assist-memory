@@ -40,6 +40,7 @@ from admin_store import AdminStore
 from config import settings
 from dashboard import SURFACE_LABELS, build_routes
 from server.mcp_server import deps, mcp
+from storage.curator import build_curator
 from storage.embeddings import build_embedder
 from storage.postgres import PostgresBackend
 from storage.reconcile import build_resolver, verify_signature
@@ -117,9 +118,11 @@ async def lifespan(app: FastAPI):
     app.state.pool = pool
     embedder = build_embedder(settings)  # Voyage when keyed, else disabled (keyword-only)
     resolver = build_resolver(settings)  # GitHub when keyed, else disabled (unverifiable)
-    deps.backend = PostgresBackend(pool, embedder=embedder, resolver=resolver)
+    curator = build_curator(settings)    # Anthropic when keyed, else disabled (no-op curate)
+    deps.backend = PostgresBackend(pool, embedder=embedder, resolver=resolver, curator=curator)
     log.info("startup_ok", max_size=settings.pool_max_size,
-             embeddings=embedder.enabled, reconciler=resolver.enabled)
+             embeddings=embedder.enabled, reconciler=resolver.enabled,
+             curator=curator.enabled)
     try:
         async with mcp_app.lifespan(app):  # run the MCP session manager
             yield

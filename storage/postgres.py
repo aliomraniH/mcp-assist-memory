@@ -17,6 +17,7 @@ import functools
 import hashlib
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 import psycopg
@@ -26,7 +27,9 @@ from psycopg.types.json import Jsonb
 
 from config import settings
 from storage.base import StorageBackend
+from storage.curator import Curator, DisabledCurator
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
+from storage.phi import assert_no_phi
 from storage.reconcile import DisabledResolver, Resolver, reconcile_claim
 from storage.sanitize import sanitize, wrap_value
 
@@ -114,8 +117,54 @@ def _split_meta(meta: dict | None) -> tuple[Any, Any, Any, Any, Any, Any]:
     return repo_sha, base_sha, branch, dirty, session_id, Jsonb(meta)
 
 
+# Deterministic event_id namespace for curator writes, so re-running coord_curate
+# for the same session is exactly-once (the memory_entry.event_id unique gate holds).
+_CURATE_EVENT_NS = uuid.uuid5(uuid.NAMESPACE_URL, "mcp-assist-memory/curator")
+
+
+def _curate_event_id(namespace: str, session_id: str, key: str, suffix: str) -> str:
+    return str(uuid.uuid5(_CURATE_EVENT_NS, f"{namespace}|{session_id}|{key}|{suffix}"))
+
+
+def _as_int(v: Any) -> int | None:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(v: Any) -> float | None:
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _claim_has_provenance(op: dict) -> bool:
+    """A claim must be mechanically verifiable: meta.repo + (meta.pr | meta.branch),
+    matching the reconciler's "no resolvable subject" rule. A claim without it is
+    downgraded to a plain note rather than written as an unverifiable claim."""
+    meta = op.get("meta") or {}
+    return bool(meta.get("repo")) and (meta.get("pr") is not None or bool(meta.get("branch")))
+
+
+def _is_live(row: dict, *, now: datetime | None = None) -> bool:
+    """A revision is the live one only if it is neither a tombstone nor past its
+    supersession boundary. ``valid_until`` (0005) is treated exactly like
+    ``tombstone``: a non-NULL timestamp in the past means this revision was
+    superseded and must not surface as the latest live entry. History is kept;
+    this only governs which revision a "latest live" read returns."""
+    if row.get("tombstone"):
+        return False
+    vu = row.get("valid_until")
+    if isinstance(vu, datetime):
+        return vu > (now or datetime.now(timezone.utc))
+    return True
+
+
 def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
     value = row["value"]
+    valid_until = row.get("valid_until")
     return {
         "namespace": row["namespace"],
         "key": row["key"],
@@ -135,25 +184,33 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         "session_id": row.get("session_id"),
         "meta": row.get("meta"),
         "content_hash": row.get("content_hash"),
+        # Curator scores + supersession boundary (0005). All optional/null for
+        # non-curated entries, so existing readers are unaffected.
+        "salience": row.get("salience"),
+        "confidence": row.get("confidence"),
+        "valid_until": valid_until.isoformat() if isinstance(valid_until, datetime) else valid_until,
     }
 
 
 _RRF_K = 60
 
 
-def _rrf_fuse(semantic_rows, keyword_rows, limit, *, k: int = _RRF_K) -> list[dict]:
-    """Reciprocal Rank Fusion of the meaning and keyword legs into one ranked list.
+def _rrf_fuse(*legs_and_limit, k: int = _RRF_K) -> list[dict]:
+    """Reciprocal Rank Fusion of N ranked legs into one ranked list.
 
-    Each leg contributes ``1 / (k + rank)`` (rank is 1-based) to a key's score, so
-    a key present in BOTH legs sums two contributions and floats above one that
-    only tops a single leg — a true blended ranking rather than concatenating the
-    cosine list with keyword backfill. Ties break on the better (smaller)
-    individual rank, then key, for a deterministic order. The row payload comes
-    from whichever leg saw the key first (semantic, then keyword)."""
+    Called as ``_rrf_fuse(leg1, leg2, ..., limit)`` — the final positional arg is
+    the result limit, everything before it is a ranked leg (summary-meaning,
+    hyde-meaning, keyword). Each leg contributes ``1 / (k + rank)`` (rank is
+    1-based) to a key's score, so a key present in multiple legs sums their
+    contributions and floats above one that only tops a single leg — a true blended
+    ranking rather than concatenating cosine with keyword backfill. Ties break on
+    the better (smaller) individual rank, then key, for a deterministic order. The
+    row payload comes from whichever leg saw the key first."""
+    *legs, limit = legs_and_limit
     scores: dict[str, float] = {}
     best_rank: dict[str, int] = {}
     rows_by_key: dict[str, dict] = {}
-    for leg in (semantic_rows, keyword_rows):
+    for leg in legs:
         for rank, row in enumerate(leg, start=1):
             key = row["key"]
             scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
@@ -186,7 +243,13 @@ def _event_to_dict(row: dict) -> dict:
 
 
 class PostgresBackend(StorageBackend):
-    def __init__(self, pool, embedder: Embedder | None = None, resolver: Resolver | None = None) -> None:
+    def __init__(
+        self,
+        pool,
+        embedder: Embedder | None = None,
+        resolver: Resolver | None = None,
+        curator: Curator | None = None,
+    ) -> None:
         self.pool = pool
         # Best-effort semantic recall. Defaults to disabled so the backend works
         # with no provider key (keyword-only search, no embeddings written).
@@ -194,6 +257,9 @@ class PostgresBackend(StorageBackend):
         # Best-effort claim reconciliation. Defaults to disabled so the backend
         # works with no GitHub token (claims reconcile to "unverifiable").
         self.resolver: Resolver = resolver or DisabledResolver()
+        # Best-effort write-side consolidation. Defaults to disabled so the backend
+        # works with no Anthropic key (coord_curate is a clean no-op).
+        self.curator: Curator = curator or DisabledCurator()
 
     async def _maybe_embed(self, key, value, tombstone) -> str | None:
         """Embed an entry's text for storage. Best-effort: returns None when
@@ -233,6 +299,18 @@ class PostgresBackend(StorageBackend):
         except (TypeError, ValueError):  # non-numeric entries
             return None
 
+    async def _maybe_embed_text(self, text: str | None, *, input_type: str = "document") -> str | None:
+        """Embed a single explicit string (the curator's ``summary`` or ``hyde``).
+        Best-effort: returns None when embeddings are disabled, the text is empty,
+        or the provider fails — never blocks a write."""
+        if not self.embedder.enabled or not text:
+            return None
+        try:
+            vecs = await self.embedder.embed([text], input_type=input_type)
+        except Exception:  # noqa: BLE001 - embedding is best-effort
+            return None
+        return self._safe_literal(vecs)
+
     # ----------------------------------------------------------------- memory
     async def _seen_event(self, conn, event_id: str) -> dict | None:
         cur = await conn.execute(
@@ -242,11 +320,21 @@ class PostgresBackend(StorageBackend):
         return await cur.fetchone()
 
     async def _append(
-        self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None
+        self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None,
+        *, salience=None, confidence=None, valid_until=None, embeddings=None,
     ) -> dict:
         # Embed BEFORE taking a pooled connection so the (network) embedding call
         # never holds a connection, and compute it once so retries don't re-embed.
-        embedding = await self._maybe_embed(key, value, tombstone)
+        # The curator supplies its own (summary, hyde) strings via `embeddings`:
+        # `summary` becomes the primary `embedding` column, `hyde` the second leg.
+        # Otherwise we embed the entry's own text into the primary column as before.
+        if embeddings is not None:
+            summary_text, hyde_text = embeddings
+            embedding = None if tombstone else await self._maybe_embed_text(summary_text)
+            hyde_embedding = None if tombstone else await self._maybe_embed_text(hyde_text, input_type="query")
+        else:
+            embedding = await self._maybe_embed(key, value, tombstone)
+            hyde_embedding = None
         repo_sha, base_sha, branch, dirty, session_id, meta_json = _split_meta(meta)
         sanitized = sanitize(value)
         # Tombstones carry no content hash (the value is a delete marker, not a fact).
@@ -269,17 +357,20 @@ class PostgresBackend(StorageBackend):
                             """
                             INSERT INTO memory_entry
                                 (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding,
-                                 repo_sha, base_sha, branch, dirty, session_id, meta, content_hash)
+                                 repo_sha, base_sha, branch, dirty, session_id, meta, content_hash,
+                                 salience, confidence, valid_until, hyde_embedding)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
                                    %s, %s, %s, %s, %s, %s, %s::vector,
-                                   %s, %s, %s, %s, %s, %s, %s
+                                   %s, %s, %s, %s, %s, %s, %s,
+                                   %s, %s, %s, %s::vector
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
                             (namespace, key, kind, payload, source_surface, tags, event_id,
                              tombstone, embedding,
                              repo_sha, base_sha, branch, dirty, session_id, meta_json, content_hash,
+                             salience, confidence, valid_until, hyde_embedding,
                              namespace, key),
                         )
                         row = await cur.fetchone()
@@ -312,7 +403,7 @@ class PostgresBackend(StorageBackend):
                 (namespace, key),
             )
             row = await cur.fetchone()
-        if row is None or row["tombstone"]:
+        if row is None or not _is_live(row):
             return None
         return _row_to_entry(row)
 
@@ -339,7 +430,7 @@ class PostgresBackend(StorageBackend):
                 params,
             )
             rows = await cur.fetchall()
-        live = [_row_to_entry(r) for r in rows if not r["tombstone"]]
+        live = [_row_to_entry(r) for r in rows if _is_live(r)]
         return live[:limit]
 
     @_retry_on_disconnect
@@ -397,7 +488,8 @@ class PostgresBackend(StorageBackend):
                         WHERE namespace = %s
                         ORDER BY key, revision DESC
                     ) latest
-                    WHERE NOT tombstone AND value::text ILIKE %s
+                    WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                          AND value::text ILIKE %s
                     LIMIT %s
                     """,
                     (namespace, f"%{query}%", limit),
@@ -430,7 +522,8 @@ class PostgresBackend(StorageBackend):
                         WHERE namespace = %s
                         ORDER BY key, revision DESC
                     ) latest
-                    WHERE NOT tombstone AND embedding IS NOT NULL
+                    WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                          AND embedding IS NOT NULL
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
                     """,
@@ -438,8 +531,30 @@ class PostgresBackend(StorageBackend):
                 )
                 semantic_rows = await cur.fetchall()
 
+                # HyDE leg (0005). The curator stores a second embedding of the
+                # *question* a future agent would ask (`hyde`); ranking the query
+                # against it too lets a problem-phrased query match a memory whose
+                # statement wouldn't. Only curated rows carry hyde_embedding, so this
+                # leg is naturally empty until the curator has run.
+                cur = await conn.execute(
+                    """
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (key) *
+                        FROM memory_entry
+                        WHERE namespace = %s
+                        ORDER BY key, revision DESC
+                    ) latest
+                    WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                          AND hyde_embedding IS NOT NULL
+                    ORDER BY hyde_embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (namespace, qvec, limit),
+                )
+                hyde_rows = await cur.fetchall()
+
             # Keyword leg. Same latest-then-filter shape: take the latest revision
-            # per key first, then keep non-tombstoned substring matches.
+            # per key first, then keep non-tombstoned, non-superseded substring matches.
             cur = await conn.execute(
                 """
                 SELECT * FROM (
@@ -448,14 +563,15 @@ class PostgresBackend(StorageBackend):
                     WHERE namespace = %s
                     ORDER BY key, revision DESC
                 ) latest
-                WHERE NOT tombstone AND value::text ILIKE %s
+                WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                      AND value::text ILIKE %s
                 LIMIT %s
                 """,
                 (namespace, f"%{query}%", limit),
             )
             keyword_rows = await cur.fetchall()
 
-        return _rrf_fuse(semantic_rows, keyword_rows, limit)
+        return _rrf_fuse(semantic_rows, hyde_rows, keyword_rows, limit)
 
     # ----------------------------------------------------------- coordination
     @_retry_on_disconnect
@@ -479,13 +595,13 @@ class PostgresBackend(StorageBackend):
             cur = await conn.execute(
                 """
                 SELECT DISTINCT ON (key) key, revision, kind, repo_sha,
-                       content_hash, value, meta, tombstone, created_at
+                       content_hash, value, meta, tombstone, valid_until, created_at
                 FROM memory_entry WHERE namespace = %s
                 ORDER BY key, revision DESC
                 """,
                 (namespace,),
             )
-            rows = [r for r in await cur.fetchall() if not r["tombstone"]]
+            rows = [r for r in await cur.fetchall() if _is_live(r)]
 
         with_sha = [r for r in rows if r["repo_sha"]]
         latest_repo_sha = (
@@ -542,7 +658,7 @@ class PostgresBackend(StorageBackend):
             conn.row_factory = dict_row
             cur = await conn.execute(
                 """
-                SELECT DISTINCT ON (namespace, key) namespace, key, content_hash, value, tombstone
+                SELECT DISTINCT ON (namespace, key) namespace, key, content_hash, value, tombstone, valid_until
                 FROM memory_entry
                 ORDER BY namespace, key, revision DESC
                 """
@@ -551,7 +667,7 @@ class PostgresBackend(StorageBackend):
 
         groups: dict[str, list[tuple]] = defaultdict(list)
         for r in rows:
-            if r["tombstone"]:
+            if not _is_live(r):
                 continue
             h = r["content_hash"] or _content_hash(r["value"])
             groups[h].append((r["namespace"], r["key"]))
@@ -601,7 +717,7 @@ class PostgresBackend(StorageBackend):
                 """,
                 (namespace,),
             )
-            rows = [r for r in await cur.fetchall() if not r["tombstone"]][:limit]
+            rows = [r for r in await cur.fetchall() if _is_live(r)][:limit]
         verdicts = await self._reconcile_rows(rows)
         return {
             "namespace": namespace,
@@ -628,7 +744,7 @@ class PostgresBackend(StorageBackend):
             )
             rows = []
             for r in await cur.fetchall():
-                if r["tombstone"]:
+                if not _is_live(r):
                     continue
                 meta = r.get("meta") or {}
                 if pr is not None and str(meta.get("pr")) != str(pr):
@@ -639,6 +755,151 @@ class PostgresBackend(StorageBackend):
         verdicts = await self._reconcile_rows(rows[:limit])
         return {"repo": repo, "resolver_enabled": self.resolver.enabled,
                 "reconciled": len(verdicts), "verdicts": verdicts}
+
+    # ------------------------------------------------------------------ curate
+    @staticmethod
+    def _op_meta(op: dict, session_id: str) -> dict:
+        """Fold the curator's structured fields (subjects/abstraction/trace spans)
+        into meta so they survive on the row without new columns."""
+        meta = dict(op.get("meta") or {})
+        meta.setdefault("session_id", session_id)
+        if op.get("subjects"):
+            meta["subjects"] = op["subjects"]
+        if op.get("abstraction"):
+            meta["abstraction"] = op["abstraction"]
+        if op.get("trace_span_ids"):
+            meta["trace_span_ids"] = op["trace_span_ids"]
+        return meta
+
+    async def _set_validity_boundary(self, namespace, key, *, session_id) -> dict | None:
+        """Close out the live revision of ``key`` by appending a new revision with
+        ``valid_until=now()``. History is preserved (nothing is hard-deleted); the
+        superseded revision simply stops being the latest *live* one. No embeddings:
+        a past-its-boundary row never surfaces in search."""
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                "SELECT * FROM memory_entry WHERE namespace=%s AND key=%s "
+                "ORDER BY revision DESC LIMIT 1",
+                (namespace, key),
+            )
+            latest = await cur.fetchone()
+        if latest is None or not _is_live(latest):
+            return None
+        meta = dict(latest.get("meta") or {})
+        meta["superseded_by_session"] = session_id
+        return await self._append(
+            namespace, key, latest["value"], latest["kind"], list(latest.get("tags") or []),
+            latest.get("source_surface"),
+            _curate_event_id(namespace, session_id, key, "supersede-boundary"),
+            False, meta=meta, valid_until=datetime.now(timezone.utc),
+            embeddings=(None, None),
+        )
+
+    async def _write_curation_op(self, namespace, op, *, session_id, action) -> dict:
+        key = op["key"]
+        kind = op.get("kind") or "note"
+        value = op.get("value")
+        if value is None:
+            value = {}
+        tags = list(op.get("tags") or [])
+        meta = self._op_meta(op, session_id)
+        emb = op.get("embeddings") or {}
+        embeddings = (emb.get("summary"), emb.get("hyde"))
+
+        # SUPERSEDE/MERGE close out the old revisions BEFORE writing the survivor.
+        if action == "SUPERSEDE" and op.get("supersedes"):
+            await self._set_validity_boundary(namespace, op["supersedes"], session_id=session_id)
+        if action == "MERGE":
+            for old_key in (op.get("merge_from") or op.get("supersedes_keys") or []):
+                if old_key and old_key != key:
+                    await self._set_validity_boundary(namespace, old_key, session_id=session_id)
+
+        written = await self._append(
+            namespace, key, value, kind, tags, op.get("source_surface"),
+            _curate_event_id(namespace, session_id, key, action), False, meta=meta,
+            salience=_as_int(op.get("salience")), confidence=_as_float(op.get("confidence")),
+            embeddings=embeddings,
+        )
+        return {
+            "op": action, "key": key, "kind": written["kind"],
+            "revision": written["revision"], "downgraded": bool(op.get("_downgraded")),
+        }
+
+    async def apply_curation(self, namespace, result, *, session_id) -> dict:
+        """Deterministically apply a curator result. Each op is PHI-gated first
+        (fail-closed: dropped + counted), claims lacking provenance are downgraded
+        to notes, and every write carries a deterministic event_id so re-applying
+        the same session is exactly-once."""
+        operations = (result or {}).get("operations") or []
+        counts = {"added": 0, "updated": 0, "merged": 0, "superseded": 0,
+                  "noop": 0, "phi_dropped": 0, "downgraded": 0, "invalid": 0}
+        applied: list[dict] = []
+        noops: list[dict] = []
+        for op in operations:
+            if not isinstance(op, dict):
+                counts["invalid"] += 1
+                continue
+            action = str(op.get("op") or "").upper()
+            if action == "NOOP":
+                counts["noop"] += 1
+                noops.append({"subjects": op.get("subjects"), "reason": op.get("reason")})
+                continue
+            if action not in ("ADD", "UPDATE", "MERGE", "SUPERSEDE") or not op.get("key"):
+                counts["invalid"] += 1
+                continue
+            # PHI gate (fail closed) — refused ops are never written.
+            if not assert_no_phi(op):
+                counts["phi_dropped"] += 1
+                continue
+            # A claim without mechanical provenance is downgraded to a plain note.
+            if (op.get("kind") or "note") == "claim" and not _claim_has_provenance(op):
+                op = {**op, "kind": "note", "_downgraded": True,
+                      "tags": list(op.get("tags") or []) + ["claim-downgraded"]}
+                counts["downgraded"] += 1
+            written = await self._write_curation_op(
+                namespace, op, session_id=session_id, action=action)
+            applied.append(written)
+            counts[{"ADD": "added", "UPDATE": "updated",
+                    "MERGE": "merged", "SUPERSEDE": "superseded"}[action]] += 1
+        return {"applied": applied, "noops": noops, "counts": counts}
+
+    def _trace_query_text(self, events: list[dict]) -> str:
+        """A compact text blob of the session trace, used only to pull `similar_memories`
+        so the curator can dedup/supersede against what's already stored."""
+        chunks: list[str] = []
+        for e in events:
+            chunks.append(str(e.get("kind") or ""))
+            try:
+                chunks.append(json.dumps(e.get("payload"), default=str))
+            except (TypeError, ValueError):
+                pass
+        return " ".join(c for c in chunks if c)[:2000]
+
+    async def coord_curate(self, namespace, session_id, *, dry_run=False, similar_limit=10) -> dict:
+        """Pull-triggered, best-effort write-side curation (mirrors coord_reconcile).
+        Disabled curator ⇒ a clear no-op, never a guess."""
+        if not self.curator.enabled:
+            return {"namespace": namespace, "session_id": session_id,
+                    "curator_enabled": False, "dry_run": dry_run, "operations": []}
+        events = await self.session_events(namespace, session_id)
+        trace = [
+            {"span_id": str(e.get("seq")), "type": e.get("kind"),
+             "payload": e.get("payload"), "created_at": e.get("created_at")}
+            for e in events
+        ]
+        query_text = self._trace_query_text(events)
+        similar = await self.memory_search(namespace, query_text, limit=similar_limit) if query_text else []
+        envelope = {"namespace": namespace, "session_id": session_id,
+                    "trace": trace, "similar_memories": similar}
+        result = await self.curator.curate(envelope)
+        operations = (result or {}).get("operations") or []
+        out = {"namespace": namespace, "session_id": session_id,
+               "curator_enabled": True, "dry_run": dry_run, "operations": operations}
+        if dry_run:
+            return out
+        out.update(await self.apply_curation(namespace, result, session_id=session_id))
+        return out
 
     # ---------------------------------------------------------------- handoff
     # Handoffs are cross-surface (web/cli/desktop) within ONE project: stored as

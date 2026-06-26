@@ -7,3 +7,4 @@
 - [Dashboard e2e test vs real secrets](dashboard-e2e-test-secrets.md) — login e2e must POST ADMIN_PW read from os.environ (not a hardcoded literal), or it goes red under any non-default ADMIN_PASSWORD (workspace secret or the CI-set value).
 - [GitHub reconciler token sourcing](github-connector-token.md) — explicit GITHUB_TOKEN wins, else fetch per-window from the Replit connector proxy (OAuth refreshes, never snapshot); failure → unverifiable.
 - [pgvector memory_search](pgvector-memory-search.md) — search the append-only revisioned store: reduce to latest-revision-per-key BEFORE filtering, or deleted/stale rows leak; pgvector text-literal ::vector cast; pooled conn row_factory sticks.
+- [valid_until live reads](valid-until-live-reads.md) — a new not-live column must be honored in BOTH SQL WHEREs and Python `_is_live` post-filters; the latter's explicit SELECT must include the column or superseded rows leak.

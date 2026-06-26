@@ -40,6 +40,11 @@ ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS session_id text;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS meta       jsonb;
 -- 0004_content_hash.sql
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS content_hash text;
+-- 0005_curation.sql columns (mirrored inline so the suite is self-contained).
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS salience   int;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS confidence real;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS valid_until timestamptz;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS hyde_embedding vector(1024);
 CREATE UNIQUE INDEX IF NOT EXISTS memory_entry_event_id_uq
     ON memory_entry (event_id) WHERE event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS memory_entry_embedding_hnsw
@@ -48,6 +53,11 @@ CREATE INDEX IF NOT EXISTS memory_entry_ns_repo_sha ON memory_entry (namespace, 
 CREATE INDEX IF NOT EXISTS memory_entry_session_id  ON memory_entry (session_id);
 CREATE INDEX IF NOT EXISTS memory_entry_meta_gin    ON memory_entry USING gin (meta jsonb_path_ops);
 CREATE INDEX IF NOT EXISTS memory_entry_content_hash ON memory_entry (content_hash);
+CREATE INDEX IF NOT EXISTS memory_entry_ns_salience ON memory_entry (namespace, salience);
+CREATE INDEX IF NOT EXISTS memory_entry_live ON memory_entry (namespace, key)
+    WHERE NOT tombstone AND valid_until IS NULL;
+CREATE INDEX IF NOT EXISTS memory_entry_hyde_hnsw
+    ON memory_entry USING hnsw (hyde_embedding vector_cosine_ops);
 CREATE TABLE IF NOT EXISTS session (
     session_id uuid PRIMARY KEY DEFAULT gen_random_uuid(), namespace text NOT NULL,
     surface text, metadata jsonb NOT NULL DEFAULT '{}',
@@ -146,6 +156,36 @@ async def reconcile_backend():
     async with pool.connection() as conn:
         await conn.execute(SCHEMA)
     yield PostgresBackend(pool, resolver=FakeResolver())
+    await pool.close()
+
+
+class FakeCurator:
+    """Offline curator for tests. Tests set ``.result`` to the canned envelope the
+    apply-worker should receive — no live Anthropic call. ``enabled`` is settable so
+    the disabled path (no Anthropic key) can be exercised too."""
+
+    def __init__(self, result=None, *, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self.result = result or {"operations": []}
+        self.calls: list[dict] = []
+
+    async def curate(self, envelope: dict) -> dict:
+        self.calls.append(envelope)
+        return self.result
+
+
+@pytest_asyncio.fixture
+async def curate_backend():
+    """Like ``backend`` but with a FakeCurator + FakeEmbedder wired in, so
+    coord_curate/apply_curation exercise the real write + dual-embedding path. Tests
+    set ``curate_backend.curator.result`` to control the canned operations."""
+    if DATABASE_URL is None:
+        pytest.skip("DATABASE_URL not set")
+    pool = AsyncConnectionPool(DATABASE_URL, open=False, min_size=0, max_size=4)
+    await pool.open()
+    async with pool.connection() as conn:
+        await conn.execute(SCHEMA)
+    yield PostgresBackend(pool, embedder=FakeEmbedder(), curator=FakeCurator())
     await pool.close()
 
 

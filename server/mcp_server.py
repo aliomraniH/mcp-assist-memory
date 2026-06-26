@@ -1,4 +1,4 @@
-"""FastMCP instance and the 21 tools.
+"""FastMCP instance and the 22 tools.
 
 The tools are thin: they validate/relay to the injected ``StorageBackend``.
 The backend is set on ``deps`` during the FastAPI lifespan (one pool, injected),
@@ -9,12 +9,12 @@ project == tenant) and the backend filters every query on it — there are no
 implicit cross-project reads. Artifacts are content-addressed and global, and
 ``coord_drift_scan``/``stats`` are deliberately store-wide coordination/admin views.
 
-Tool surface (21):
+Tool surface (22):
   memory:   memory_save, memory_get, memory_list, memory_history, memory_delete, memory_search
   handoff:  handoff_save, handoff_load, handoff_list
   session:  session_create, session_append_event, session_get, session_list, session_events
   artifact: artifact_put, artifact_get, artifact_list
-  coord:    coord_health, coord_drift_scan, coord_reconcile
+  coord:    coord_health, coord_drift_scan, coord_reconcile, coord_curate
   admin:    stats
 """
 from __future__ import annotations
@@ -240,6 +240,22 @@ async def coord_reconcile(namespace: str, limit: int = 100) -> dict:
     every verdict is `unverifiable` (never silently `current`). Run it at session
     start to learn which claims need re-verifying."""
     return await _backend().coord_reconcile(namespace, limit=limit)
+
+
+@mcp.tool
+async def coord_curate(namespace: str, session_id: str, dry_run: bool = False) -> dict:
+    """Pull-triggered, write-side LLM curation of a finished session. Reads the
+    session's execution trace plus similar existing memories, asks the curator what
+    is worth persisting, and (unless dry_run) applies the resulting operations
+    deterministically: ADD/UPDATE/MERGE/SUPERSEDE/NOOP. Every op passes a fail-closed
+    PHI gate first, claims without provenance (meta.repo + meta.pr/branch) are
+    downgraded to notes, supersession sets a validity boundary (history is kept, never
+    deleted), and writes are idempotent so re-running the same session never
+    double-writes. When the curator is disabled (no Anthropic key) it returns
+    {curator_enabled: false, operations: []} — a clear no-op, never a guess. Run it at
+    session end to consolidate durable lessons. dry_run=True returns the proposed
+    operations without writing."""
+    return await _backend().coord_curate(namespace, session_id, dry_run=dry_run)
 
 
 # -------------------------------------------------------------------- admin
