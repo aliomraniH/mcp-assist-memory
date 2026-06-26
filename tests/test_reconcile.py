@@ -2,7 +2,7 @@
 to coord/_reconcile/*, the disabled (no-GitHub) path, and webhook signature auth."""
 from __future__ import annotations
 
-from storage.reconcile import CURRENT, STALE, UNVERIFIABLE, reconcile_claim, verify_signature
+from storage.reconcile import CURRENT, STALE, UNVERIFIABLE, reconcile_claim, sha_match, verify_signature
 
 REPO = "acme/widget"
 
@@ -104,6 +104,30 @@ async def test_webhook_repo_scoped_reconcile_across_namespaces(reconcile_backend
     out = await reconcile_backend.coord_reconcile_repo(repo, pr=11)
     assert out["reconciled"] == 2
     assert all(v["state"] == CURRENT for v in out["verdicts"])
+
+
+def test_sha_match_tolerates_abbreviation():
+    full = "6e942ca0c84733da5772f476a6ca98c81ea4d02b"
+    assert sha_match("6e942ca", full) is True          # short recorded vs full from API
+    assert sha_match(full, "6e942ca") is True           # symmetric
+    assert sha_match("6E942CA", full) is True           # case-insensitive
+    assert sha_match(full, full) is True                # identical
+    assert sha_match("deadbee", full) is False          # different commit
+    assert sha_match("6e9", full) is False              # too short to trust (<7)
+    assert sha_match(None, full) is False
+    assert sha_match("6e942ca", None) is False
+
+
+async def test_pr_merged_with_SHORT_recorded_sha_is_current(reconcile_backend, ns):
+    # Live-found regression: claim records a 7-char sha, GitHub returns the full 40.
+    full = "6e942ca0c84733da5772f476a6ca98c81ea4d02b"
+    reconcile_backend.resolver.pulls[(REPO, 7)] = {"merged": True, "merge_sha": full}
+    await reconcile_backend.memory_save(
+        ns, "pr7", {"done": True}, kind="claim",
+        meta={"repo": REPO, "pr": 7, "merge_sha": "6e942ca"},
+    )
+    out = await reconcile_backend.coord_reconcile(ns)
+    assert out["verdicts"][0]["state"] == CURRENT
 
 
 def test_verify_signature_roundtrip_and_rejects_tampering():
