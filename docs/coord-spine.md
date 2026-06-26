@@ -1,6 +1,6 @@
 # Coordination spine — keeping memory in sync with the code it describes
 
-**Status:** Phase 1 implemented (this PR). Phases 2–3 are designed here, not yet built.
+**Status:** Phases 1 & 2 implemented. Phase 3 is designed here, not yet built.
 
 ## The problem (observed, not hypothetical)
 
@@ -79,15 +79,27 @@ Stored as new `kind` enum values (`claim`, `knowledge`) — see Phase 1.
   (`meta`/`_meta`) into the columns. It deliberately does **not** scrape SHAs from prose — a wrong
   provenance stamp is worse than none.
 
-### Phase 2 — the universal, git-free spine
+### Phase 2 — the universal, git-free spine (implemented)
 
-- Add `namespace_epoch` + `content_hash` to the version vector (server-computed, always present).
-- Two drift detectors that need **zero git**, riding the embeddings already shipped:
-  - *Namespace drift* — cosine similarity of same-key entries across namespaces flags
-    `canvas-case`↔`canvas-glp1` **before** a manual merge (stronger than exact hash match).
-  - *Status contradiction* — opposing Claims on one subject get flagged.
-- Surface via a `coord_health(namespace)` tool + a `coord/_nudges` key. Any surface that can call
-  one MCP tool gets nudges — no git required to receive them.
+- `migrations/0004_content_hash.sql`: a `content_hash` column (sha256 of the canonical value),
+  computed on write, surfaced on reads — the always-present, git-free dimension of the version
+  vector. Identical facts hash identically regardless of surface or namespace. Legacy/tombstoned
+  rows are null and the detectors hash on the fly, so no backfill is required for them to work
+  (`scripts/backfill_content_hash.py` only populates the column for the indexed scan path).
+- `coord_health(namespace)` — a per-namespace drift report, no git needed:
+  - *stale* — live entries whose `repo_sha` is behind the namespace's most-recently-observed
+    `repo_sha` (a git-free proxy for "predates current code → re-verify"). Catches the
+    silently-stale `coord/verify-status` class.
+  - *duplicate_content* — distinct keys holding an identical fact (same `content_hash`).
+  - *claim_collisions* — multiple live `claim`s about the same subject (`meta.subject`, or
+    `meta.pr`). Catches the rev2-vs-rev3 contradiction class before a human has to.
+- `coord_drift_scan()` — a deliberately store-wide (admin, like `stats`) scan for the same fact
+  living under more than one namespace — the `canvas-case`↔`canvas-glp1` class. Respects tenancy
+  by being explicitly cross-tenant rather than leaking through a per-project read.
+
+Deferred to a follow-up: `namespace_epoch` (a logical-clock refinement for entries that carry no
+`repo_sha`), semantic (cosine) near-duplicate detection layered on top of the exact-hash grouping,
+and a written `coord/_nudges` key (today the detectors are pull, via the two tools).
 
 ### Phase 3 — backend git/GitHub access + reconciler
 

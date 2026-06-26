@@ -105,6 +105,13 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     async def artifact_list(self, *, limit: int = 100) -> list[dict]: ...
 
+    # ---------------- coordination (drift detection) ----------------
+    @abc.abstractmethod
+    async def coord_health(self, namespace: str, *, limit: int = 200) -> dict: ...
+
+    @abc.abstractmethod
+    async def coord_drift_scan(self, *, limit: int = 50) -> dict: ...
+
     # ---------------- admin ----------------
     @abc.abstractmethod
     async def stats(self) -> dict: ...

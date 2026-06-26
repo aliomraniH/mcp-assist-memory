@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import json
 import uuid
 from typing import Any
 
@@ -90,6 +91,16 @@ def _retry_if_idempotent(fn):
 _META_COLS = ("repo_sha", "base_sha", "branch", "dirty", "session_id")
 
 
+def _content_hash(value: Any) -> str:
+    """sha256 over a canonical JSON encoding of the (already-sanitized) value.
+
+    The always-present, git-free dimension of the version vector: identical
+    facts hash identically regardless of surface or namespace, which is what the
+    coordination detectors group on. Sort keys so dict ordering doesn't matter."""
+    canon = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
 def _split_meta(meta: dict | None) -> tuple[Any, Any, Any, Any, Any, Any]:
     """Return ``(repo_sha, base_sha, branch, dirty, session_id, meta_jsonb)``.
 
@@ -122,6 +133,7 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         "dirty": row.get("dirty"),
         "session_id": row.get("session_id"),
         "meta": row.get("meta"),
+        "content_hash": row.get("content_hash"),
     }
 
 
@@ -232,6 +244,9 @@ class PostgresBackend(StorageBackend):
         # never holds a connection, and compute it once so retries don't re-embed.
         embedding = await self._maybe_embed(key, value, tombstone)
         repo_sha, base_sha, branch, dirty, session_id, meta_json = _split_meta(meta)
+        sanitized = sanitize(value)
+        # Tombstones carry no content hash (the value is a delete marker, not a fact).
+        content_hash = None if tombstone else _content_hash(sanitized)
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
             # Exactly-once: if this event already landed, return it unchanged.
@@ -240,7 +255,7 @@ class PostgresBackend(StorageBackend):
                 if existing is not None:
                     return _row_to_entry(existing)
 
-            payload = Jsonb(sanitize(value))
+            payload = Jsonb(sanitized)
             tags = tags or []
             last_exc: Exception | None = None
             for _ in range(_MAX_RETRIES):
@@ -250,17 +265,17 @@ class PostgresBackend(StorageBackend):
                             """
                             INSERT INTO memory_entry
                                 (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding,
-                                 repo_sha, base_sha, branch, dirty, session_id, meta)
+                                 repo_sha, base_sha, branch, dirty, session_id, meta, content_hash)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
                                    %s, %s, %s, %s, %s, %s, %s::vector,
-                                   %s, %s, %s, %s, %s, %s
+                                   %s, %s, %s, %s, %s, %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
                             (namespace, key, kind, payload, source_surface, tags, event_id,
                              tombstone, embedding,
-                             repo_sha, base_sha, branch, dirty, session_id, meta_json,
+                             repo_sha, base_sha, branch, dirty, session_id, meta_json, content_hash,
                              namespace, key),
                         )
                         row = await cur.fetchone()
@@ -437,6 +452,117 @@ class PostgresBackend(StorageBackend):
             keyword_rows = await cur.fetchall()
 
         return _rrf_fuse(semantic_rows, keyword_rows, limit)
+
+    # ----------------------------------------------------------- coordination
+    @_retry_on_disconnect
+    async def coord_health(self, namespace, *, limit=200) -> dict:
+        """Drift report for ONE namespace — computed from stored provenance, no
+        git required. Surfaces three things a reader would otherwise eyeball:
+
+        * ``stale``       — live entries whose repo_sha is behind the namespace's
+                            most-recently-observed repo_sha (a git-free proxy for
+                            "this predates current code → re-verify").
+        * ``duplicate_content`` — distinct keys holding an identical fact
+                            (same content_hash) — a restate/fork to reconcile.
+        * ``claim_collisions``  — multiple live claims about the same subject
+                            (meta.subject, or meta.pr) — the rev2-vs-rev3 class,
+                            caught before a human has to.
+        """
+        from collections import defaultdict
+
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                """
+                SELECT DISTINCT ON (key) key, revision, kind, repo_sha,
+                       content_hash, value, meta, tombstone, created_at
+                FROM memory_entry WHERE namespace = %s
+                ORDER BY key, revision DESC
+                """,
+                (namespace,),
+            )
+            rows = [r for r in await cur.fetchall() if not r["tombstone"]]
+
+        with_sha = [r for r in rows if r["repo_sha"]]
+        latest_repo_sha = (
+            max(with_sha, key=lambda r: r["created_at"])["repo_sha"] if with_sha else None
+        )
+        stale = [
+            {"key": r["key"], "repo_sha": r["repo_sha"], "revision": r["revision"]}
+            for r in with_sha
+            if r["repo_sha"] != latest_repo_sha
+        ]
+
+        by_hash: dict[str, list[str]] = defaultdict(list)
+        for r in rows:
+            by_hash[r["content_hash"] or _content_hash(r["value"])].append(r["key"])
+        duplicate_content = [
+            {"content_hash": h, "keys": sorted(keys)}
+            for h, keys in by_hash.items() if len(keys) > 1
+        ]
+
+        by_subject: dict[str, set] = defaultdict(set)
+        for r in rows:
+            if r["kind"] != "claim":
+                continue
+            meta = r["meta"] or {}
+            subject = meta.get("subject")
+            if subject is None and meta.get("pr") is not None:
+                subject = f"pr:{meta['pr']}"
+            if subject is not None:
+                by_subject[str(subject)].add(r["key"])
+        claim_collisions = [
+            {"subject": s, "keys": sorted(keys)}
+            for s, keys in by_subject.items() if len(keys) > 1
+        ]
+
+        return {
+            "namespace": namespace,
+            "entry_count": len(rows),
+            "latest_repo_sha": latest_repo_sha,
+            "stale": stale[:limit],
+            "duplicate_content": duplicate_content[:limit],
+            "claim_collisions": claim_collisions[:limit],
+        }
+
+    @_retry_on_disconnect
+    async def coord_drift_scan(self, *, limit=50) -> dict:
+        """Store-wide: the same fact living under more than one namespace — the
+        namespace-drift class (e.g. canvas-case vs canvas-glp1). DELIBERATELY
+        cross-tenant, like ``stats``: a coordination/admin scan, not a per-project
+        read. Groups live entries by content_hash (computed on the fly for legacy
+        rows that predate the column) and returns hashes spanning >1 namespace."""
+        from collections import defaultdict
+
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                """
+                SELECT DISTINCT ON (namespace, key) namespace, key, content_hash, value, tombstone
+                FROM memory_entry
+                ORDER BY namespace, key, revision DESC
+                """
+            )
+            rows = await cur.fetchall()
+
+        groups: dict[str, list[tuple]] = defaultdict(list)
+        for r in rows:
+            if r["tombstone"]:
+                continue
+            h = r["content_hash"] or _content_hash(r["value"])
+            groups[h].append((r["namespace"], r["key"]))
+
+        drift = []
+        for h, items in groups.items():
+            namespaces = {ns for ns, _ in items}
+            if len(namespaces) > 1:
+                drift.append({
+                    "content_hash": h,
+                    "namespaces": sorted(namespaces),
+                    "entries": sorted(f"{ns}/{k}" for ns, k in items),
+                })
+        drift.sort(key=lambda d: (-len(d["namespaces"]), d["content_hash"]))
+        return {"suspected_namespace_drift": drift[:limit]}
 
     # ---------------------------------------------------------------- handoff
     # Handoffs are cross-surface (web/cli/desktop) within ONE project: stored as

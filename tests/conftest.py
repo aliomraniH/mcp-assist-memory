@@ -38,6 +38,8 @@ ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS branch     text;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS dirty      boolean;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS session_id text;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS meta       jsonb;
+-- 0004_content_hash.sql
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS content_hash text;
 CREATE UNIQUE INDEX IF NOT EXISTS memory_entry_event_id_uq
     ON memory_entry (event_id) WHERE event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS memory_entry_embedding_hnsw
@@ -45,6 +47,7 @@ CREATE INDEX IF NOT EXISTS memory_entry_embedding_hnsw
 CREATE INDEX IF NOT EXISTS memory_entry_ns_repo_sha ON memory_entry (namespace, repo_sha);
 CREATE INDEX IF NOT EXISTS memory_entry_session_id  ON memory_entry (session_id);
 CREATE INDEX IF NOT EXISTS memory_entry_meta_gin    ON memory_entry USING gin (meta jsonb_path_ops);
+CREATE INDEX IF NOT EXISTS memory_entry_content_hash ON memory_entry (content_hash);
 CREATE TABLE IF NOT EXISTS session (
     session_id uuid PRIMARY KEY DEFAULT gen_random_uuid(), namespace text NOT NULL,
     surface text, metadata jsonb NOT NULL DEFAULT '{}',
