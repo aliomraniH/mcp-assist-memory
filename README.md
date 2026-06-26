@@ -141,6 +141,16 @@ restarts/redeploys, and the three surfaces share no server-side session state.
   results, lower it toward `40` to shave latency. Very large tenants can also tune
   the index **build** parameters (`m`, `ef_construction`); see
   `migrations/0002_embeddings.sql` (changing those requires recreating the index).
+- **Coordination reconciler (`coord_reconcile`):** when GitHub access is available,
+  a `claim` (with `meta.repo` + `meta.pr`/`meta.branch`) is resolved against live
+  GitHub — is PR #N merged? what is branch X's head? — and stamped with an
+  append-only verdict; without access it stays `unverifiable` (never a wrong
+  `current`). Access is sourced in priority order: an explicit `GITHUB_TOKEN`
+  (read-only repo + PRs), else — on Replit — the **connected GitHub account** via
+  the Replit connector (token fetched fresh per cache-window so it survives OAuth
+  refresh), else disabled. Resolution is **best-effort**: a network/API failure
+  yields `unverifiable`, never a blocked write. `GITHUB_WEBHOOK_SECRET` enables
+  `POST /webhook/github` to reconcile affected claims on push / pull_request.
 
 ## Run locally
 

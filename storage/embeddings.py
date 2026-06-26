@@ -29,7 +29,7 @@ class Embedder(Protocol):
     enabled: bool
 
     async def embed(
-        self, texts: list[str], *, input_type: str = "document"
+        self, texts: list[str], *, input_type: str = "document", max_retries: int = 0
     ) -> list[list[float]] | None: ...
 
 
@@ -39,7 +39,7 @@ class DisabledEmbedder:
     enabled = False
 
     async def embed(
-        self, texts: list[str], *, input_type: str = "document"
+        self, texts: list[str], *, input_type: str = "document", max_retries: int = 0
     ) -> list[list[float]] | None:
         return None
 
@@ -57,10 +57,19 @@ class VoyageEmbedder:
         self.timeout = timeout
 
     async def embed(
-        self, texts: list[str], *, input_type: str = "document"
+        self, texts: list[str], *, input_type: str = "document", max_retries: int = 0
     ) -> list[list[float]] | None:
+        """Embed ``texts`` via Voyage.
+
+        ``max_retries`` defaults to 0 so the live write/search path fails fast on
+        a 429/5xx (embedding is best-effort and runs inline — it must not add
+        seconds of latency to a save). Bulk callers that can afford to wait (the
+        backfill) pass a budget to ride out rate limiting; retries use exponential
+        backoff and honor a ``Retry-After`` header. Other 4xx raise immediately.
+        """
         if not texts:
             return []
+        import asyncio
         import httpx
 
         payload: dict[str, Any] = {
@@ -70,15 +79,36 @@ class VoyageEmbedder:
             "output_dimension": self.dim,    # pin to the vector column's dimension
         }
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(
-                VOYAGE_URL,
-                headers={"Authorization": f"Bearer {self._api_key}"},
-                json=payload,
-            )
-            resp.raise_for_status()
+            for attempt in range(max_retries + 1):
+                resp = await client.post(
+                    VOYAGE_URL,
+                    headers={"Authorization": f"Bearer {self._api_key}"},
+                    json=payload,
+                )
+                if resp.status_code in self._RETRY_STATUS and attempt < max_retries:
+                    await asyncio.sleep(self._retry_delay(resp, attempt))
+                    continue
+                resp.raise_for_status()
+                break
             data = resp.json()["data"]
         # Preserve request order regardless of how the API returns them.
         return [d["embedding"] for d in sorted(data, key=lambda d: d["index"])]
+
+    _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+    _BACKOFF_BASE = 2.0          # seconds: 2, 4, 8, 16, 32 (capped)
+    _BACKOFF_CAP = 32.0
+
+    @classmethod
+    def _retry_delay(cls, resp: Any, attempt: int) -> float:
+        """Backoff before the next retry: prefer the server's Retry-After header,
+        else exponential backoff capped at ``_BACKOFF_CAP``."""
+        retry_after = resp.headers.get("retry-after")
+        if retry_after:
+            try:
+                return min(float(retry_after), cls._BACKOFF_CAP)
+            except ValueError:
+                pass
+        return min(cls._BACKOFF_BASE * (2 ** attempt), cls._BACKOFF_CAP)
 
 
 def build_embedder(settings: Any) -> Embedder:

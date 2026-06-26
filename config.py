@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     github_api_url: str = "https://api.github.com"
     github_webhook_secret: str | None = None
 
+    # --- Replit connector access (optional) ---
+    # When github_token is NOT set explicitly, the reconciler can source a
+    # read-capable token from the connected GitHub account via the Replit
+    # connector proxy (these vars are injected by the platform). The token is
+    # fetched fresh per cache-window so it survives OAuth refresh; a static
+    # github_token still takes precedence when provided.
+    replit_connectors_hostname: str | None = None
+    repl_identity: str | None = None
+    web_repl_renewal: str | None = None
+
     # --- semantic recall (Phase 3): only active when voyage_api_key is set ---
     # embedding_dim MUST match the vector(N) column in migrations/0002_embeddings.sql.
     embedding_model: str = "voyage-3.5-lite"

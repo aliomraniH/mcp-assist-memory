@@ -23,12 +23,17 @@ from config import settings  # noqa: E402
 from storage.embeddings import build_embedder, embed_text, to_vector_literal  # noqa: E402
 
 BATCH = 64
+# This is a bulk, off-critical-path job, so it can afford to wait out rate limits.
+# Free Voyage tiers cap requests-per-minute aggressively; retry each batch and
+# pace between batches so the whole backfill rides through 429s instead of dying.
+MAX_RETRIES = 8
+INTER_BATCH_SLEEP = 1.0
 
 
 async def main() -> None:
     embedder = build_embedder(settings)
     if not embedder.enabled:
-        print("no embedding provider configured (set VOYAGE_API_KEY) — nothing to do")
+        print("no embedding provider configured (set VOYAGE_API_KEY) — nothing to do", flush=True)
         return
 
     total = 0
@@ -47,9 +52,9 @@ async def main() -> None:
             # value is jsonb -> already a python object (str/dict/list) via psycopg.
             texts = [embed_text(key, value) for _id, key, value in rows]
 
-            vectors = await embedder.embed(texts, input_type="document")
+            vectors = await embedder.embed(texts, input_type="document", max_retries=MAX_RETRIES)
             if not vectors:
-                print("embedder returned no vectors — aborting")
+                print("embedder returned no vectors — aborting", flush=True)
                 return
 
             async with conn.transaction():
@@ -59,9 +64,10 @@ async def main() -> None:
                         (to_vector_literal(vec), row_id),
                     )
             total += len(rows)
-            print(f"embedded {len(rows)} rows (total {total})")
+            print(f"embedded {len(rows)} rows (total {total})", flush=True)
+            await asyncio.sleep(INTER_BATCH_SLEEP)
 
-    print(f"backfill complete — {total} rows embedded")
+    print(f"backfill complete — {total} rows embedded", flush=True)
 
 
 if __name__ == "__main__":

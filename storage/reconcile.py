@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
 # Verdict states.
 CURRENT = "current"
@@ -54,24 +54,43 @@ class DisabledResolver:
 class GitHubResolver:
     """Read-only GitHub REST resolver. Every call is best-effort: any failure
     (network, auth, 404, rate-limit) returns None, which the caller maps to
-    ``unverifiable`` rather than a wrong answer."""
+    ``unverifiable`` rather than a wrong answer.
+
+    The token is supplied by an async provider resolved per request, so a
+    refreshing OAuth token (Replit connector) and a static PAT are handled the
+    same way. A plain string is accepted too and wrapped as a constant provider."""
 
     enabled = True
 
-    def __init__(self, token: str, api_url: str = "https://api.github.com", *, timeout: float = 15.0) -> None:
-        self._token = token
+    def __init__(
+        self,
+        token_provider: "Callable[[], Awaitable[str | None]] | str",
+        api_url: str = "https://api.github.com",
+        *,
+        timeout: float = 15.0,
+    ) -> None:
+        if isinstance(token_provider, str):
+            _token = token_provider
+
+            async def _const() -> str | None:
+                return _token
+
+            self._token_provider: "Callable[[], Awaitable[str | None]]" = _const
+        else:
+            self._token_provider = token_provider
         self.api_url = api_url.rstrip("/")
         self.timeout = timeout
-
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token}", "Accept": "application/vnd.github+json"}
 
     async def _get(self, path: str) -> dict | None:
         import httpx
 
         try:
+            token = await self._token_provider()
+            if not token:
+                return None
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.get(f"{self.api_url}{path}", headers=self._headers())
+                resp = await client.get(f"{self.api_url}{path}", headers=headers)
                 resp.raise_for_status()
                 return resp.json()
         except Exception:  # noqa: BLE001 - best-effort: any failure -> unverifiable
@@ -91,11 +110,22 @@ class GitHubResolver:
 
 
 def build_resolver(settings: Any) -> Resolver:
-    """Pick a resolver from config: GitHub when a token is present, else disabled.
-    Decoupled from ``config`` (only config.py reads the environment)."""
+    """Pick a resolver from config, decoupled from ``config`` (only config.py
+    reads the environment):
+
+    1. an explicit ``github_token`` (PAT) wins — durable and simplest;
+    2. else the connected GitHub account via the Replit connector proxy;
+    3. else disabled (claims reconcile to ``unverifiable``)."""
+    api_url = getattr(settings, "github_api_url", "https://api.github.com")
     token = getattr(settings, "github_token", None)
     if token:
-        return GitHubResolver(token, getattr(settings, "github_api_url", "https://api.github.com"))
+        return GitHubResolver(token, api_url)
+
+    from storage.github_token import build_connector_token_provider
+
+    provider = build_connector_token_provider(settings)
+    if provider is not None:
+        return GitHubResolver(provider, api_url)
     return DisabledResolver()
 
 
