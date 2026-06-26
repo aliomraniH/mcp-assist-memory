@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     langsmith_api_key: str | None = None
 
+    # --- memory curator (write-side consolidation): only active when anthropic_api_key is set ---
+    # The curator is to *writing* what the embedder is to search and the resolver is
+    # to reconciliation: an optional, injected, best-effort dependency. Without
+    # anthropic_api_key build_curator() returns a DisabledCurator and coord_curate is
+    # a clean no-op — the server boots and behaves identically. voyage_api_key (above)
+    # is reused to embed the curator's two strings (summary + hyde); absent ⇒ keyword-only.
+    curator_model: str = "claude-opus-4-1"
+    curator_max_output_tokens: int = 4096
+
     # --- coordination reconciler (Phase 3): only active when github_token is set ---
     # A READ-ONLY GitHub token lets the backend resolve a claim's truth (is PR #N
     # merged? what is branch X's head?) off the agent's critical path. Without it

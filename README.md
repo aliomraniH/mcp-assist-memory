@@ -151,6 +151,20 @@ restarts/redeploys, and the three surfaces share no server-side session state.
   refresh), else disabled. Resolution is **best-effort**: a network/API failure
   yields `unverifiable`, never a blocked write. `GITHUB_WEBHOOK_SECRET` enables
   `POST /webhook/github` to reconcile affected claims on push / pull_request.
+- **Memory curator (`coord_curate`):** when `ANTHROPIC_API_KEY` is set, a finished
+  session can be consolidated write-side: `coord_curate(namespace, session_id)` reads
+  the session's execution trace plus similar existing memories, asks the model what is
+  worth persisting, and applies the resulting `ADD`/`UPDATE`/`MERGE`/`SUPERSEDE`/`NOOP`
+  operations deterministically. Every op passes a fail-closed PHI gate first, claims
+  without provenance (`meta.repo` + `meta.pr`/`branch`) are downgraded to notes,
+  supersession sets a validity boundary (history is kept, never deleted), and writes are
+  idempotent (deterministic `event_id`) so re-running a session never double-writes. It
+  is **best-effort**: without the key the curator is disabled and `coord_curate` is a
+  clean no-op (`{curator_enabled: false, operations: []}`), and any model/parse failure
+  yields zero operations — never a wrong write. `dry_run=True` returns the proposed
+  operations without writing. `CURATOR_MODEL` and `CURATOR_MAX_OUTPUT_TOKENS` tune it.
+  Curated rows also carry a second `hyde_embedding`, so `memory_search` can match a
+  future *question* (HyDE leg) as well as the stored statement.
 
 ## Run locally
 

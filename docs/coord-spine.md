@@ -116,6 +116,14 @@ every claim reconciles to `unverifiable`.
 - `coord_reconcile(namespace)` (MCP tool) reconciles every live claim and writes an **append-only**
   `coord/_reconcile/<key>` record (tagged with the state) — the user's claim is never rewritten.
 - `coord_reconcile_repo(repo, pr=…, branch=…)` is the store-wide entry point for the webhook.
+- `coord_curate(namespace, session_id, dry_run=…)` (MCP tool) is the **write-side** counterpart:
+  pull-triggered at session end, it reads the session trace + similar memories, asks the curator
+  (Anthropic, gated by `ANTHROPIC_API_KEY`; Voyage embeddings optional) what is worth persisting,
+  and applies `ADD/UPDATE/MERGE/SUPERSEDE/NOOP` deterministically. Every op is PHI-gated (fail
+  closed), claims without provenance are downgraded to notes, `SUPERSEDE` sets a `valid_until`
+  boundary (history kept, never deleted), and writes are idempotent via a deterministic `event_id`.
+  Disabled curator ⇒ `{curator_enabled: false, operations: []}` — a clean no-op, never a guess.
+  **Implemented** (mirrors the reconciler's optional/injected/best-effort pattern).
 - **Push trigger** — `POST /webhook/github`, HMAC-verified via `verify_signature` over the raw body
   (`X-Hub-Signature-256`); `pull_request`/`push` events reconcile affected claims across namespaces.
   Returns 503 until `GITHUB_WEBHOOK_SECRET` is set, so it's inert where unused.
