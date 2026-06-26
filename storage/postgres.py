@@ -27,6 +27,7 @@ from psycopg.types.json import Jsonb
 from config import settings
 from storage.base import StorageBackend
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
+from storage.reconcile import DisabledResolver, Resolver, reconcile_claim
 from storage.sanitize import sanitize, wrap_value
 
 _MAX_RETRIES = 3
@@ -185,11 +186,14 @@ def _event_to_dict(row: dict) -> dict:
 
 
 class PostgresBackend(StorageBackend):
-    def __init__(self, pool, embedder: Embedder | None = None) -> None:
+    def __init__(self, pool, embedder: Embedder | None = None, resolver: Resolver | None = None) -> None:
         self.pool = pool
         # Best-effort semantic recall. Defaults to disabled so the backend works
         # with no provider key (keyword-only search, no embeddings written).
         self.embedder: Embedder = embedder or DisabledEmbedder()
+        # Best-effort claim reconciliation. Defaults to disabled so the backend
+        # works with no GitHub token (claims reconcile to "unverifiable").
+        self.resolver: Resolver = resolver or DisabledResolver()
 
     async def _maybe_embed(self, key, value, tombstone) -> str | None:
         """Embed an entry's text for storage. Best-effort: returns None when
@@ -563,6 +567,78 @@ class PostgresBackend(StorageBackend):
                 })
         drift.sort(key=lambda d: (-len(d["namespaces"]), d["content_hash"]))
         return {"suspected_namespace_drift": drift[:limit]}
+
+    # --------------------------------------------------------- reconciliation
+    _RECONCILE_PREFIX = "coord/_reconcile/"
+
+    async def _reconcile_rows(self, rows: list[dict]) -> list[dict]:
+        """Reconcile a set of live claim rows and write each verdict to its own
+        append-only ``coord/_reconcile/<key>`` record. Never touches the claim."""
+        verdicts = []
+        for r in rows:
+            entry = _row_to_entry(r, wrap=False)
+            verdict = await reconcile_claim(entry, self.resolver)
+            await self.memory_save(
+                r["namespace"], f"{self._RECONCILE_PREFIX}{r['key']}", verdict,
+                kind="config", tags=["reconcile", verdict["state"]],
+            )
+            verdicts.append(verdict)
+        return verdicts
+
+    @_retry_on_disconnect
+    async def coord_reconcile(self, namespace, *, limit=100) -> dict:
+        """Reconcile every live claim in a namespace against GitHub (off the
+        agent's critical path) and record an append-only verdict per claim. When
+        the resolver is disabled every verdict is ``unverifiable`` — never
+        silently ``current``. Returns the verdicts and whether the resolver ran."""
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                """
+                SELECT DISTINCT ON (key) * FROM memory_entry
+                WHERE namespace = %s AND kind = 'claim'
+                ORDER BY key, revision DESC
+                """,
+                (namespace,),
+            )
+            rows = [r for r in await cur.fetchall() if not r["tombstone"]][:limit]
+        verdicts = await self._reconcile_rows(rows)
+        return {
+            "namespace": namespace,
+            "resolver_enabled": self.resolver.enabled,
+            "reconciled": len(verdicts),
+            "verdicts": verdicts,
+        }
+
+    @_retry_on_disconnect
+    async def coord_reconcile_repo(self, repo, *, pr=None, branch=None, limit=500) -> dict:
+        """Store-wide (admin, like drift_scan): reconcile every live claim whose
+        ``meta.repo`` matches ``repo`` — optionally narrowed to a PR or branch.
+        Used by the GitHub webhook so a merge/push reconciles affected claims
+        across all namespaces at once."""
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                """
+                SELECT DISTINCT ON (namespace, key) * FROM memory_entry
+                WHERE kind = 'claim' AND meta->>'repo' = %s
+                ORDER BY namespace, key, revision DESC
+                """,
+                (repo,),
+            )
+            rows = []
+            for r in await cur.fetchall():
+                if r["tombstone"]:
+                    continue
+                meta = r.get("meta") or {}
+                if pr is not None and str(meta.get("pr")) != str(pr):
+                    continue
+                if branch is not None and meta.get("branch") != branch:
+                    continue
+                rows.append(r)
+        verdicts = await self._reconcile_rows(rows[:limit])
+        return {"repo": repo, "resolver_enabled": self.resolver.enabled,
+                "reconciled": len(verdicts), "verdicts": verdicts}
 
     # ---------------------------------------------------------------- handoff
     # Handoffs are cross-surface (web/cli/desktop) within ONE project: stored as

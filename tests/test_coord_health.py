@@ -56,12 +56,14 @@ async def test_drift_scan_finds_same_fact_across_namespaces(backend):
     import uuid
     ns1 = f"proj-test-{uuid.uuid4().hex[:12]}"
     ns2 = f"proj-test-{uuid.uuid4().hex[:12]}"
-    shared = {"plugin": "glp1", "phase": 1}
+    # A marker unique to this run makes the content_hash unique, so the store-wide
+    # scan is isolated from other entries in the shared test DB.
+    shared = {"plugin": "glp1", "phase": 1, "marker": uuid.uuid4().hex}
     await backend.memory_save(ns1, "state", shared)
     await backend.memory_save(ns2, "state", shared)
     await backend.memory_save(ns1, "local-only", {"x": 1})
 
-    scan = await backend.coord_drift_scan()
+    scan = await backend.coord_drift_scan(limit=500)
     hit = [d for d in scan["suspected_namespace_drift"]
            if set(d["namespaces"]) >= {ns1, ns2}]
     assert hit, "the fact shared across ns1/ns2 should be flagged as drift"

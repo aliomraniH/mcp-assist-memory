@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import pathlib
 import secrets as _secrets
 from contextlib import asynccontextmanager
@@ -41,6 +42,7 @@ from dashboard import SURFACE_LABELS, build_routes
 from server.mcp_server import deps, mcp
 from storage.embeddings import build_embedder
 from storage.postgres import PostgresBackend
+from storage.reconcile import build_resolver, verify_signature
 
 structlog.configure(
     processors=[
@@ -114,8 +116,10 @@ async def lifespan(app: FastAPI):
 
     app.state.pool = pool
     embedder = build_embedder(settings)  # Voyage when keyed, else disabled (keyword-only)
-    deps.backend = PostgresBackend(pool, embedder=embedder)
-    log.info("startup_ok", max_size=settings.pool_max_size, embeddings=embedder.enabled)
+    resolver = build_resolver(settings)  # GitHub when keyed, else disabled (unverifiable)
+    deps.backend = PostgresBackend(pool, embedder=embedder, resolver=resolver)
+    log.info("startup_ok", max_size=settings.pool_max_size,
+             embeddings=embedder.enabled, reconciler=resolver.enabled)
     try:
         async with mcp_app.lifespan(app):  # run the MCP session manager
             yield
@@ -177,6 +181,40 @@ async def healthz() -> Response:
         log.warning("healthz_degraded", error=str(exc))
         return JSONResponse({"status": "degraded", "db": "down"}, status_code=503)
     return JSONResponse({"status": "ok", "db": "ok"})
+
+
+# GitHub webhook → reconcile affected claims (Phase 3). Not behind the bearer gate;
+# it authenticates with its own HMAC signature over the raw body. Disabled (503)
+# until GITHUB_WEBHOOK_SECRET is set, so it's inert in deployments that don't use it.
+@app.post("/webhook/github")
+async def github_webhook(request: Request) -> Response:
+    secret = settings.github_webhook_secret
+    if not secret:
+        return JSONResponse({"error": "webhook disabled"}, status_code=503)
+    body = await request.body()
+    if not verify_signature(secret, body, request.headers.get("x-hub-signature-256")):
+        return JSONResponse({"error": "bad signature"}, status_code=401)
+
+    event = request.headers.get("x-github-event", "")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    repo = (payload.get("repository") or {}).get("full_name")
+    backend: PostgresBackend = deps.backend  # type: ignore[assignment]
+    if repo is None or backend is None:
+        return JSONResponse({"status": "ignored", "reason": "no repo / backend"})
+
+    if event == "pull_request":
+        pr = payload.get("number") or (payload.get("pull_request") or {}).get("number")
+        result = await backend.coord_reconcile_repo(repo, pr=pr)
+    elif event == "push":
+        branch = (payload.get("ref") or "").removeprefix("refs/heads/") or None
+        result = await backend.coord_reconcile_repo(repo, branch=branch)
+    else:
+        return JSONResponse({"status": "ignored", "event": event})
+    log.info("webhook_reconcile", event=event, repo=repo, reconciled=result["reconciled"])
+    return JSONResponse({"status": "ok", **result})
 
 
 # Static capabilities page (not behind the bearer gate — it's public docs).

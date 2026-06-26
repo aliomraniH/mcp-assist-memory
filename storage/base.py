@@ -112,6 +112,14 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     async def coord_drift_scan(self, *, limit: int = 50) -> dict: ...
 
+    @abc.abstractmethod
+    async def coord_reconcile(self, namespace: str, *, limit: int = 100) -> dict: ...
+
+    @abc.abstractmethod
+    async def coord_reconcile_repo(
+        self, repo: str, *, pr: int | None = None, branch: str | None = None, limit: int = 500
+    ) -> dict: ...
+
     # ---------------- admin ----------------
     @abc.abstractmethod
     async def stats(self) -> dict: ...

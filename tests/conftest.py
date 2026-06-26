@@ -117,6 +117,38 @@ async def semantic_backend():
     await pool.close()
 
 
+class FakeResolver:
+    """Offline GitHub resolver for tests. Tests populate ``pulls`` / ``heads`` to
+    stand in for live PR/branch state without any network call."""
+
+    enabled = True
+
+    def __init__(self) -> None:
+        self.pulls: dict = {}   # (repo, pr) -> {"merged": bool, "merge_sha": str}
+        self.heads: dict = {}   # (repo, branch) -> sha
+
+    async def merged_state(self, repo, pr):
+        return self.pulls.get((repo, int(pr)))
+
+    async def branch_head(self, repo, branch):
+        return self.heads.get((repo, branch))
+
+
+@pytest_asyncio.fixture
+async def reconcile_backend():
+    """Like ``backend`` but with a FakeResolver wired in, so coord_reconcile
+    exercises the real verdict + append-only write path. Tests set
+    ``reconcile_backend.resolver.pulls/heads`` to control resolved truth."""
+    if DATABASE_URL is None:
+        pytest.skip("DATABASE_URL not set")
+    pool = AsyncConnectionPool(DATABASE_URL, open=False, min_size=0, max_size=4)
+    await pool.open()
+    async with pool.connection() as conn:
+        await conn.execute(SCHEMA)
+    yield PostgresBackend(pool, resolver=FakeResolver())
+    await pool.close()
+
+
 @pytest_asyncio.fixture
 def ns():
     """A unique neutral-project namespace per test (project == namespace)."""

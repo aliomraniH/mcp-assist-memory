@@ -1,6 +1,6 @@
 # Coordination spine — keeping memory in sync with the code it describes
 
-**Status:** Phases 1 & 2 implemented. Phase 3 is designed here, not yet built.
+**Status:** Phases 1, 2 & 3 implemented.
 
 ## The problem (observed, not hypothetical)
 
@@ -101,23 +101,30 @@ Deferred to a follow-up: `namespace_epoch` (a logical-clock refinement for entri
 `repo_sha`), semantic (cosine) near-duplicate detection layered on top of the exact-hash grouping,
 and a written `coord/_nudges` key (today the detectors are pull, via the two tools).
 
-### Phase 3 — backend git/GitHub access + reconciler
+### Phase 3 — backend git/GitHub access + reconciler (implemented)
 
-A `Reconciler`/`GitClient` dependency that is to provenance what `Embedder` is to search:
-declared in `config.py`, injected in `app.py`'s lifespan, `DisabledReconciler` when no creds (the
-server runs identically without it). Runs **off the agent's critical path** via three triggers:
+`storage/reconcile.py` adds a `Resolver` dependency that is to provenance what `Embedder` is to
+search: `build_resolver(settings)` returns a `GitHubResolver` (read-only REST) when `GITHUB_TOKEN`
+is set, else a `DisabledResolver`. It's injected in `app.py`'s lifespan
+(`PostgresBackend(pool, embedder=…, resolver=…)`); with no token the server runs identically and
+every claim reconciles to `unverifiable`.
 
-- **Push** — a `/webhook/github` route (HMAC-verified). On `pull_request.closed+merged` / `push`,
-  stamp `merge_sha` / flip derived merged-state on claims referencing that PR/branch.
-- **Pull** — a schedule walks `coord/*` claims whose `repo_sha` is behind the resolved HEAD and
-  flips them to `stale`.
-- **Lazy** — on read, trigger an async recheck if a claim hasn't been reconciled recently.
+- `reconcile_claim(entry, resolver)` derives a verdict **from provenance, not prose**: `meta.repo`
+  + `meta.pr` → `merged_state`; `meta.repo` + `meta.branch` → `branch_head` vs `repo_sha`. States:
+  `current | stale | unverifiable`. A blind resolver (disabled, or a failed call) yields
+  `unverifiable` — **never** a silent `current`.
+- `coord_reconcile(namespace)` (MCP tool) reconciles every live claim and writes an **append-only**
+  `coord/_reconcile/<key>` record (tagged with the state) — the user's claim is never rewritten.
+- `coord_reconcile_repo(repo, pr=…, branch=…)` is the store-wide entry point for the webhook.
+- **Push trigger** — `POST /webhook/github`, HMAC-verified via `verify_signature` over the raw body
+  (`X-Hub-Signature-256`); `pull_request`/`push` events reconcile affected claims across namespaces.
+  Returns 503 until `GITHUB_WEBHOOK_SECRET` is set, so it's inert where unused.
 
-Guardrails: **append-only** to reserved `coord/_reconcile/*` keys — never rewrites a user's value
-(or the server becomes a new drift source). Marks `unverifiable` when blind; never false-fresh.
-Token read-only, bound per-namespace→repo (rides the v2 per-project-token roadmap). Degrades to
-`git ls-remote` when the GitHub MCP is absent. A `coord_seal` step enriches a cycle's entries with
-`merge_sha`, diff summary, and `git log --grep=<session_id>` back-links.
+Guardrails honored: append-only to reserved `coord/_reconcile/*`; `unverifiable` when blind, never
+false-fresh; the GitHub token is read-only and claims self-describe their repo via `meta.repo`
+(no global namespace→repo map needed). **Deferred:** the scheduled-poll and lazy-on-read triggers
+(today reconcile is pull, via the tool, plus push, via the webhook), and the `coord_seal`
+cycle-end enrichment with diff summary + `git log --grep=<session_id>` back-links.
 
 ### Client-side discipline (consuming repos)
 

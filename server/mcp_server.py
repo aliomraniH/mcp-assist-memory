@@ -1,4 +1,4 @@
-"""FastMCP instance and the 20 tools.
+"""FastMCP instance and the 21 tools.
 
 The tools are thin: they validate/relay to the injected ``StorageBackend``.
 The backend is set on ``deps`` during the FastAPI lifespan (one pool, injected),
@@ -9,12 +9,12 @@ project == tenant) and the backend filters every query on it — there are no
 implicit cross-project reads. Artifacts are content-addressed and global, and
 ``coord_drift_scan``/``stats`` are deliberately store-wide coordination/admin views.
 
-Tool surface (20):
+Tool surface (21):
   memory:   memory_save, memory_get, memory_list, memory_history, memory_delete, memory_search
   handoff:  handoff_save, handoff_load, handoff_list
   session:  session_create, session_append_event, session_get, session_list, session_events
   artifact: artifact_put, artifact_get, artifact_list
-  coord:    coord_health, coord_drift_scan
+  coord:    coord_health, coord_drift_scan, coord_reconcile
   admin:    stats
 """
 from __future__ import annotations
@@ -228,6 +228,18 @@ async def coord_drift_scan(limit: int = 50) -> dict:
     this is a deliberately cross-tenant coordination/admin view, not a per-project
     read. Returns content hashes that span >1 namespace, worst first."""
     return await _backend().coord_drift_scan(limit=limit)
+
+
+@mcp.tool
+async def coord_reconcile(namespace: str, limit: int = 100) -> dict:
+    """Reconcile every live claim in a namespace against GitHub and record an
+    append-only verdict (current | stale | unverifiable) per claim under
+    coord/_reconcile/<key> — the user's entry is never rewritten. Resolution is
+    derived from each claim's provenance (meta.repo + meta.pr / meta.branch), not
+    its prose. When the backend has no GitHub token the resolver is disabled and
+    every verdict is `unverifiable` (never silently `current`). Run it at session
+    start to learn which claims need re-verifying."""
+    return await _backend().coord_reconcile(namespace, limit=limit)
 
 
 # -------------------------------------------------------------------- admin
