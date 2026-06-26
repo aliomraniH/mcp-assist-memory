@@ -127,3 +127,65 @@ async def test_reconcile_claim_unit_disabled():
 
     v = await reconcile_claim({"key": "k", "meta": {"repo": REPO, "pr": 11}}, _Off())
     assert v["state"] == UNVERIFIABLE
+
+
+async def test_real_github_resolver_end_to_end(backend, ns, monkeypatch):
+    """End-to-end through the REAL GitHubResolver (its HTTP fetch + verdict
+    derivation) with the GitHub API mocked — covers the gap between the offline
+    token tests (test_github_token) and the FakeResolver verdict tests above.
+
+    A PR claim that records the same merge_sha the API reports must read CURRENT;
+    a branch claim whose repo_sha is behind the live head must read STALE."""
+    import uuid
+
+    from storage.reconcile import GitHubResolver
+
+    repo = f"acme/widget-{uuid.uuid4().hex[:8]}"
+    head_sha, merge_sha = "3ab6d4a", "61a0f55"
+
+    class FakeResp:
+        def __init__(self, payload):
+            self._p = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._p
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **k):
+            if "/pulls/" in url:
+                return FakeResp({"merged": True, "merge_commit_sha": merge_sha})
+            if "/branches/" in url:
+                return FakeResp({"commit": {"sha": head_sha}})
+            raise AssertionError(f"unexpected GitHub path: {url}")
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    async def _token():  # stand-in for the connector/PAT token provider
+        return "ghp_fake"
+
+    backend.resolver = GitHubResolver(_token)
+
+    await backend.memory_save(ns, "merged-pr", {"done": True}, kind="claim",
+                              meta={"repo": repo, "pr": 7, "merge_sha": merge_sha})
+    await backend.memory_save(ns, "behind-branch", {"x": 1}, kind="claim",
+                              meta={"repo": repo, "branch": "main", "repo_sha": "deadbee"})
+
+    out = await backend.coord_reconcile(ns)
+    assert out["resolver_enabled"] is True
+    states = {v["key"]: v["state"] for v in out["verdicts"]}
+    assert states["merged-pr"] == CURRENT
+    assert states["behind-branch"] == STALE
