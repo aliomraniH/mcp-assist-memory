@@ -12,6 +12,10 @@ import pytest
 os.environ.setdefault("ADMIN_PASSWORD", "test-admin-pw")
 os.environ.setdefault("MCP_AUTH_TOKEN", "seed-token-xyz")
 
+# Read the effective password (default above, or whatever the env/CI sets) so the
+# e2e login posts the same value the app gates on — robust to any ADMIN_PASSWORD.
+ADMIN_PW = os.environ["ADMIN_PASSWORD"]
+
 from dashboard import csrf_token, make_session, valid_session  # noqa: E402
 
 SECRET = "session-secret-xyz"
@@ -78,7 +82,7 @@ def test_admin_login_rotate_and_mcp_auth():
         # wrong then right password
         r = client.post("/admin/login", data={"password": "nope"}, follow_redirects=False)
         assert r.status_code == 200 and "Incorrect" in r.text
-        r = client.post("/admin/login", data={"password": "test-admin-pw"}, follow_redirects=False)
+        r = client.post("/admin/login", data={"password": ADMIN_PW}, follow_redirects=False)
         assert r.status_code == 303
 
         page = client.get("/admin").text

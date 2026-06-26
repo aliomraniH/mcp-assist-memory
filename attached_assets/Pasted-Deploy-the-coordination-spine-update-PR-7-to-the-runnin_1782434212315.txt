@@ -1,0 +1,43 @@
+Deploy the coordination-spine update (PR #7) to the running mcp-assist-memory service.
+The change is backward compatible: all new DB columns are nullable, and the new
+features degrade to disabled if their secrets are absent. Do this in order:
+
+1. Pull the latest `main` into the deployed workspace (it includes migrations
+   0003_provenance.sql and 0004_content_hash.sql, storage/reconcile.py, and 3 new
+   MCP tools).
+
+2. Apply DB migrations against the PRODUCTION DATABASE_URL:
+       python scripts/migrate.py
+   This is an online, additive change (nullable columns + a widened kind CHECK +
+   indexes). Expect it to print: apply 0003_provenance.sql, apply 0004_content_hash.sql.
+   If republishing triggers "Failed to validate database migrations", republish with
+   "Create production database" and copy dev data (known Replit quirk).
+
+3. (Optional, enables semantic features) In Secrets, set VOYAGE_API_KEY. Then backfill:
+       python scripts/backfill_embeddings.py
+   Skip if not using semantic search — keyword search still works.
+
+4. (Optional, enables the Phase-3 reconciler) In Secrets, set:
+       GITHUB_TOKEN          = a READ-ONLY token (repo contents + pull requests only)
+       GITHUB_WEBHOOK_SECRET = a long random string
+   Without these, coord_reconcile returns "unverifiable" and /webhook/github returns
+   503 — both safe. If you set GITHUB_WEBHOOK_SECRET, add a GitHub webhook on the repo:
+   Payload URL https://<this-service>/webhook/github, content type application/json,
+   secret = the same value, events: Pull requests + Pushes.
+
+5. Backfill the new provenance/hash columns for existing rows (safe, idempotent):
+       python scripts/backfill_provenance.py
+       python scripts/backfill_content_hash.py
+
+6. Restart / republish the deployment so the new tool surface (21 tools) loads.
+
+7. Verify and report back:
+   - GET /healthz returns {"status":"ok"}.
+   - The MCP tool list now includes coord_health, coord_drift_scan, coord_reconcile.
+   - Smoke test: call coord_health for an existing namespace and paste the JSON
+     (it should return entry_count plus stale/duplicate_content/claim_collisions arrays).
+   - Confirm the startup log line shows embeddings=<bool> and reconciler=<bool>
+     matching which secrets you set.
+
+Do NOT set any write-scoped GitHub token; the reconciler is read-only by design.
+Report the migrate output, the startup log line, and the coord_health smoke result.
