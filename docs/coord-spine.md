@@ -126,6 +126,18 @@ false-fresh; the GitHub token is read-only and claims self-describe their repo v
 (today reconcile is pull, via the tool, plus push, via the webhook), and the `coord_seal`
 cycle-end enrichment with diff summary + `git log --grep=<session_id>` back-links.
 
+### The write side — Memory Curator (async consolidation)
+
+The reconciler above keeps existing entries *honest*; the **Memory Curator** decides what gets
+*written* in the first place. It runs asynchronously after a working agent's session ends — off the
+hot path, never blocking the working agent — reads the session's execution trace, and emits a
+structured set of memory operations (`ADD`/`UPDATE`/`MERGE`/`SUPERSEDE`/`NOOP`) that a deterministic
+worker applies. It is the deliberate counterpart to "only one kind drifts": it stamps each write
+with the `claim` vs `knowledge` kind, attaches the provenance (`meta.repo`/`pr`/`branch` +
+`merge_sha`/`repo_sha`) that makes a claim mechanically reconcilable, and honors the same guardrails
+(record evidence, never assert `current`; PHI gate; sparse high-signal store over volume). The
+canonical, versioned system prompt lives in [`memory-curator.md`](./memory-curator.md).
+
 ### Client-side discipline (consuming repos)
 
 - SessionStart/PostToolUse hook injects the version vector (namespace from `agent.config.json`,
