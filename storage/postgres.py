@@ -13,9 +13,11 @@ shared global handoff space). Artifacts are content-addressed and global.
 """
 from __future__ import annotations
 
+import base64
 import functools
 import hashlib
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -26,12 +28,18 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from config import settings
+from errors import AppError
+from errors.catalog import FEEDBACK_NUDGE
 from storage.base import StorageBackend
 from storage.curator import Curator, DisabledCurator
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
 from storage.phi import assert_no_phi
-from storage.reconcile import DisabledResolver, Resolver, reconcile_claim
+from storage.profiles import resolve_profile
+from storage.reconcile import STALE, DisabledResolver, Resolver, reconcile_claim, sha_match
 from storage.sanitize import sanitize, wrap_value
+from storage.screening import screen_value
+from storage.telemetry import build_event_row
+from storage.versioning import SCHEMA_VERSION, SERVER_VERSION
 
 _MAX_RETRIES = 3
 
@@ -93,6 +101,10 @@ def _retry_if_idempotent(fn):
 # Coordination-envelope keys projected out of `meta` into indexed columns. The
 # full envelope is still stored in the `meta` jsonb column, losslessly.
 _META_COLS = ("repo_sha", "base_sha", "branch", "dirty", "session_id")
+
+# Phase 5 (T5.1): provenance tiers, aligned with the four-tier source-provenance
+# model. Backfill default is 'unknown' — historical rows annotate forward only.
+_ORIGINS = ("tool", "retrieval", "synthesized", "human", "unknown")
 
 
 def _content_hash(value: Any) -> str:
@@ -189,6 +201,26 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         "salience": row.get("salience"),
         "confidence": row.get("confidence"),
         "valid_until": valid_until.isoformat() if isinstance(valid_until, datetime) else valid_until,
+        # Phase 2 (T2.1/T2.3): the writing actor and the revision's globally
+        # unique id (usable in derived_from "key@revision_id" lineage refs).
+        "actor": row.get("actor"),
+        "revision_id": row.get("id"),
+        # Phase 3 (T3.2): the screening verdict travels with the entry. The
+        # writer learns it at write time (in the save ack), not at
+        # failed-retrieval time; `screening` holds pattern NAMES only.
+        "quarantined": row.get("quarantined", False),
+        "screening": list(row["screening"]) if row.get("screening") else None,
+        # Phase 5 (T5.1–T5.3): provenance tier, structured model attribution,
+        # and lineage refs ("key@revision_id"). All optional / annotate-forward.
+        "origin": row.get("origin", "unknown"),
+        "origin_detail": row.get("origin_detail"),
+        "origin_model_id": row.get("origin_model_id"),
+        "origin_model_family": row.get("origin_model_family"),
+        "derived_from": list(row["derived_from"]) if row.get("derived_from") else None,
+        # Version stamps persisted with the revision (0006, rule 3). Null on
+        # rows written before the trust-spine migration — annotate forward only.
+        "server_version": row.get("server_version"),
+        "schema_version": row.get("schema_version"),
     }
 
 
@@ -239,6 +271,7 @@ def _event_to_dict(row: dict) -> dict:
         "kind": row["kind"],
         "payload": wrap_value(row["payload"]),
         "created_at": row["created_at"].isoformat(),
+        "actor": row.get("actor"),
     }
 
 
@@ -260,6 +293,12 @@ class PostgresBackend(StorageBackend):
         # Best-effort write-side consolidation. Defaults to disabled so the backend
         # works with no Anthropic key (coord_curate is a clean no-op).
         self.curator: Curator = curator or DisabledCurator()
+        # T7.0: per-namespace variant-profile cache (namespace -> (ts, profile)).
+        self._profile_cache: dict[str, tuple[float, dict]] = {}
+        # T8.1: per-namespace friction context auto-attached to observations
+        # (in-memory, single-process dev server — documented tradeoff).
+        self._last_error_code: dict[str, str] = {}
+        self._last_quarantine: dict[str, list[str]] = {}
 
     async def _maybe_embed(self, key, value, tombstone) -> str | None:
         """Embed an entry's text for storage. Best-effort: returns None when
@@ -312,16 +351,54 @@ class PostgresBackend(StorageBackend):
         return self._safe_literal(vecs)
 
     # ----------------------------------------------------------------- memory
-    async def _seen_event(self, conn, event_id: str) -> dict | None:
+    async def _seen_event(self, conn, namespace: str, actor: str, event_id: str) -> dict | None:
+        # T2.1: dedup is scoped to (namespace, actor, event_id) — two independent
+        # writers sharing an event_id no longer collapse to one write.
         cur = await conn.execute(
-            "SELECT * FROM memory_entry WHERE event_id = %s ORDER BY revision DESC LIMIT 1",
-            (event_id,),
+            "SELECT * FROM memory_entry WHERE namespace = %s AND actor = %s AND event_id = %s "
+            "ORDER BY revision DESC LIMIT 1",
+            (namespace, actor, event_id),
         )
         return await cur.fetchone()
 
+    @staticmethod
+    def _dedup_entry(row: dict) -> dict:
+        """T2.2: a replay returns the canonical original record, visibly marked."""
+        entry = _row_to_entry(row)
+        entry["deduplicated"] = True
+        entry["original_created_at"] = entry["created_at"]
+        # The dedup check itself just read the row back from the store.
+        entry["verified_persisted"] = True
+        return entry
+
+    _PROFILE_TTL_S = 60.0
+
+    async def _namespace_profile(self, namespace: str) -> dict:
+        """The namespace's variant/config profile (Phase 5/6/7 shared lookup),
+        cached ~60s so per-call profile echoes don't add a query per tool call.
+        Missing row ⇒ {} (all defaults)."""
+        cached = self._profile_cache.get(namespace)
+        if cached and (time.monotonic() - cached[0]) < self._PROFILE_TTL_S:
+            return cached[1]
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                "SELECT profile FROM variant_profiles WHERE namespace = %s", (namespace,))
+            row = await cur.fetchone()
+        profile = (row or {}).get("profile") or {}
+        self._profile_cache[namespace] = (time.monotonic(), profile)
+        return profile
+
+    async def resolved_profile(self, namespace: str) -> dict:
+        """T7.0: the namespace's profile merged over defaults — echoed on every
+        dict response and snapshotted into tool_events."""
+        return resolve_profile(await self._namespace_profile(namespace))
+
     async def _append(
         self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None,
-        *, salience=None, confidence=None, valid_until=None, embeddings=None,
+        *, actor="unattributed", salience=None, confidence=None, valid_until=None, embeddings=None,
+        origin="unknown", origin_detail=None, origin_model_id=None, origin_model_family=None,
+        derived_from=None,
     ) -> dict:
         # Embed BEFORE taking a pooled connection so the (network) embedding call
         # never holds a connection, and compute it once so retries don't re-embed.
@@ -339,13 +416,42 @@ class PostgresBackend(StorageBackend):
         sanitized = sanitize(value)
         # Tombstones carry no content hash (the value is a delete marker, not a fact).
         content_hash = None if tombstone else _content_hash(sanitized)
+        actor = actor or "unattributed"
+
+        # Phase 3 (T3.1/T3.2): deterministic write-time screen — quarantine,
+        # don't reject. A flagged write persists with quarantined=true and is
+        # excluded from default reads. Un-quarantining happens ONLY via a new
+        # revision carrying meta.screening_override + a real actor, which keeps
+        # an append-only audit trail of who cleared what.
+        hits = [] if tombstone else screen_value(sanitized)
+        override = bool(
+            hits
+            and isinstance(meta, dict) and meta.get("screening_override")
+            and actor != "unattributed"
+        )
+        quarantined = bool(hits) and not override
+
+        # Phase 5 (T5.1): provenance tier is a closed enum; free-text
+        # origin_detail is a PHI channel and is suppressed (visibly, via an
+        # advisory) in clinical=true namespaces.
+        origin = origin or "unknown"
+        if origin not in _ORIGINS:
+            raise AppError("invalid_origin", f"invalid origin {origin!r}")
+        origin_detail_suppressed = False
+        if origin_detail:
+            profile = await self._namespace_profile(namespace)
+            if profile.get("clinical"):
+                origin_detail = None
+                origin_detail_suppressed = True
+        derived_from = [str(d) for d in derived_from] if derived_from else None
+        row: dict | None = None
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
-            # Exactly-once: if this event already landed, return it unchanged.
+            # Exactly-once within (namespace, actor): a landed event replays visibly.
             if event_id:
-                existing = await self._seen_event(conn, event_id)
+                existing = await self._seen_event(conn, namespace, actor, event_id)
                 if existing is not None:
-                    return _row_to_entry(existing)
+                    return self._dedup_entry(existing)
 
             payload = Jsonb(sanitized)
             tags = tags or []
@@ -358,12 +464,17 @@ class PostgresBackend(StorageBackend):
                             INSERT INTO memory_entry
                                 (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding,
                                  repo_sha, base_sha, branch, dirty, session_id, meta, content_hash,
-                                 salience, confidence, valid_until, hyde_embedding)
+                                 salience, confidence, valid_until, hyde_embedding,
+                                 server_version, schema_version, actor, quarantined, screening,
+                                 origin, origin_detail, origin_model_id, origin_model_family,
+                                 derived_from)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
                                    %s, %s, %s, %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s, %s, %s,
-                                   %s, %s, %s, %s::vector
+                                   %s, %s, %s, %s::vector,
+                                   %s, %s, %s, %s, %s,
+                                   %s, %s, %s, %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
@@ -371,28 +482,127 @@ class PostgresBackend(StorageBackend):
                              tombstone, embedding,
                              repo_sha, base_sha, branch, dirty, session_id, meta_json, content_hash,
                              salience, confidence, valid_until, hyde_embedding,
+                             SERVER_VERSION, SCHEMA_VERSION, actor, quarantined, hits or None,
+                             origin, origin_detail, origin_model_id, origin_model_family,
+                             derived_from,
                              namespace, key),
                         )
                         row = await cur.fetchone()
-                        return _row_to_entry(row)
+                    break
+                except pg_errors.CheckViolation as exc:
+                    raise AppError("invalid_kind", f"invalid kind {kind!r}") from exc
                 except pg_errors.UniqueViolation as exc:
                     last_exc = exc
                     # Either a concurrent revision collision (retry) or a racing
-                    # duplicate event_id (return the winner).
+                    # duplicate event_id (return the winner, visibly deduplicated).
                     if event_id:
                         async with self.pool.connection() as c2:
                             c2.row_factory = dict_row
-                            existing = await self._seen_event(c2, event_id)
+                            existing = await self._seen_event(c2, namespace, actor, event_id)
                             if existing is not None:
-                                return _row_to_entry(existing)
+                                return self._dedup_entry(existing)
                     continue
-            raise last_exc  # exhausted retries
+            if row is None:
+                raise AppError(
+                    "write_conflict",
+                    f"revision-collision retries exhausted for {namespace}/{key}",
+                ) from last_exc
+
+        # T2.3: read-back-verified ack. Re-read through the same public read
+        # path a stranger would use — never the in-hand RETURNING row (the
+        # phantom-ack survived precisely because the in-hand object looked
+        # fine). Any miss or hash mismatch is a standardized error result,
+        # never a success ack. readback_latency_ms is logged via telemetry;
+        # if p95 write latency becomes a problem, that's a measured
+        # conversation later, not a reason to skip verification now.
+        entry = _row_to_entry(row)
+        t0 = time.monotonic()
+        history = await self.memory_history(namespace, key)
+        readback_ms = int((time.monotonic() - t0) * 1000)
+        match = next((h for h in history if h["revision"] == entry["revision"]), None)
+        if (
+            match is None
+            or match["content_hash"] != entry["content_hash"]
+            or bool(match["tombstone"]) != bool(tombstone)
+        ):
+            raise AppError(
+                "write_verification_failed",
+                f"read-back of {namespace}/{key} revision {entry['revision']} "
+                "did not return what was written",
+            )
+        entry["verified_persisted"] = True
+        entry["readback_latency_ms"] = readback_ms
+        entry["deduplicated"] = False
+        if override:
+            # Visible + telemetrable (v_screening_hit_rate counts override clears).
+            entry["screening_override"] = True
+            entry["advisories"] = list(entry.get("advisories") or []) + ["screening_override"]
+        if quarantined:
+            entry["feedback"] = FEEDBACK_NUDGE  # T8.2: nudge where friction is fresh
+        if origin_detail_suppressed:
+            entry["advisories"] = (list(entry.get("advisories") or [])
+                                   + ["origin_detail_suppressed_clinical"])
+        return entry
+
+    async def _stale_pin_advisory(self, meta: dict, mode: str) -> tuple[dict | None, str | None]:
+        """R5 (T7.2): at claim-write time, check whether the pinned sha is already
+        behind the live branch head. Best-effort with a hard 2s budget — NEVER
+        fails or slows a write beyond that; a miss reports advisory_status
+        skipped_timeout/skipped_unresolved instead of guessing."""
+        import asyncio
+
+        repo, branch = meta.get("repo"), meta.get("branch")
+        pinned = meta.get("repo_sha")
+        if not (repo and branch and pinned) or not self.resolver.enabled:
+            return None, None
+        try:
+            async with asyncio.timeout(2):
+                head = await self.resolver.branch_head(repo, branch)
+        except (TimeoutError, asyncio.TimeoutError):
+            return None, "skipped_timeout"
+        except Exception:  # noqa: BLE001 - best-effort advisory, never blocks a write
+            return None, "skipped_unresolved"
+        if head is None:
+            return None, "skipped_unresolved"
+        if sha_match(pinned, head):
+            return None, "ok"
+        advisory: dict[str, Any] = {
+            "name": "stale_pin", "will_resolve_stale": True,
+            "pinned_sha": pinned, "branch_head": head,
+            "feedback": FEEDBACK_NUDGE,  # T8.2
+        }
+        if mode == "full":
+            advisory["remediation"] = (
+                f"the pinned repo_sha {pinned} is behind {branch}'s live head {head[:12]} — "
+                "this claim will reconcile stale. To record a historical fact, move the "
+                "sha into the value and pin the live head instead."
+            )
+        return advisory, "computed"
 
     @_retry_if_idempotent
     async def memory_save(
-        self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None, meta=None
+        self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None, meta=None,
+        actor="unattributed", origin="unknown", origin_detail=None,
+        origin_model_id=None, origin_model_family=None, derived_from=None,
     ) -> dict:
-        return await self._append(namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta)
+        entry = await self._append(
+            namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta, actor=actor,
+            origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
+            origin_model_family=origin_model_family, derived_from=derived_from,
+        )
+        # R5 advisory arm (per-namespace): claims that pin external mutable
+        # state get a write-time freshness check. Control arm ('off') skips
+        # the lookup entirely.
+        if kind == "claim" and isinstance(meta, dict) and not entry.get("deduplicated"):
+            profile = resolve_profile(await self._namespace_profile(namespace))
+            mode = profile["advisory_mode"]
+            if mode in ("full", "minimal"):
+                advisory, status = await self._stale_pin_advisory(meta, mode)
+                if status is not None:
+                    entry["advisory_status"] = status
+                if advisory is not None:
+                    entry["advisories"] = list(entry.get("advisories") or []) + [advisory]
+        return entry
 
     @_retry_on_disconnect
     async def memory_get(self, namespace, key) -> dict | None:
@@ -408,7 +618,17 @@ class PostgresBackend(StorageBackend):
         return _row_to_entry(row)
 
     @_retry_on_disconnect
-    async def memory_list(self, namespace, *, kind=None, tag=None, limit=100) -> list[dict]:
+    async def memory_list_page(
+        self, namespace, *, kind=None, tag=None, prefix=None, limit=100,
+        cursor=None, include_quarantined=False,
+    ) -> dict:
+        """T4.1: key-ordered page of the latest live entry per key.
+
+        ``prefix`` compiles to an index-friendly ``LIKE 'prefix%'`` with the
+        caller's ``%``/``_`` escaped — prefix means PREFIX, never a pattern.
+        ``cursor`` is the opaque continuation token from the previous page;
+        the response carries ``truncated`` + ``next_cursor``.
+        """
         clauses = ["namespace = %s"]
         params: list[Any] = [namespace]
         if kind:
@@ -417,6 +637,28 @@ class PostgresBackend(StorageBackend):
         if tag:
             clauses.append("%s = ANY(tags)")
             params.append(tag)
+        if prefix:
+            escaped = (prefix.replace("\\", "\\\\")
+                             .replace("%", "\\%")
+                             .replace("_", "\\_"))
+            clauses.append("key LIKE %s")
+            params.append(escaped + "%")
+        # T8.1: the `_meta/` house band (observations, future spine records) is
+        # hidden from normal lists — ask for it explicitly via a _meta prefix.
+        if not (prefix and prefix.startswith("_meta")):
+            clauses.append("key NOT LIKE %s")
+            params.append(r"\_meta/%")
+        if cursor:
+            try:
+                after_key = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise AppError(
+                    "invalid_cursor",
+                    "cursor is not a token returned by a previous memory_list page",
+                    remedy="pass the next_cursor value from the previous response, unmodified",
+                ) from exc
+            clauses.append("key > %s")
+            params.append(after_key)
         where = " AND ".join(clauses)
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -430,8 +672,28 @@ class PostgresBackend(StorageBackend):
                 params,
             )
             rows = await cur.fetchall()
-        live = [_row_to_entry(r) for r in rows if _is_live(r)]
-        return live[:limit]
+        # T3.2: quarantined entries are excluded from default reads; opt back
+        # in with include_quarantined=True (verdict stays visible on the entry).
+        live = [
+            _row_to_entry(r) for r in rows
+            if _is_live(r) and (include_quarantined or not r.get("quarantined"))
+        ]
+        page = live[:limit]
+        truncated = len(live) > limit
+        next_cursor = (
+            base64.urlsafe_b64encode(page[-1]["key"].encode("utf-8")).decode("ascii")
+            if truncated and page else None
+        )
+        return {"entries": page, "truncated": truncated, "next_cursor": next_cursor}
+
+    async def memory_list(
+        self, namespace, *, kind=None, tag=None, prefix=None, limit=100, include_quarantined=False,
+    ) -> list[dict]:
+        page = await self.memory_list_page(
+            namespace, kind=kind, tag=tag, prefix=prefix, limit=limit,
+            include_quarantined=include_quarantined,
+        )
+        return page["entries"]
 
     @_retry_on_disconnect
     async def memory_history(self, namespace, key, *, limit=50) -> list[dict]:
@@ -446,7 +708,9 @@ class PostgresBackend(StorageBackend):
         return [_row_to_entry(r) for r in rows]
 
     @_retry_if_idempotent
-    async def memory_delete(self, namespace, key, *, source_surface=None, event_id=None, meta=None) -> dict:
+    async def memory_delete(
+        self, namespace, key, *, source_surface=None, event_id=None, meta=None, actor="unattributed",
+    ) -> dict:
         # Tombstone = append a deleting revision (history is preserved). `meta`
         # lets a delete record the provenance of the deletion (who/at-what-sha).
         async with self.pool.connection() as conn:
@@ -458,10 +722,15 @@ class PostgresBackend(StorageBackend):
             )
             latest = await cur.fetchone()
         kind = latest["kind"] if latest else "note"
-        return await self._append(namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True, meta=meta)
+        return await self._append(
+            namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True,
+            meta=meta, actor=actor,
+        )
 
     @_retry_on_disconnect
-    async def memory_search(self, namespace, query, *, limit=20) -> list[dict]:
+    async def memory_search(
+        self, namespace, query, *, limit=20, include_quarantined=False,
+    ) -> list[dict]:
         # Tenant-scoped: every leg filters on a single namespace first — no
         # implicit cross-project reads.
         #
@@ -489,10 +758,11 @@ class PostgresBackend(StorageBackend):
                         ORDER BY key, revision DESC
                     ) latest
                     WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                          AND (%s OR NOT quarantined)
                           AND value::text ILIKE %s
                     LIMIT %s
                     """,
-                    (namespace, f"%{query}%", limit),
+                    (namespace, include_quarantined, f"%{query}%", limit),
                 )
                 rows = await cur.fetchall()
                 return [_row_to_entry(r) for r in rows[:limit]]
@@ -523,11 +793,12 @@ class PostgresBackend(StorageBackend):
                         ORDER BY key, revision DESC
                     ) latest
                     WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                          AND (%s OR NOT quarantined)
                           AND embedding IS NOT NULL
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    (namespace, qvec, limit),
+                    (namespace, include_quarantined, qvec, limit),
                 )
                 semantic_rows = await cur.fetchall()
 
@@ -545,11 +816,12 @@ class PostgresBackend(StorageBackend):
                         ORDER BY key, revision DESC
                     ) latest
                     WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                          AND (%s OR NOT quarantined)
                           AND hyde_embedding IS NOT NULL
                     ORDER BY hyde_embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    (namespace, qvec, limit),
+                    (namespace, include_quarantined, qvec, limit),
                 )
                 hyde_rows = await cur.fetchall()
 
@@ -564,10 +836,11 @@ class PostgresBackend(StorageBackend):
                     ORDER BY key, revision DESC
                 ) latest
                 WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                      AND (%s OR NOT quarantined)
                       AND value::text ILIKE %s
                 LIMIT %s
                 """,
-                (namespace, f"%{query}%", limit),
+                (namespace, include_quarantined, f"%{query}%", limit),
             )
             keyword_rows = await cur.fetchall()
 
@@ -594,14 +867,18 @@ class PostgresBackend(StorageBackend):
             conn.row_factory = dict_row
             cur = await conn.execute(
                 """
-                SELECT DISTINCT ON (key) key, revision, kind, repo_sha,
-                       content_hash, value, meta, tombstone, valid_until, created_at
+                SELECT DISTINCT ON (key) id, key, revision, kind, repo_sha,
+                       content_hash, value, meta, tombstone, valid_until, created_at,
+                       quarantined, screening, derived_from, actor
                 FROM memory_entry WHERE namespace = %s
                 ORDER BY key, revision DESC
                 """,
                 (namespace,),
             )
-            rows = [r for r in await cur.fetchall() if _is_live(r)]
+            # `_meta/` records (observations …) are outside the drift detectors.
+            rows = [r for r in await cur.fetchall()
+                    if _is_live(r) and not r["key"].startswith("_meta/")]
+        quarantined_count = sum(1 for r in rows if r.get("quarantined"))
 
         with_sha = [r for r in rows if r["repo_sha"]]
         latest_repo_sha = (
@@ -636,6 +913,111 @@ class PostgresBackend(StorageBackend):
             for s, keys in by_subject.items() if len(keys) > 1
         ]
 
+        # Phase 5 (T5.3): tainted lineage — downstream entries whose derived_from
+        # chain contains a quarantined or reconcile-falsified ancestor. REPORT
+        # ONLY, no automatic cascade: human judgment decides what's actually
+        # poisoned (auto-cascade is how one false positive nukes a namespace).
+        tainted: dict[str, str] = {}  # key -> why it's a tainted ROOT
+        for r in rows:
+            if r.get("quarantined"):
+                tainted[r["key"]] = "quarantined"
+            if r["key"].startswith(self._RECONCILE_PREFIX):
+                verdict = r["value"] if isinstance(r["value"], dict) else {}
+                if verdict.get("state") == STALE:
+                    tainted.setdefault(
+                        r["key"][len(self._RECONCILE_PREFIX):], "reconcile_falsified")
+        # lineage refs are "key@revision_id" (or bare keys); resolve both forms
+        parents = {
+            r["key"]: {str(ref).split("@", 1)[0] for ref in (r.get("derived_from") or [])}
+            for r in rows if r.get("derived_from")
+        }
+        tainted_lineage: list[dict] = []
+        for key, parent_keys in parents.items():
+            seen: set[str] = set()
+            frontier = set(parent_keys)
+            hit_roots: set[str] = set()
+            while frontier:
+                p = frontier.pop()
+                if p in seen:
+                    continue
+                seen.add(p)
+                if p in tainted:
+                    hit_roots.add(p)
+                frontier |= parents.get(p, set())
+            if hit_roots:
+                tainted_lineage.append({
+                    "key": key,
+                    "tainted_ancestors": sorted(hit_roots),
+                    "reasons": {root: tainted[root] for root in sorted(hit_roots)},
+                })
+
+        # Phase 6 (T6.1): staleness demotion. A reconcile verdict is a snapshot,
+        # not a subscription — a claim whose latest verdict is older than the
+        # namespace's staleness window needs re-verifying EVEN IF that verdict
+        # was `current`. Claims never reconciled at all are flagged too.
+        profile = await self._namespace_profile(namespace)
+        staleness_hours = float(
+            profile.get("claim_staleness_hours")
+            or settings.default_claim_staleness_hours)
+        now = datetime.now(timezone.utc)
+        verdict_by_claim = {
+            r["key"][len(self._RECONCILE_PREFIX):]: r
+            for r in rows if r["key"].startswith(self._RECONCILE_PREFIX)
+        }
+        claims = [r for r in rows
+                  if r["kind"] == "claim" and not r["key"].startswith(self._RECONCILE_PREFIX)]
+        needs_reverification = []
+        for c in claims:
+            verdict = verdict_by_claim.get(c["key"])
+            if verdict is None:
+                needs_reverification.append({
+                    "key": c["key"], "reason": "never_reconciled",
+                    "last_verdict_state": None, "verdict_age_hours": None,
+                })
+                continue
+            age_hours = (now - verdict["created_at"]).total_seconds() / 3600.0
+            state = (verdict["value"] or {}).get("state") if isinstance(verdict["value"], dict) else None
+            if age_hours > staleness_hours:
+                needs_reverification.append({
+                    "key": c["key"], "reason": "verdict_expired",
+                    "last_verdict_state": state,
+                    "verdict_age_hours": round(age_hours, 1),
+                })
+
+        # Phase 6 (T6.2): too-clean heuristic — informational prompts to
+        # investigate, never blockers. Fabricated success survives longer than
+        # fabricated failure because nobody interrogates good news.
+        skepticism: dict[str, Any] = {}
+        verdict_states = [
+            (verdict_by_claim[c["key"]]["value"] or {}).get("state")
+            for c in claims if c["key"] in verdict_by_claim
+            and isinstance(verdict_by_claim[c["key"]]["value"], dict)
+        ]
+        if len(verdict_states) > 20 and verdict_states and all(s == "current" for s in verdict_states):
+            skepticism["all_verdicts_current"] = {
+                "claims": len(verdict_states),
+                "note": "every reconciled claim reads current — too clean; spot-check a few",
+            }
+        # runs of identical content written by DIFFERENT actors
+        run: list[dict] = []
+        identical_runs = []
+        for r in sorted(rows, key=lambda r: r["created_at"]):
+            h = r["content_hash"] or _content_hash(r["value"])
+            if run and (run[0]["content_hash"] or _content_hash(run[0]["value"])) == h:
+                run.append(r)
+            else:
+                run = [r]
+            actors = {x.get("actor") or "unattributed" for x in run}
+            if len(run) >= 5 and len(actors) > 1:
+                entry = {"content_hash": h, "count": len(run),
+                         "actors": sorted(actors), "keys": sorted(x["key"] for x in run)}
+                if not identical_runs or identical_runs[-1]["content_hash"] != h:
+                    identical_runs.append(entry)
+                else:
+                    identical_runs[-1] = entry
+        if identical_runs:
+            skepticism["identical_content_runs"] = identical_runs[:limit]
+
         return {
             "namespace": namespace,
             "entry_count": len(rows),
@@ -643,6 +1025,15 @@ class PostgresBackend(StorageBackend):
             "stale": stale[:limit],
             "duplicate_content": duplicate_content[:limit],
             "claim_collisions": claim_collisions[:limit],
+            # Phase 3 (T3.2): live entries currently held in quarantine.
+            "quarantined_count": quarantined_count,
+            # Phase 5 (T5.3): report-only lineage taint (no automatic cascade).
+            "tainted_lineage": tainted_lineage[:limit],
+            # Phase 6 (T6.1): verdicts past the namespace's staleness window.
+            "claim_staleness_hours": staleness_hours,
+            "needs_reverification": needs_reverification[:limit],
+            # Phase 6 (T6.2): informational only, never a blocker.
+            "skepticism": skepticism,
         }
 
     @_retry_on_disconnect
@@ -667,7 +1058,7 @@ class PostgresBackend(StorageBackend):
 
         groups: dict[str, list[tuple]] = defaultdict(list)
         for r in rows:
-            if not _is_live(r):
+            if not _is_live(r) or r["key"].startswith("_meta/"):
                 continue
             h = r["content_hash"] or _content_hash(r["value"])
             groups[h].append((r["namespace"], r["key"]))
@@ -694,9 +1085,11 @@ class PostgresBackend(StorageBackend):
         for r in rows:
             entry = _row_to_entry(r, wrap=False)
             verdict = await reconcile_claim(entry, self.resolver)
+            # Distinct actor (T2.1): the instrument recording a verdict must
+            # never share an actor with the subject under measurement.
             await self.memory_save(
                 r["namespace"], f"{self._RECONCILE_PREFIX}{r['key']}", verdict,
-                kind="config", tags=["reconcile", verdict["state"]],
+                kind="config", tags=["reconcile", verdict["state"]], actor="reconciler",
             )
             verdicts.append(verdict)
         return verdicts
@@ -793,8 +1186,15 @@ class PostgresBackend(StorageBackend):
             latest.get("source_surface"),
             _curate_event_id(namespace, session_id, key, "supersede-boundary"),
             False, meta=meta, valid_until=datetime.now(timezone.utc),
-            embeddings=(None, None),
+            embeddings=(None, None), actor="curator",
         )
+
+    def _curator_identity(self) -> tuple[str | None, str | None]:
+        """(curator_model_id, curator_family) — structured attribution (T5.2/T5.4);
+        enforcement compares these fields, never origin_detail prose."""
+        model_id = getattr(self.curator, "model_id", None) or getattr(settings, "curator_model", None)
+        family = getattr(self.curator, "family", None) or getattr(settings, "curator_family", None)
+        return model_id, family
 
     async def _write_curation_op(self, namespace, op, *, session_id, action) -> dict:
         key = op["key"]
@@ -806,6 +1206,10 @@ class PostgresBackend(StorageBackend):
         meta = self._op_meta(op, session_id)
         emb = op.get("embeddings") or {}
         embeddings = (emb.get("summary"), emb.get("hyde"))
+        curator_model_id, curator_family = self._curator_identity()
+        # T5.4: curation accountability — stamp who curated, structurally.
+        meta["curator_model_id"] = curator_model_id
+        meta["curator_family"] = curator_family
 
         # SUPERSEDE/MERGE close out the old revisions BEFORE writing the survivor.
         if action == "SUPERSEDE" and op.get("supersedes"):
@@ -819,12 +1223,43 @@ class PostgresBackend(StorageBackend):
             namespace, key, value, kind, tags, op.get("source_surface"),
             _curate_event_id(namespace, session_id, key, action), False, meta=meta,
             salience=_as_int(op.get("salience")), confidence=_as_float(op.get("confidence")),
-            embeddings=embeddings,
+            embeddings=embeddings, actor="curator",
+            origin="synthesized", origin_model_id=curator_model_id,
+            origin_model_family=curator_family,
+            derived_from=op.get("derived_from"),
         )
         return {
             "op": action, "key": key, "kind": written["kind"],
             "revision": written["revision"], "downgraded": bool(op.get("_downgraded")),
         }
+
+    def _family_blocklist(self) -> set[str]:
+        raw = getattr(settings, "curator_family_must_differ_from", None) or ""
+        return {f.strip().lower() for f in raw.split(",") if f.strip()}
+
+    async def _family_conflict(self, namespace, op) -> dict | None:
+        """T5.4: when CURATOR_FAMILY_MUST_DIFFER_FROM is set, refuse to curate an
+        entry whose origin_model_family matches the curator's own family — enum
+        comparison on structured fields, never prose parsing. Returns the
+        standardized error object for the refused op, or None when allowed."""
+        blocklist = self._family_blocklist()
+        _, curator_family = self._curator_identity()
+        if not blocklist or not curator_family or curator_family.lower() not in blocklist:
+            return None
+        target_key = op.get("key")
+        candidates = [target_key, op.get("supersedes"),
+                      *(op.get("merge_from") or op.get("supersedes_keys") or [])]
+        for cand in filter(None, candidates):
+            existing = await self.memory_get(namespace, cand)
+            if existing and (existing.get("origin_model_family") or "").lower() == curator_family.lower():
+                return AppError(
+                    "curator_family_conflict",
+                    f"refusing to curate {cand}: its origin_model_family "
+                    f"({existing['origin_model_family']}) matches the curator's family "
+                    f"({curator_family}) and CURATOR_FAMILY_MUST_DIFFER_FROM forbids "
+                    "same-family self-review",
+                ).payload
+        return None
 
     async def apply_curation(self, namespace, result, *, session_id) -> dict:
         """Deterministically apply a curator result. Each op is PHI-gated first
@@ -833,9 +1268,11 @@ class PostgresBackend(StorageBackend):
         the same session is exactly-once."""
         operations = (result or {}).get("operations") or []
         counts = {"added": 0, "updated": 0, "merged": 0, "superseded": 0,
-                  "noop": 0, "phi_dropped": 0, "downgraded": 0, "invalid": 0}
+                  "noop": 0, "phi_dropped": 0, "downgraded": 0, "invalid": 0,
+                  "family_conflict": 0}
         applied: list[dict] = []
         noops: list[dict] = []
+        family_conflicts: list[dict] = []
         for op in operations:
             if not isinstance(op, dict):
                 counts["invalid"] += 1
@@ -852,6 +1289,12 @@ class PostgresBackend(StorageBackend):
             if not assert_no_phi(op):
                 counts["phi_dropped"] += 1
                 continue
+            # T5.4: same-family self-review gate (structured enum comparison).
+            conflict = await self._family_conflict(namespace, op)
+            if conflict is not None:
+                counts["family_conflict"] += 1
+                family_conflicts.append({"key": op.get("key"), **conflict})
+                continue
             # A claim without mechanical provenance is downgraded to a plain note.
             if (op.get("kind") or "note") == "claim" and not _claim_has_provenance(op):
                 op = {**op, "kind": "note", "_downgraded": True,
@@ -862,11 +1305,16 @@ class PostgresBackend(StorageBackend):
             applied.append(written)
             counts[{"ADD": "added", "UPDATE": "updated",
                     "MERGE": "merged", "SUPERSEDE": "superseded"}[action]] += 1
-        return {"applied": applied, "noops": noops, "counts": counts}
+        out = {"applied": applied, "noops": noops, "counts": counts}
+        if family_conflicts:
+            out["family_conflicts"] = family_conflicts
+        return out
 
     def _trace_query_text(self, events: list[dict]) -> str:
         """A compact text blob of the session trace, used only to pull `similar_memories`
-        so the curator can dedup/supersede against what's already stored."""
+        so the curator can dedup/supersede against what's already stored. Best-effort
+        read-side helper: an unserializable payload chunk is skipped (it only weakens
+        the similarity query), never a write-path swallow."""
         chunks: list[str] = []
         for e in events:
             chunks.append(str(e.get("kind") or ""))
@@ -905,14 +1353,27 @@ class PostgresBackend(StorageBackend):
     # Handoffs are cross-surface (web/cli/desktop) within ONE project: stored as
     # kind='handoff' rows inside the caller's namespace, never a shared space.
     @_retry_if_idempotent
-    async def handoff_save(self, namespace, key, value, *, source_surface=None, event_id=None, meta=None) -> dict:
-        return await self._append(namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta)
+    async def handoff_save(
+        self, namespace, key, value, *, source_surface=None, event_id=None, meta=None, actor="unattributed",
+        origin="unknown", origin_detail=None, origin_model_id=None, origin_model_family=None,
+        derived_from=None,
+    ) -> dict:
+        return await self._append(
+            namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta, actor=actor,
+            origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
+            origin_model_family=origin_model_family, derived_from=derived_from,
+        )
 
-    async def handoff_load(self, namespace, key) -> dict | None:
-        return await self.memory_get(namespace, key)
+    async def handoff_load(self, namespace, key, *, include_quarantined=False) -> dict | None:
+        entry = await self.memory_get(namespace, key)
+        if entry is not None and entry.get("quarantined") and not include_quarantined:
+            return None  # T3.2: quarantined handoffs are excluded by default
+        return entry
 
-    async def handoff_list(self, namespace, *, limit=100) -> list[dict]:
-        return await self.memory_list(namespace, kind="handoff", limit=limit)
+    async def handoff_list(self, namespace, *, limit=100, include_quarantined=False) -> list[dict]:
+        return await self.memory_list(
+            namespace, kind="handoff", limit=limit, include_quarantined=include_quarantined,
+        )
 
     # --------------------------------------------------------------- sessions
     @_retry_on_disconnect  # a drop in the commit-ack window at worst orphans an
@@ -929,15 +1390,29 @@ class PostgresBackend(StorageBackend):
             row = await cur.fetchone()
         return _session_to_dict(row)
 
-    @_retry_on_disconnect  # at-least-once under a mid-failover drop: a replay in the
-                           # narrow commit-ack window may append one duplicate event —
-                           # acceptable for an append-only log vs. failing the call.
-    async def session_append_event(self, namespace, session_id, kind, payload) -> dict:
+    @_retry_on_disconnect  # without an event_id: at-least-once under a mid-failover
+                           # drop (a replay in the narrow commit-ack window may append
+                           # one duplicate event). WITH an event_id (T2.1) the
+                           # (namespace, actor, event_id) unique gate makes the retry
+                           # collapse to a visible dedup — exactly-once.
+    async def session_append_event(
+        self, namespace, session_id, kind, payload, *, actor="unattributed", event_id=None,
+    ) -> dict:
+        actor = actor or "unattributed"
         last_exc: Exception | None = None
         for _ in range(_MAX_RETRIES):
             try:
                 async with self.pool.connection() as conn:
                     conn.row_factory = dict_row
+                    if event_id:
+                        cur = await conn.execute(
+                            "SELECT * FROM session_event WHERE namespace = %s AND actor = %s "
+                            "AND event_id = %s",
+                            (namespace, actor, event_id),
+                        )
+                        existing = await cur.fetchone()
+                        if existing is not None:
+                            return {**_event_to_dict(existing), "deduplicated": True}
                     async with conn.transaction():
                         # Tenant guard: the session must exist under this namespace.
                         cur = await conn.execute(
@@ -945,22 +1420,30 @@ class PostgresBackend(StorageBackend):
                             (session_id, namespace),
                         )
                         if await cur.fetchone() is None:
-                            raise ValueError("session not found in namespace")
+                            raise AppError(
+                                "session_not_found",
+                                f"session {session_id} not found in namespace {namespace}",
+                            )
                         cur = await conn.execute(
                             """
-                            INSERT INTO session_event (session_id, namespace, seq, kind, payload)
-                            SELECT %s, %s, COALESCE(MAX(seq), 0) + 1, %s, %s
+                            INSERT INTO session_event (session_id, namespace, seq, kind, payload, actor, event_id)
+                            SELECT %s, %s, COALESCE(MAX(seq), 0) + 1, %s, %s, %s, %s
                             FROM session_event WHERE session_id = %s
                             RETURNING *
                             """,
-                            (session_id, namespace, kind, Jsonb(sanitize(payload)), session_id),
+                            (session_id, namespace, kind, Jsonb(sanitize(payload)),
+                             actor, event_id, session_id),
                         )
                         row = await cur.fetchone()
-                return _event_to_dict(row)
+                return {**_event_to_dict(row), "deduplicated": False}
             except pg_errors.UniqueViolation as exc:
+                # Either a seq collision (retry) or a racing duplicate event_id —
+                # the next iteration's dedup check returns the winner.
                 last_exc = exc
                 continue
-        raise last_exc
+        raise AppError(
+            "write_conflict", f"seq-collision retries exhausted for session {session_id}",
+        ) from last_exc
 
     @_retry_on_disconnect
     async def session_get(self, namespace, session_id) -> dict | None:
@@ -1016,7 +1499,27 @@ class PostgresBackend(StorageBackend):
                 (sha, data, size, content_type),
             )
             inserted = await cur.fetchone()
-        return {"sha256": sha, "size": size, "content_type": content_type, "deduped": inserted is None}
+
+        # T2.3: read the bytes back through the public read path and re-hash.
+        # Full-blob re-read doubles write IO up to the 50MB cap — measured
+        # honesty over speed; readback_latency_ms makes the cost visible.
+        t0 = time.monotonic()
+        meta = await self.artifact_get(sha)
+        stored = await self.artifact_read_range(sha, 0, size) if meta else None
+        if (
+            meta is None or meta["size"] != size
+            or stored is None or hashlib.sha256(stored).hexdigest() != sha
+        ):
+            raise AppError(
+                "write_verification_failed",
+                f"artifact {sha} read-back did not match the written bytes",
+            )
+        return {
+            "sha256": sha, "size": size, "content_type": content_type,
+            "deduped": inserted is None, "verified_persisted": True,
+            "content_hash": sha,
+            "readback_latency_ms": int((time.monotonic() - t0) * 1000),
+        }
 
     @_retry_on_disconnect
     async def artifact_get(self, sha256) -> dict | None:
@@ -1071,6 +1574,99 @@ class PostgresBackend(StorageBackend):
             }
             for r in rows
         ]
+
+    # ------------------------------------------------------------ observations
+    _OBSERVATION_KEY = "_meta/observations"
+    _OBS_CATEGORIES = ("ergonomics", "error_recovery", "advisory", "screening",
+                       "docs_gap", "surprise", "suggestion")
+    _OBS_SEVERITIES = ("blocker", "friction", "note")
+
+    async def observation_log(
+        self, namespace, *, category, severity="note", tool_ref=None,
+        expected=None, actual=None, suggestion=None, session_id=None,
+        actor="unattributed",
+    ) -> dict:
+        """T8.1: the LLM's feedback channel. Each observation is an ordinary
+        append-only revision of `_meta/observations` (memory_history is the
+        log; existing read tools work on it for free). `_meta/` is excluded
+        from normal memory_list and coord_* scans unless explicitly requested.
+
+        Bias controls (T8.3, pre-committed): observations are prompted at
+        friction, so they over-sample error/quarantine paths and under-sample
+        silent success; models perform agreeableness. They are qualitative
+        annotations that must corroborate a log-derived metric — tool_events
+        is the denominator, never the vote count."""
+        profile = resolve_profile(await self._namespace_profile(namespace))
+        if profile.get("clinical"):
+            raise AppError(
+                "observations_disabled",
+                f"observation_log is disabled in clinical namespace {namespace}",
+            )
+        if category not in self._OBS_CATEGORIES or severity not in self._OBS_SEVERITIES:
+            raise AppError(
+                "invalid_observation",
+                f"invalid category {category!r} or severity {severity!r}",
+            )
+        value = {
+            "category": category, "severity": severity, "tool_ref": tool_ref,
+            "expected": expected, "actual": actual, "suggestion": suggestion,
+            # server-attached context — codes and names, never argument content
+            "auto": {
+                "namespace": namespace,
+                "session_id": session_id,
+                "variant_profile": profile,
+                "last_error_code": self._last_error_code.get(namespace),
+                "last_quarantine": self._last_quarantine.get(namespace),
+                "ts": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+        entry = await self._append(
+            namespace, self._OBSERVATION_KEY, value, "note",
+            ["observation", category, severity], None, None, False, actor=actor,
+            origin="synthesized",
+        )
+        return {
+            "recorded": True, "revision": entry["revision"],
+            "revision_id": entry["revision_id"],
+            "verified_persisted": entry["verified_persisted"],
+            "quarantined": entry["quarantined"],
+            "read_back_with": f"memory_history('{namespace}', '{self._OBSERVATION_KEY}')",
+        }
+
+    # --------------------------------------------------------------- telemetry
+    async def record_tool_event(
+        self, *, tool: str, args: dict, result: Any = None, outcome: str = "ok",
+        error_code: str | None = None, remedy_emitted: bool = False,
+        latency_ms: int | None = None,
+    ) -> None:
+        """Append one PHI-safe row to tool_events (Phase 1). Values pass through
+        redact() in build_event_row — names/lengths/hashes only. Raises on
+        failure; the TOOL layer swallows+logs so telemetry can never fail a
+        call (telemetry is observability, not the user's persistence ack)."""
+        row = build_event_row(
+            tool=tool, args=args, result=result, outcome=outcome,
+            error_code=error_code, remedy_emitted=remedy_emitted, latency_ms=latency_ms,
+        )
+        # T8.1: remember the namespace's most recent friction so observation_log
+        # can auto-attach it (codes/pattern names only — PHI-safe by shape).
+        ns = row.get("namespace")
+        if ns:
+            if row["outcome"] == "error" and row.get("error_code"):
+                self._last_error_code[ns] = row["error_code"]
+            if row["outcome"] == "quarantined":
+                self._last_quarantine[ns] = row.get("screening_patterns") or []
+        cols = list(row)
+        placeholders = ", ".join(["%s"] * len(cols))
+        values = [
+            Jsonb(row[c]) if c in ("arg_value_meta", "variant_profile") and row[c] is not None
+            else row[c]
+            for c in cols
+        ]
+        async with self.pool.connection() as conn:
+            await conn.execute(
+                f"INSERT INTO tool_events ({', '.join(cols)}) VALUES ({placeholders})",
+                values,
+            )
 
     # ------------------------------------------------------------------ admin
     @_retry_on_disconnect

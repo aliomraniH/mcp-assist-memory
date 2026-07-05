@@ -35,6 +35,12 @@ class StorageBackend(abc.ABC):
         source_surface: str | None = None,
         event_id: str | None = None,
         meta: dict | None = None,
+        actor: str = "unattributed",
+        origin: str = "unknown",
+        origin_detail: str | None = None,
+        origin_model_id: str | None = None,
+        origin_model_family: str | None = None,
+        derived_from: list[str] | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod
@@ -42,8 +48,16 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     async def memory_list(
-        self, namespace: str, *, kind: str | None = None, tag: str | None = None, limit: int = 100
+        self, namespace: str, *, kind: str | None = None, tag: str | None = None,
+        prefix: str | None = None, limit: int = 100, include_quarantined: bool = False,
     ) -> list[dict]: ...
+
+    @abc.abstractmethod
+    async def memory_list_page(
+        self, namespace: str, *, kind: str | None = None, tag: str | None = None,
+        prefix: str | None = None, limit: int = 100, cursor: str | None = None,
+        include_quarantined: bool = False,
+    ) -> dict: ...
 
     @abc.abstractmethod
     async def memory_history(self, namespace: str, key: str, *, limit: int = 50) -> list[dict]: ...
@@ -51,26 +65,33 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     async def memory_delete(
         self, namespace: str, key: str, *, source_surface: str | None = None, event_id: str | None = None,
-        meta: dict | None = None,
+        meta: dict | None = None, actor: str = "unattributed",
     ) -> dict: ...
 
     @abc.abstractmethod
     async def memory_search(
-        self, namespace: str, query: str, *, limit: int = 20
+        self, namespace: str, query: str, *, limit: int = 20, include_quarantined: bool = False
     ) -> list[dict]: ...
 
     # ---------------- handoff: cross-surface convention, scoped to a project ----------------
     @abc.abstractmethod
     async def handoff_save(
         self, namespace: str, key: str, value: Any, *, source_surface: str | None = None, event_id: str | None = None,
-        meta: dict | None = None,
+        meta: dict | None = None, actor: str = "unattributed",
+        origin: str = "unknown", origin_detail: str | None = None,
+        origin_model_id: str | None = None, origin_model_family: str | None = None,
+        derived_from: list[str] | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod
-    async def handoff_load(self, namespace: str, key: str) -> dict | None: ...
+    async def handoff_load(
+        self, namespace: str, key: str, *, include_quarantined: bool = False
+    ) -> dict | None: ...
 
     @abc.abstractmethod
-    async def handoff_list(self, namespace: str, *, limit: int = 100) -> list[dict]: ...
+    async def handoff_list(
+        self, namespace: str, *, limit: int = 100, include_quarantined: bool = False
+    ) -> list[dict]: ...
 
     # ---------------- sessions: episodic memory (tenant-scoped) ----------------
     @abc.abstractmethod
@@ -80,7 +101,8 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     async def session_append_event(
-        self, namespace: str, session_id: str, kind: str, payload: Any
+        self, namespace: str, session_id: str, kind: str, payload: Any,
+        *, actor: str = "unattributed", event_id: str | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod
@@ -126,3 +148,12 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     async def health(self) -> bool: ...
+
+    # ---------------- shared spine (Phases 1/7) — concrete defaults ----------------
+    # Non-abstract so alternate backends aren't forced to implement telemetry or
+    # variant profiles; the tool layer treats both as best-effort.
+    async def record_tool_event(self, **kwargs) -> None:  # pragma: no cover - default no-op
+        return None
+
+    async def resolved_profile(self, namespace: str) -> dict:  # pragma: no cover - default
+        return {}

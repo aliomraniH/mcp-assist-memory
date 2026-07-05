@@ -2,9 +2,15 @@
 
 Two jobs:
 
-* ``sanitize`` runs on every write. It strips control characters and any text
-  that tries to forge our own ``<<<UNTRUSTED_DATA>>>`` / ``<<<END>>>`` delimiters
-  so a stored value can't smuggle a fake boundary into a consumer's context.
+* ``sanitize`` runs on every write. It strips control characters and rewrites
+  any text that tries to forge our own ``<<<UNTRUSTED_DATA>>>`` / ``<<<END>>>``
+  delimiters into a VISIBLE, ONE-WAY escape (``[[UNTRUSTED_DATA]]`` /
+  ``[[END]]``) so a stored value can't smuggle a fake boundary into a
+  consumer's context — and the attempt stays visible instead of vanishing
+  (Phase 3, T3.3). The escape is never undone on read: unescaping would
+  reconstruct the spoof at exactly the moment it's dangerous. Exact-match
+  graders and parsers must account for stored marker-like content appearing
+  escaped.
 * ``wrap_value`` runs at the read boundary. It wraps stored strings in the
   untrusted markers so a downstream model treats them as data, not instructions.
 """
@@ -16,14 +22,19 @@ from typing import Any
 UNTRUSTED_OPEN = "<<<UNTRUSTED_DATA>>>"
 UNTRUSTED_CLOSE = "<<<END>>>"
 
-# Forged delimiters (any casing / internal whitespace) are removed on write.
-_DELIM_RE = re.compile(r"<<<\s*(?:UNTRUSTED_DATA|END)\s*>>>", re.IGNORECASE)
+# Forged delimiters (any casing / internal whitespace) are escaped on write —
+# a visible one-way rewrite, never a silent strip and never unescaped on read.
+_DELIM_RE = re.compile(r"<<<\s*(UNTRUSTED_DATA|END)\s*>>>", re.IGNORECASE)
 # Strip C0 control chars except tab (\x09), newline (\x0a), carriage return (\x0d).
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
+def _escape_delim(m: re.Match) -> str:
+    return f"[[{m.group(1).upper()}]]"
+
+
 def scrub_text(text: str) -> str:
-    return _CTRL_RE.sub("", _DELIM_RE.sub("", text))
+    return _CTRL_RE.sub("", _DELIM_RE.sub(_escape_delim, text))
 
 
 def sanitize(value: Any) -> Any:

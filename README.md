@@ -1,7 +1,7 @@
 # mcp-assist-memory
 
 A **generic, project-agnostic** memory / coordination / artifact server for
-multi-agent and multi-surface work. One FastAPI process serves an **18-tool MCP**
+multi-agent and multi-surface work. One FastAPI process serves a **23-tool MCP**
 over Streamable HTTP, backed by **Postgres (+ pgvector)**, deployed standalone on
 a **Replit Reserved VM**.
 
@@ -11,19 +11,32 @@ namespace *values*, never in tool names, tables, columns, or code.
 
 ### Capabilities at a glance
 
-- **18-tool MCP** over Streamable HTTP (memory, handoff, session, artifact, admin).
+- **23-tool MCP** over Streamable HTTP (memory, handoff, session, artifact,
+  coordination, feedback, admin).
+- **Trust-boundary spine (Plan v2)** — actor-scoped exactly-once writes with
+  visible dedup, read-back-verified acks (`verified_persisted`), standardized
+  error payloads with remedies, write-time screening + quarantine, provenance
+  tiers (`origin`, model attribution, `derived_from` lineage), trust decay
+  (`needs_reverification`), PHI-safe `tool_events` telemetry, per-namespace
+  variant profiles, and an `observation_log` feedback channel.
 - **Namespace-scoped multi-tenancy** — every per-project query filters on `namespace`.
 - **Resilient to transient DB drops** — the server transparently retries genuine
   connection losses (Neon scale-down / PgBouncer recycle, SQLSTATE `57P01`/`08xxx`)
   on a fresh pooled connection, and validates connections at checkout, so callers
   no longer have to retry. Retries are idempotency-gated, so they never double-write.
-- **Prompt-injection hardening** — values are sanitized on write and returned wrapped
-  in `<<<UNTRUSTED_DATA>>>` markers; `storage.sanitize.unwrap_value` recovers the raw
-  value when a consumer needs it (e.g. to `json.loads`).
+- **Prompt-injection resistance layer** — values are sanitized on write (forged
+  markers are escaped one-way to `[[UNTRUSTED_DATA]]`, never reconstructed on read),
+  instruction-shaped writes are screened and quarantined (visible in the write ack;
+  `include_quarantined: true` opts reads back in), and reads come back wrapped in
+  `<<<UNTRUSTED_DATA>>>` markers; `storage.sanitize.unwrap_value` recovers the raw
+  value when a consumer needs it (e.g. to `json.loads`). Honest framing: these are
+  layers, not proofs — deterministic screens and wrappers are bypassable by an
+  adaptive attacker; adversarial evaluation is pending (see Phase 10 backlog in
+  `DECISION-PROTOCOL.md`).
 - **Content-addressed artifacts** (sha256, global dedup), 50 MB cap, ranged reads.
 - **Per-surface rotatable tokens** (web vs. desktop-cli) managed from a password-gated `/admin` dashboard.
 
-## The 18 tools
+## The 23 tools
 
 | Group | Tools |
 |---|---|
@@ -31,6 +44,8 @@ namespace *values*, never in tool names, tables, columns, or code.
 | handoff | `handoff_save` `handoff_load` `handoff_list` |
 | session | `session_create` `session_append_event` `session_get` `session_list` `session_events` |
 | artifact | `artifact_put` `artifact_get` `artifact_list` |
+| coordination | `coord_health` `coord_drift_scan` `coord_reconcile` `coord_curate` |
+| feedback | `observation_log` |
 | admin | `stats` |
 
 `/healthz` (liveness) and the `/admin` token dashboard are served separately (not

@@ -45,8 +45,8 @@ ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS salience   int;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS confidence real;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS valid_until timestamptz;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS hyde_embedding vector(1024);
-CREATE UNIQUE INDEX IF NOT EXISTS memory_entry_event_id_uq
-    ON memory_entry (event_id) WHERE event_id IS NOT NULL;
+-- (memory_entry_event_id_uq, the pre-0006 GLOBAL event_id unique, is gone:
+--  0006 replaces it with the (namespace, actor, event_id) scope below.)
 CREATE INDEX IF NOT EXISTS memory_entry_embedding_hnsw
     ON memory_entry USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS memory_entry_ns_repo_sha ON memory_entry (namespace, repo_sha);
@@ -69,7 +69,55 @@ CREATE TABLE IF NOT EXISTS session_event (
 CREATE TABLE IF NOT EXISTS artifact (
     sha256 char(64) PRIMARY KEY, bytes bytea NOT NULL, size integer NOT NULL,
     content_type text, created_at timestamptz NOT NULL DEFAULT now());
+-- 0006_trust_spine.sql (mirrored inline so the suite is self-contained).
+CREATE TABLE IF NOT EXISTS tool_events (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ts timestamptz NOT NULL DEFAULT now(),
+    namespace text, tool text NOT NULL, actor text, session_id text,
+    arg_names text[] NOT NULL DEFAULT '{}', arg_value_meta jsonb,
+    variant_profile jsonb, server_version text, schema_version int,
+    outcome text NOT NULL, error_code text,
+    remedy_emitted boolean NOT NULL DEFAULT false,
+    advisories text[], advisory_status text, screening_patterns text[],
+    dedup boolean, verified_persisted boolean,
+    latency_ms int, readback_latency_ms int, result_bytes int, truncated boolean);
+CREATE INDEX IF NOT EXISTS tool_events_ts ON tool_events (ts);
+CREATE INDEX IF NOT EXISTS tool_events_ns_ts ON tool_events (namespace, ts);
+CREATE TABLE IF NOT EXISTS variant_profiles (
+    namespace text PRIMARY KEY, profile jsonb NOT NULL DEFAULT '{}',
+    updated_at timestamptz NOT NULL DEFAULT now(), note text);
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS actor text NOT NULL DEFAULT 'unattributed';
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS server_version text;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS schema_version int;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS quarantined boolean NOT NULL DEFAULT false;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS screening text[];
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS origin text NOT NULL DEFAULT 'unknown'
+    CHECK (origin IN ('tool','retrieval','synthesized','human','unknown'));
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS origin_detail text;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS origin_model_id text;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS origin_model_family text;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS derived_from text[];
+ALTER TABLE session_event ADD COLUMN IF NOT EXISTS actor text NOT NULL DEFAULT 'unattributed';
+ALTER TABLE session_event ADD COLUMN IF NOT EXISTS event_id uuid;
+DROP INDEX IF EXISTS memory_entry_event_id_uq;
+CREATE UNIQUE INDEX IF NOT EXISTS memory_entry_ns_actor_event_uq
+    ON memory_entry (namespace, actor, event_id) WHERE event_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS session_event_ns_actor_event_uq
+    ON session_event (namespace, actor, event_id) WHERE event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS memory_entry_ns_quarantined
+    ON memory_entry (namespace) WHERE quarantined;
+CREATE INDEX IF NOT EXISTS memory_entry_ns_key_pattern
+    ON memory_entry (namespace, key text_pattern_ops);
 """
+
+def _load_migration_views() -> str:
+    """Read the CREATE OR REPLACE VIEW statements straight from the migration
+    file so the test schema can never drift from what production applies."""
+    import pathlib
+    sql = (pathlib.Path(__file__).parent.parent / "migrations" / "0006_trust_spine.sql").read_text()
+    marker = "-- Stale-pin rate"
+    idx = sql.find(marker)
+    return sql[idx:] if idx != -1 else ""
 
 @pytest_asyncio.fixture
 async def backend():
@@ -82,6 +130,7 @@ async def backend():
     await pool.open()
     async with pool.connection() as conn:
         await conn.execute(SCHEMA)
+        await conn.execute(_load_migration_views())
     yield PostgresBackend(pool)
     await pool.close()
 

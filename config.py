@@ -37,6 +37,31 @@ class Settings(BaseSettings):
     # is reused to embed the curator's two strings (summary + hyde); absent ⇒ keyword-only.
     curator_model: str = "claude-opus-4-1"
     curator_max_output_tokens: int = 4096
+    # Curation accountability (Phase 5, T5.4). curator_family is stamped on every
+    # curated write (structured enum-ish string, e.g. "anthropic" — enforcement
+    # compares these fields, never origin_detail prose). When
+    # CURATOR_FAMILY_MUST_DIFFER_FROM is set (comma-separated families), the
+    # apply-worker refuses to curate entries whose origin_model_family matches —
+    # same-family self-review is a verified bias; this bakes the referee-protocol
+    # workaround into the spine.
+    curator_family: str = "anthropic"
+    curator_family_must_differ_from: str | None = None
+
+    # --- trust decay (Phase 6): a reconcile verdict is a snapshot, not a
+    # subscription. Claims whose latest verdict is older than this window are
+    # demoted to needs_reverification by coord_health, even if the verdict was
+    # `current`. Override per namespace via variant_profiles.profile
+    # .claim_staleness_hours (dev namespaces that reconcile weekly may want 168
+    # so the signal stays legible on a low-traffic server).
+    default_claim_staleness_hours: int = 72
+
+    # --- namespace ACL (Phase 9, design doc: docs/namespace-isolation.md) ---
+    # Optional JSON mapping token -> list of allowed namespace PREFIXES, e.g.
+    # {"tok-web": ["proj-canvas", "dev/"], "tok-cli": ["dev/"]}. When set,
+    # namespace-scoped tool calls with a token whose allowlist doesn't cover the
+    # namespace fail closed with the standard acl_denied payload. Unset ⇒
+    # behavior unchanged (no ACL). Not full multi-tenancy — see the design doc.
+    token_namespace_acl: str | None = None
 
     # --- coordination reconciler (Phase 3): only active when github_token is set ---
     # A READ-ONLY GitHub token lets the backend resolve a claim's truth (is PR #N
