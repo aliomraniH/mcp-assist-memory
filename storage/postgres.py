@@ -33,7 +33,8 @@ from storage.base import StorageBackend
 from storage.curator import Curator, DisabledCurator
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
 from storage.phi import assert_no_phi
-from storage.reconcile import STALE, DisabledResolver, Resolver, reconcile_claim
+from storage.profiles import resolve_profile
+from storage.reconcile import STALE, DisabledResolver, Resolver, reconcile_claim, sha_match
 from storage.sanitize import sanitize, wrap_value
 from storage.screening import screen_value
 from storage.telemetry import build_event_row
@@ -291,6 +292,8 @@ class PostgresBackend(StorageBackend):
         # Best-effort write-side consolidation. Defaults to disabled so the backend
         # works with no Anthropic key (coord_curate is a clean no-op).
         self.curator: Curator = curator or DisabledCurator()
+        # T7.0: per-namespace variant-profile cache (namespace -> (ts, profile)).
+        self._profile_cache: dict[str, tuple[float, dict]] = {}
 
     async def _maybe_embed(self, key, value, tombstone) -> str | None:
         """Embed an entry's text for storage. Best-effort: returns None when
@@ -363,15 +366,28 @@ class PostgresBackend(StorageBackend):
         entry["verified_persisted"] = True
         return entry
 
+    _PROFILE_TTL_S = 60.0
+
     async def _namespace_profile(self, namespace: str) -> dict:
-        """The namespace's variant/config profile (Phase 5/6/7 shared lookup).
+        """The namespace's variant/config profile (Phase 5/6/7 shared lookup),
+        cached ~60s so per-call profile echoes don't add a query per tool call.
         Missing row ⇒ {} (all defaults)."""
+        cached = self._profile_cache.get(namespace)
+        if cached and (time.monotonic() - cached[0]) < self._PROFILE_TTL_S:
+            return cached[1]
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
             cur = await conn.execute(
                 "SELECT profile FROM variant_profiles WHERE namespace = %s", (namespace,))
             row = await cur.fetchone()
-        return (row or {}).get("profile") or {}
+        profile = (row or {}).get("profile") or {}
+        self._profile_cache[namespace] = (time.monotonic(), profile)
+        return profile
+
+    async def resolved_profile(self, namespace: str) -> dict:
+        """T7.0: the namespace's profile merged over defaults — echoed on every
+        dict response and snapshotted into tool_events."""
+        return resolve_profile(await self._namespace_profile(namespace))
 
     async def _append(
         self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None,
@@ -521,17 +537,64 @@ class PostgresBackend(StorageBackend):
                                    + ["origin_detail_suppressed_clinical"])
         return entry
 
+    async def _stale_pin_advisory(self, meta: dict, mode: str) -> tuple[dict | None, str | None]:
+        """R5 (T7.2): at claim-write time, check whether the pinned sha is already
+        behind the live branch head. Best-effort with a hard 2s budget — NEVER
+        fails or slows a write beyond that; a miss reports advisory_status
+        skipped_timeout/skipped_unresolved instead of guessing."""
+        import asyncio
+
+        repo, branch = meta.get("repo"), meta.get("branch")
+        pinned = meta.get("repo_sha")
+        if not (repo and branch and pinned) or not self.resolver.enabled:
+            return None, None
+        try:
+            async with asyncio.timeout(2):
+                head = await self.resolver.branch_head(repo, branch)
+        except (TimeoutError, asyncio.TimeoutError):
+            return None, "skipped_timeout"
+        except Exception:  # noqa: BLE001 - best-effort advisory, never blocks a write
+            return None, "skipped_unresolved"
+        if head is None:
+            return None, "skipped_unresolved"
+        if sha_match(pinned, head):
+            return None, "ok"
+        advisory: dict[str, Any] = {
+            "name": "stale_pin", "will_resolve_stale": True,
+            "pinned_sha": pinned, "branch_head": head,
+        }
+        if mode == "full":
+            advisory["remediation"] = (
+                f"the pinned repo_sha {pinned} is behind {branch}'s live head {head[:12]} — "
+                "this claim will reconcile stale. To record a historical fact, move the "
+                "sha into the value and pin the live head instead."
+            )
+        return advisory, "computed"
+
     @_retry_if_idempotent
     async def memory_save(
         self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None, meta=None,
         actor="unattributed", origin="unknown", origin_detail=None,
         origin_model_id=None, origin_model_family=None, derived_from=None,
     ) -> dict:
-        return await self._append(
+        entry = await self._append(
             namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta, actor=actor,
             origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
             origin_model_family=origin_model_family, derived_from=derived_from,
         )
+        # R5 advisory arm (per-namespace): claims that pin external mutable
+        # state get a write-time freshness check. Control arm ('off') skips
+        # the lookup entirely.
+        if kind == "claim" and isinstance(meta, dict) and not entry.get("deduplicated"):
+            profile = resolve_profile(await self._namespace_profile(namespace))
+            mode = profile["advisory_mode"]
+            if mode in ("full", "minimal"):
+                advisory, status = await self._stale_pin_advisory(meta, mode)
+                if status is not None:
+                    entry["advisory_status"] = status
+                if advisory is not None:
+                    entry["advisories"] = list(entry.get("advisories") or []) + [advisory]
+        return entry
 
     @_retry_on_disconnect
     async def memory_get(self, namespace, key) -> dict | None:

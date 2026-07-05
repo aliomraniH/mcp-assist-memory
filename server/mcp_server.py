@@ -30,9 +30,11 @@ from typing import Any
 import structlog
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware
 
 from config import settings
 from errors import AppError
+from errors.suggest import did_you_mean
 from storage.base import StorageBackend
 from storage.versioning import stamp
 
@@ -53,6 +55,18 @@ def _backend() -> StorageBackend:
     return deps.backend
 
 
+async def _profile_for(namespace) -> dict | None:
+    """Resolved variant profile for a namespace — best-effort: a profile lookup
+    failure must never affect a tool call (control defaults apply)."""
+    if not namespace or deps.backend is None:
+        return None
+    try:
+        return await deps.backend.resolved_profile(namespace)
+    except Exception:  # noqa: BLE001 - best-effort observability plumbing
+        from storage.profiles import DEFAULT_PROFILE
+        return dict(DEFAULT_PROFILE)
+
+
 def instrument(fn):
     """Telemetry + version stamping for every tool (Phase 1).
 
@@ -70,10 +84,15 @@ def instrument(fn):
         start = time.monotonic()
         call_args = dict(sig.bind_partial(*args, **kwargs).arguments)
         outcome, error_code, remedy_emitted, result = "ok", None, False, None
+        profile = await _profile_for(call_args.get("namespace"))
         try:
             result = await fn(*args, **kwargs)
             if isinstance(result, dict):
                 result = stamp(result)
+                # T7.0: every dict response echoes the namespace's variant
+                # profile — self-describing transcripts.
+                if profile is not None:
+                    result.setdefault("variant_profile", profile)
             return result
         except AppError as exc:
             # T2.5: execution failures surface as the standardized machine-
@@ -81,8 +100,16 @@ def instrument(fn):
             # JSON-RPC protocol error), so the model sees it and can recover.
             outcome = "error"
             error_code = exc.code
-            remedy_emitted = exc.remedy is not None
-            raise ToolError(json.dumps(exc.payload)) from exc
+            payload = exc.payload
+            # T7.4 (R9): the remedy field is variant-controlled — the raise
+            # site always supplies it, the tool layer strips it when the
+            # namespace's arm says off, so its effect is measurable.
+            if profile is not None and profile.get("remedy_errors") == "off":
+                payload = {"error": {**payload["error"], "remedy": None}}
+            if profile is not None:
+                payload["error"]["variant_profile"] = profile
+            remedy_emitted = payload["error"].get("remedy") is not None
+            raise ToolError(json.dumps(payload)) from exc
         except Exception as exc:
             outcome = "error"
             error_code = type(exc).__name__
@@ -438,3 +465,69 @@ async def coord_curate(namespace: str, session_id: str, dry_run: bool = False) -
 async def stats() -> dict:
     """Return store-wide counts (memory revisions/keys, sessions, events, artifacts, bytes)."""
     return await _backend().stats()
+
+
+# ---------------------------------------------------- R6 arg strictness (T7.3)
+# FastMCP rejects unknown arguments at schema validation with a raw pydantic
+# message — that IS the control arm. The hint/plain arms intercept the call
+# BEFORE validation and answer with the standardized unknown_arg payload
+# (did-you-mean for hint). Every interception is telemetered as
+# unknown_arg_rejected so one-turn recovery finally has a denominator.
+_TOOL_PARAMS: dict[str, set[str]] = {
+    fn.__name__: set(inspect.signature(fn).parameters)
+    for fn in (
+        memory_save, memory_get, memory_list, memory_history, memory_delete,
+        memory_search, handoff_save, handoff_load, handoff_list,
+        session_create, session_append_event, session_get, session_list,
+        session_events, artifact_put, artifact_get, artifact_list,
+        coord_health, coord_drift_scan, coord_reconcile, coord_curate, stats,
+    )
+}
+
+
+class ArgStrictnessMiddleware(Middleware):
+    async def on_call_tool(self, context, call_next):
+        params = _TOOL_PARAMS.get(context.message.name)
+        arguments = context.message.arguments or {}
+        unknown = sorted(set(arguments) - params) if params is not None else []
+        if unknown:
+            namespace = arguments.get("namespace")
+            profile = await _profile_for(namespace)
+            strictness = (profile or {}).get("arg_strictness", "control")
+            outcome = "unknown_arg_rejected"
+            if strictness in ("hint", "plain"):
+                if strictness == "hint":
+                    message = "; ".join(
+                        did_you_mean(u, sorted(_TOOL_PARAMS[context.message.name]))
+                        for u in unknown)
+                else:
+                    message = f"unknown argument(s): {', '.join(unknown)}"
+                exc = AppError("unknown_arg", message)
+                payload = exc.payload
+                if profile is not None:
+                    if profile.get("remedy_errors") == "off":
+                        payload = {"error": {**payload["error"], "remedy": None}}
+                    payload["error"]["variant_profile"] = profile
+                await _record_unknown_arg(context.message.name, arguments, outcome,
+                                          payload["error"].get("remedy") is not None)
+                raise ToolError(json.dumps(payload))
+            # control: let the framework's own rejection surface unchanged,
+            # but count it — the silent-failure rate finally has a number.
+            await _record_unknown_arg(context.message.name, arguments, outcome, False)
+        return await call_next(context)
+
+
+async def _record_unknown_arg(tool: str, arguments: dict, outcome: str, remedy: bool) -> None:
+    backend = deps.backend
+    if backend is None:
+        return
+    try:
+        await backend.record_tool_event(
+            tool=tool, args=arguments, result=None, outcome=outcome,
+            error_code="unknown_arg", remedy_emitted=remedy,
+        )
+    except Exception as exc:  # noqa: BLE001 - observability only
+        log.warning("unknown_arg_record_failed", tool=tool, error=str(exc))
+
+
+mcp.add_middleware(ArgStrictnessMiddleware())

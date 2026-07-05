@@ -148,3 +148,12 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     async def health(self) -> bool: ...
+
+    # ---------------- shared spine (Phases 1/7) — concrete defaults ----------------
+    # Non-abstract so alternate backends aren't forced to implement telemetry or
+    # variant profiles; the tool layer treats both as best-effort.
+    async def record_tool_event(self, **kwargs) -> None:  # pragma: no cover - default no-op
+        return None
+
+    async def resolved_profile(self, namespace: str) -> dict:  # pragma: no cover - default
+        return {}

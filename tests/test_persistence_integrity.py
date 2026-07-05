@@ -171,6 +171,7 @@ def test_no_swallow_and_continue_in_write_paths():
     swallows = list(re.finditer(r"except [^\n]+:\s*\n\s+pass\b", src))
     swallows += list(re.finditer(r"except Exception[^\n]*\n", src))
     for m in swallows:
-        window = src[max(0, m.start() - 600): m.start()].lower()
+        # documented either in the preceding context or on the handler line itself
+        window = src[max(0, m.start() - 600): m.end()].lower()
         assert "best-effort" in window or "best effort" in window, (
             "undocumented swallow handler near: " + src[m.start(): m.start() + 80])
