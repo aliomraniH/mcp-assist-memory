@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     # so the signal stays legible on a low-traffic server).
     default_claim_staleness_hours: int = 72
 
+    # --- namespace ACL (Phase 9, design doc: docs/namespace-isolation.md) ---
+    # Optional JSON mapping token -> list of allowed namespace PREFIXES, e.g.
+    # {"tok-web": ["proj-canvas", "dev/"], "tok-cli": ["dev/"]}. When set,
+    # namespace-scoped tool calls with a token whose allowlist doesn't cover the
+    # namespace fail closed with the standard acl_denied payload. Unset ⇒
+    # behavior unchanged (no ACL). Not full multi-tenancy — see the design doc.
+    token_namespace_acl: str | None = None
+
     # --- coordination reconciler (Phase 3): only active when github_token is set ---
     # A READ-ONLY GitHub token lets the backend resolve a claim's truth (is PR #N
     # merged? what is branch X's head?) off the agent's critical path. Without it

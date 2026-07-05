@@ -575,3 +575,62 @@ async def _record_unknown_arg(tool: str, arguments: dict, outcome: str, remedy: 
 
 
 mcp.add_middleware(ArgStrictnessMiddleware())
+
+
+# ------------------------------------------------- namespace ACL (Phase 9)
+# Minimal implementation of docs/namespace-isolation.md: an optional JSON map
+# token -> [namespace prefixes]. Unconfigured ⇒ inert (behavior unchanged).
+# Configured ⇒ namespace-scoped calls outside the caller's allowlist fail
+# closed with the standard acl_denied payload. Full multi-tenancy (per-token
+# read/write split, artifact scoping) is deliberately out of this pass.
+@functools.lru_cache(maxsize=1)
+def _parse_acl(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        acl = json.loads(raw)
+        return acl if isinstance(acl, dict) else None
+    except ValueError:
+        log.warning("token_namespace_acl_invalid_json")
+        return None
+
+
+def _request_token() -> str | None:
+    """Bearer token of the current HTTP request (None outside HTTP transport)."""
+    try:
+        from fastmcp.server.dependencies import get_http_request
+
+        request = get_http_request()
+    except Exception:  # noqa: BLE001 - not in an HTTP request context
+        return None
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[len("Bearer "):]
+    from urllib.parse import parse_qs
+
+    tokens = parse_qs(request.url.query).get("token", [])
+    return tokens[0] if tokens else None
+
+
+class NamespaceACLMiddleware(Middleware):
+    async def on_call_tool(self, context, call_next):
+        acl = _parse_acl(settings.token_namespace_acl)
+        if acl is None:
+            return await call_next(context)
+        namespace = (context.message.arguments or {}).get("namespace")
+        if namespace is None:
+            return await call_next(context)  # global tools: out of this pass
+        allowed = acl.get(_request_token() or "")
+        if not allowed or not any(str(namespace).startswith(p) for p in allowed):
+            exc = AppError(
+                "acl_denied",
+                f"this token's TOKEN_NAMESPACE_ACL does not allow namespace "
+                f"{namespace!r}",
+            )
+            payload = exc.payload
+            payload["error"]["feedback"] = FEEDBACK_NUDGE
+            raise ToolError(json.dumps(payload))
+        return await call_next(context)
+
+
+mcp.add_middleware(NamespaceACLMiddleware())

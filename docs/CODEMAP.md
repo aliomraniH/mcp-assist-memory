@@ -7,7 +7,7 @@ symbol names, which are stable).
 ## Tool registration
 
 * `server/mcp_server.py:46` — the single `FastMCP(name="assist-memory")` instance.
-* `server/mcp_server.py:50-265` — all `@mcp.tool` registrations (22 tools), thin
+* `server/mcp_server.py:50-265` — all `@mcp.tool` registrations (23 tools after Phase 8), thin
   relays into the injected `StorageBackend`.
 * `app.py:94` — `mcp.http_app(path="/", stateless_http=True)` builds the ASGI app;
   `app.py:173` mounts it at `/mcp`; `app.py:122` injects the backend on `deps`
@@ -101,3 +101,26 @@ symbol names, which are stable).
 * Resolver — `storage/reconcile.py:129` (`build_resolver`); disabled ⇒
   `unverifiable`, never silently `current`.
 * Curator — `storage/curator.py:133` (`build_curator`); disabled ⇒ clean no-op.
+
+---
+
+## Post-program addendum (Phases 1–9 landed)
+
+The Phase 0 sections above describe the PRE-program state and are kept as the
+audit trail. What moved:
+
+* Trust spine modules: `storage/redact.py` (PHI gate), `storage/telemetry.py`
+  (tool_events rows), `storage/versioning.py` (stamps), `storage/screening.py`
+  (write-time screen), `storage/profiles.py` (variant profiles),
+  `errors/catalog.py` + `errors/suggest.py` (standardized payloads,
+  did-you-mean).
+* `server/mcp_server.py` now wraps every tool in `instrument` (telemetry +
+  stamps + AppError→ToolError) and registers two middlewares:
+  `ArgStrictnessMiddleware` (R6) and `NamespaceACLMiddleware` (Phase 9).
+* `_append` (storage/postgres.py) gained: (namespace, actor, event_id) dedup,
+  screening/quarantine, provenance columns, and the T2.3 read-back
+  verification through `memory_history` before any success ack.
+* `coord_health` reports `quarantined_count`, `tainted_lineage`,
+  `needs_reverification`, `skepticism` in addition to the original three.
+* Migration `0006_trust_spine.sql` bundles all Phase 1–6 schema changes
+  (rule 6) — one migration, one schema_version bump (6).
