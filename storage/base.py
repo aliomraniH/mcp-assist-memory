@@ -43,9 +43,16 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     async def memory_list(
-        self, namespace: str, *, kind: str | None = None, tag: str | None = None, limit: int = 100,
-        include_quarantined: bool = False,
+        self, namespace: str, *, kind: str | None = None, tag: str | None = None,
+        prefix: str | None = None, limit: int = 100, include_quarantined: bool = False,
     ) -> list[dict]: ...
+
+    @abc.abstractmethod
+    async def memory_list_page(
+        self, namespace: str, *, kind: str | None = None, tag: str | None = None,
+        prefix: str | None = None, limit: int = 100, cursor: str | None = None,
+        include_quarantined: bool = False,
+    ) -> dict: ...
 
     @abc.abstractmethod
     async def memory_history(self, namespace: str, key: str, *, limit: int = 50) -> list[dict]: ...

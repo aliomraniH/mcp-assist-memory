@@ -13,6 +13,7 @@ shared global handoff space). Artifacts are content-addressed and global.
 """
 from __future__ import annotations
 
+import base64
 import functools
 import hashlib
 import json
@@ -498,9 +499,17 @@ class PostgresBackend(StorageBackend):
         return _row_to_entry(row)
 
     @_retry_on_disconnect
-    async def memory_list(
-        self, namespace, *, kind=None, tag=None, limit=100, include_quarantined=False,
-    ) -> list[dict]:
+    async def memory_list_page(
+        self, namespace, *, kind=None, tag=None, prefix=None, limit=100,
+        cursor=None, include_quarantined=False,
+    ) -> dict:
+        """T4.1: key-ordered page of the latest live entry per key.
+
+        ``prefix`` compiles to an index-friendly ``LIKE 'prefix%'`` with the
+        caller's ``%``/``_`` escaped — prefix means PREFIX, never a pattern.
+        ``cursor`` is the opaque continuation token from the previous page;
+        the response carries ``truncated`` + ``next_cursor``.
+        """
         clauses = ["namespace = %s"]
         params: list[Any] = [namespace]
         if kind:
@@ -509,6 +518,23 @@ class PostgresBackend(StorageBackend):
         if tag:
             clauses.append("%s = ANY(tags)")
             params.append(tag)
+        if prefix:
+            escaped = (prefix.replace("\\", "\\\\")
+                             .replace("%", "\\%")
+                             .replace("_", "\\_"))
+            clauses.append("key LIKE %s")
+            params.append(escaped + "%")
+        if cursor:
+            try:
+                after_key = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise AppError(
+                    "invalid_cursor",
+                    "cursor is not a token returned by a previous memory_list page",
+                    remedy="pass the next_cursor value from the previous response, unmodified",
+                ) from exc
+            clauses.append("key > %s")
+            params.append(after_key)
         where = " AND ".join(clauses)
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -528,7 +554,22 @@ class PostgresBackend(StorageBackend):
             _row_to_entry(r) for r in rows
             if _is_live(r) and (include_quarantined or not r.get("quarantined"))
         ]
-        return live[:limit]
+        page = live[:limit]
+        truncated = len(live) > limit
+        next_cursor = (
+            base64.urlsafe_b64encode(page[-1]["key"].encode("utf-8")).decode("ascii")
+            if truncated and page else None
+        )
+        return {"entries": page, "truncated": truncated, "next_cursor": next_cursor}
+
+    async def memory_list(
+        self, namespace, *, kind=None, tag=None, prefix=None, limit=100, include_quarantined=False,
+    ) -> list[dict]:
+        page = await self.memory_list_page(
+            namespace, kind=kind, tag=tag, prefix=prefix, limit=limit,
+            include_quarantined=include_quarantined,
+        )
+        return page["entries"]
 
     @_retry_on_disconnect
     async def memory_history(self, namespace, key, *, limit=50) -> list[dict]:

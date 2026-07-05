@@ -40,6 +40,9 @@ CATALOG: dict[str, tuple[str, bool]] = {
     "artifact_too_large": (
         "store large objects in object storage and reference the sha256 "
         "instead of inlining the bytes", False),
+    "invalid_cursor": (
+        "pass the next_cursor value from the previous memory_list response, "
+        "unmodified", False),
     "session_not_found": (
         "no session with that session_id exists in this namespace — call "
         "session_create first, and check you passed the right namespace", False),

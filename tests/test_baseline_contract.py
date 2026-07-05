@@ -14,6 +14,10 @@ Flip ledger (append an entry when a phase flips a pin):
     test_baseline_raw_error_shapes → standardized AppError payload (T2.5).
   * Phase 3 — test_baseline_forged_markers_are_stripped → visible one-way
     escape (T3.3), never silently stripped, never unescaped on read.
+  * Phase 4 — test_baseline_memory_list_bare_list_no_prefix → backend gains
+    prefix filtering + a memory_list_page envelope (T4.1); the TOOL now returns
+    {entries, truncated, next_cursor} while the backend bare-list shape stays
+    for internal callers.
 """
 from __future__ import annotations
 
@@ -83,14 +87,16 @@ def test_baseline_forged_markers_are_stripped():
 
 
 async def test_baseline_memory_list_bare_list_no_prefix(backend, ns):
-    """BASELINE: memory_list returns a bare list, and there is no prefix filter
-    or pagination cursor. Flip target: Phase 4 (T4.1) — tool-layer envelope;
-    the backend list shape for internal callers stays a list."""
+    """FLIPPED in Phase 4 (T4.1): the backend supports prefix filtering and a
+    paginated envelope (memory_list_page); backend memory_list stays a bare
+    list for internal callers, the TOOL returns the envelope."""
     await backend.memory_save(ns, "run/T02/a", {"v": 1})
     out = await backend.memory_list(ns)
     assert isinstance(out, list) and out[0]["key"] == "run/T02/a"
-    with pytest.raises(TypeError):
-        await backend.memory_list(ns, prefix="run/")
+    filtered = await backend.memory_list(ns, prefix="run/")
+    assert [e["key"] for e in filtered] == ["run/T02/a"]
+    page = await backend.memory_list_page(ns, limit=10)
+    assert set(page) == {"entries", "truncated", "next_cursor"}
 
 
 async def test_baseline_lenient_non_dict_meta(backend, ns):

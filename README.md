@@ -17,9 +17,15 @@ namespace *values*, never in tool names, tables, columns, or code.
   connection losses (Neon scale-down / PgBouncer recycle, SQLSTATE `57P01`/`08xxx`)
   on a fresh pooled connection, and validates connections at checkout, so callers
   no longer have to retry. Retries are idempotency-gated, so they never double-write.
-- **Prompt-injection hardening** — values are sanitized on write and returned wrapped
-  in `<<<UNTRUSTED_DATA>>>` markers; `storage.sanitize.unwrap_value` recovers the raw
-  value when a consumer needs it (e.g. to `json.loads`).
+- **Prompt-injection resistance layer** — values are sanitized on write (forged
+  markers are escaped one-way to `[[UNTRUSTED_DATA]]`, never reconstructed on read),
+  instruction-shaped writes are screened and quarantined (visible in the write ack;
+  `include_quarantined: true` opts reads back in), and reads come back wrapped in
+  `<<<UNTRUSTED_DATA>>>` markers; `storage.sanitize.unwrap_value` recovers the raw
+  value when a consumer needs it (e.g. to `json.loads`). Honest framing: these are
+  layers, not proofs — deterministic screens and wrappers are bypassable by an
+  adaptive attacker; adversarial evaluation is pending (see Phase 10 backlog in
+  `DECISION-PROTOCOL.md`).
 - **Content-addressed artifacts** (sha256, global dedup), 50 MB cap, ranged reads.
 - **Per-surface rotatable tokens** (web vs. desktop-cli) managed from a password-gated `/admin` dashboard.
 
