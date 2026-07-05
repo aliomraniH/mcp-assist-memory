@@ -63,12 +63,17 @@ async def test_phi_gate_no_raw_values_in_tool_events(tools, backend, ns):
 
 
 async def test_error_call_records_error_outcome_and_reraises(tools, backend, ns):
-    with pytest.raises(ValueError):
+    # Phase 2 (T2.5): the tool layer surfaces AppError as a ToolError carrying
+    # the standardized payload; telemetry records the machine code + remedy flag.
+    from fastmcp.exceptions import ToolError
+
+    with pytest.raises(ToolError):
         await mcp_server.session_append_event(
             namespace=ns, session_id=str(uuid.uuid4()), kind="note", payload={"x": 1})
     ev = (await _events(backend, ns))[0]
     assert ev["outcome"] == "error"
-    assert ev["error_code"] == "ValueError"
+    assert ev["error_code"] == "session_not_found"
+    assert ev["remedy_emitted"] is True
 
 
 async def test_version_stamps_persisted_on_revision(backend, ns):

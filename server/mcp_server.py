@@ -22,14 +22,17 @@ from __future__ import annotations
 import base64
 import functools
 import inspect
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import structlog
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 from config import settings
+from errors import AppError
 from storage.base import StorageBackend
 from storage.versioning import stamp
 
@@ -72,14 +75,17 @@ def instrument(fn):
             if isinstance(result, dict):
                 result = stamp(result)
             return result
+        except AppError as exc:
+            # T2.5: execution failures surface as the standardized machine-
+            # parseable payload inside an MCP isError:true tool RESULT (never a
+            # JSON-RPC protocol error), so the model sees it and can recover.
+            outcome = "error"
+            error_code = exc.code
+            remedy_emitted = exc.remedy is not None
+            raise ToolError(json.dumps(exc.payload)) from exc
         except Exception as exc:
             outcome = "error"
-            # AppError (Phase 2) carries a machine code + remedy; anything else
-            # falls back to the exception class name.
-            error_code = getattr(exc, "code", None) or type(exc).__name__
-            payload = getattr(exc, "payload", None)
-            if isinstance(payload, dict):
-                remedy_emitted = bool((payload.get("error") or {}).get("remedy"))
+            error_code = type(exc).__name__
             raise
         finally:
             backend = deps.backend
@@ -113,11 +119,18 @@ async def memory_save(
     source_surface: str | None = None,
     event_id: str | None = None,
     meta: dict | None = None,
+    actor: str = "unattributed",
 ) -> dict:
     """Append a new revision of a memory entry in a project namespace.
     kind ∈ note|decision|todo|handoff|config|claim|knowledge (claim = a verifiable
     assertion about external mutable state that expires; knowledge = a durable fact).
     Pass a stable event_id (uuid) for exactly-once writes during offline reconcile.
+    event_id dedup is scoped to (namespace, actor); pass a distinct actor for each
+    independent writer — a subject under measurement and the instrument recording it
+    must never share an actor. A replayed event_id returns the original record with
+    deduplicated:true + original_created_at; a fresh write returns deduplicated:false.
+    Every ack is read-back verified (verified_persisted, revision_id, content_hash) —
+    a failed verification is an error, never a success ack.
 
     meta is an optional coordination envelope: its repo_sha/base_sha/branch/dirty/
     session_id keys are projected into indexed columns (the rest kept as-is) so a
@@ -125,7 +138,7 @@ async def memory_save(
     Best-effort — omit it and the entry stores exactly as before."""
     return await _backend().memory_save(
         namespace, key, value, kind=kind, tags=tags,
-        source_surface=source_surface, event_id=event_id, meta=meta,
+        source_surface=source_surface, event_id=event_id, meta=meta, actor=actor,
     )
 
 
@@ -156,12 +169,14 @@ async def memory_history(namespace: str, key: str, limit: int = 50) -> list[dict
 @instrument
 async def memory_delete(
     namespace: str, key: str, source_surface: str | None = None, event_id: str | None = None,
-    meta: dict | None = None,
+    meta: dict | None = None, actor: str = "unattributed",
 ) -> dict:
     """Soft-delete a key by appending a tombstone revision (history preserved).
+    event_id dedup is scoped to (namespace, actor); pass a distinct actor per
+    independent writer. Replays return deduplicated:true with the original record.
     meta optionally records the provenance of the deletion (repo_sha/session_id…)."""
     return await _backend().memory_delete(
-        namespace, key, source_surface=source_surface, event_id=event_id, meta=meta,
+        namespace, key, source_surface=source_surface, event_id=event_id, meta=meta, actor=actor,
     )
 
 
@@ -181,13 +196,16 @@ async def memory_search(namespace: str, query: str, limit: int = 20) -> list[dic
 @instrument
 async def handoff_save(
     namespace: str, key: str, value: Any, source_surface: str | None = None, event_id: str | None = None,
-    meta: dict | None = None,
+    meta: dict | None = None, actor: str = "unattributed",
 ) -> dict:
     """Save a cross-surface handoff under a shared key within a project namespace
-    (read it back with handoff_load). meta is the optional coordination envelope
-    (see memory_save)."""
+    (read it back with handoff_load). event_id dedup is scoped to (namespace, actor);
+    pass a distinct actor per independent writer. Replays return deduplicated:true;
+    every ack is read-back verified (verified_persisted). meta is the optional
+    coordination envelope (see memory_save)."""
     return await _backend().handoff_save(
         namespace, key, value, source_surface=source_surface, event_id=event_id, meta=meta,
+        actor=actor,
     )
 
 
@@ -215,9 +233,17 @@ async def session_create(namespace: str, surface: str | None = None, metadata: d
 
 @mcp.tool
 @instrument
-async def session_append_event(namespace: str, session_id: str, kind: str, payload: Any) -> dict:
-    """Append an ordered event to a session in this namespace; returns the assigned seq."""
-    return await _backend().session_append_event(namespace, session_id, kind, payload)
+async def session_append_event(
+    namespace: str, session_id: str, kind: str, payload: Any,
+    actor: str = "unattributed", event_id: str | None = None,
+) -> dict:
+    """Append an ordered event to a session in this namespace; returns the assigned seq.
+    Pass a stable event_id (uuid) for exactly-once appends; dedup is scoped to
+    (namespace, actor) — pass a distinct actor per independent writer. Replays
+    return the original event with deduplicated:true."""
+    return await _backend().session_append_event(
+        namespace, session_id, kind, payload, actor=actor, event_id=event_id,
+    )
 
 
 @mcp.tool
@@ -250,11 +276,11 @@ async def artifact_put(content_base64: str, content_type: str | None = None) -> 
     try:
         data = base64.b64decode(content_base64, validate=True)
     except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
-        raise ValueError(f"content_base64 is not valid base64: {exc}") from exc
+        raise AppError("invalid_base64", f"content_base64 is not valid base64: {exc}") from exc
     if len(data) > settings.max_artifact_bytes:
-        raise ValueError(
-            f"artifact {len(data)} bytes exceeds cap {settings.max_artifact_bytes}; "
-            "store large objects in object storage and reference the sha256"
+        raise AppError(
+            "artifact_too_large",
+            f"artifact {len(data)} bytes exceeds cap {settings.max_artifact_bytes}",
         )
     return await _backend().artifact_put(data, content_type=content_type)
 

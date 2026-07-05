@@ -7,61 +7,70 @@ circumstance means an accidental behavior change — that is the point of the fi
 
 Flip ledger (append an entry when a phase flips a pin):
   * Phase 1 — test_baseline_unverified_ack: persisted revisions and their entry
-    dicts now carry server_version/schema_version (rule 3); the ack remains
-    UNVERIFIED (no verified_persisted / revision_id) until Phase 2.
+    dicts now carry server_version/schema_version (rule 3).
+  * Phase 2 — test_baseline_silent_dedup → visible dedup (T2.2);
+    test_baseline_global_dedup_scope → (namespace, actor, event_id) scope (T2.1);
+    test_baseline_unverified_ack → read-back-verified acks (T2.3);
+    test_baseline_raw_error_shapes → standardized AppError payload (T2.5).
 """
 from __future__ import annotations
 
 import uuid
 
 import pytest
-from psycopg import errors as pg_errors
 
+from errors import AppError
 from storage.sanitize import sanitize
 
 
 async def test_baseline_silent_dedup(backend, ns):
-    """BASELINE: a replayed event_id is a silent no-op — the response is
-    indistinguishable from a fresh write (no `deduplicated` marker, no
-    original_created_at). Flip target: Phase 2 (T2.2)."""
+    """FLIPPED in Phase 2 (T2.2): a replayed event_id returns the canonical
+    original record, visibly marked deduplicated:true + original_created_at;
+    a fresh write says deduplicated:false."""
     eid = str(uuid.uuid4())
     first = await backend.memory_save(ns, "k", {"v": 1}, event_id=eid)
+    assert first["deduplicated"] is False
     replay = await backend.memory_save(ns, "k", {"v": 2}, event_id=eid)
     assert replay["revision"] == first["revision"]
-    assert "deduplicated" not in replay
-    assert "original_created_at" not in replay
+    assert replay["content_hash"] == first["content_hash"]  # canonical original, not {"v": 2}
+    assert replay["deduplicated"] is True
+    assert replay["original_created_at"] == first["created_at"]
 
 
 async def test_baseline_global_dedup_scope(backend, ns):
-    """BASELINE: event_id dedup is GLOBAL — two independent writers sharing an
-    event_id silently collapse to one write (the measured phantom-write defect).
-    Flip target: Phase 2 (T2.1) scopes dedup to (namespace, actor, event_id)."""
+    """FLIPPED in Phase 2 (T2.1): dedup is scoped to (namespace, actor, event_id) —
+    two independent writers sharing an event_id both persist."""
     eid = str(uuid.uuid4())
-    await backend.memory_save(ns, "writer-a", {"v": "a"}, event_id=eid)
-    other = await backend.memory_save(f"{ns}-other", "writer-b", {"v": "b"}, event_id=eid)
-    # the second, unrelated write is swallowed: the first namespace's row comes back
-    assert other["namespace"] == ns and other["key"] == "writer-a"
+    a = await backend.memory_save(ns, "writer-a", {"v": "a"}, event_id=eid, actor="agent-a")
+    b = await backend.memory_save(f"{ns}-other", "writer-b", {"v": "b"}, event_id=eid, actor="agent-b")
+    assert a["key"] == "writer-a" and a["deduplicated"] is False
+    assert b["key"] == "writer-b" and b["deduplicated"] is False
 
 
 async def test_baseline_unverified_ack(backend, ns):
-    """BASELINE (part-flipped in Phase 1): revisions are version-stamped (rule 3),
-    but the save ack is still built from the in-hand RETURNING row only — no
-    public-read-path verification. Flip target for the rest: Phase 2 (T2.3)."""
+    """FLIPPED in Phase 1 (stamps) + Phase 2 (T2.3): the ack is read-back
+    verified through the public read path and carries the evidence."""
     out = await backend.memory_save(ns, "k2", {"v": 1})
-    assert "verified_persisted" not in out
-    assert "revision_id" not in out
-    assert out["schema_version"] == 6      # flipped: Phase 1 (rule 3)
-    assert out["server_version"]           # flipped: Phase 1 (rule 3)
+    assert out["verified_persisted"] is True
+    assert out["revision_id"]
+    assert out["content_hash"]
+    assert out["readback_latency_ms"] >= 0
+    assert out["schema_version"] == 6
+    assert out["server_version"]
 
 
 async def test_baseline_raw_error_shapes(backend, ns):
-    """BASELINE: execution failures surface as raw exceptions (ValueError text,
-    raw psycopg CheckViolation) with no machine-parseable {code, remedy,
-    retryable} payload. Flip target: Phase 2 (T2.5)."""
-    with pytest.raises(ValueError, match="session not found"):
+    """FLIPPED in Phase 2 (T2.5): execution failures carry the standardized
+    machine-parseable payload {code, message, remedy, retryable}."""
+    with pytest.raises(AppError) as exc:
         await backend.session_append_event(ns, str(uuid.uuid4()), "note", {"x": 1})
-    with pytest.raises(pg_errors.CheckViolation):
+    err = exc.value.payload["error"]
+    assert set(err) >= {"code", "message", "remedy", "retryable"}
+    assert err["code"] == "session_not_found" and err["remedy"]
+
+    with pytest.raises(AppError) as exc:
         await backend.memory_save(ns, "bad-kind", {"v": 1}, kind="not-a-kind")
+    assert exc.value.code == "invalid_kind"
 
 
 def test_baseline_forged_markers_are_stripped():

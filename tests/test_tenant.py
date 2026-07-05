@@ -54,5 +54,9 @@ async def test_session_reads_require_owning_namespace(backend, two_projects):
     assert await backend.session_get(b, sid) is None
     assert await backend.session_events(b, sid) == []
     assert await backend.session_list(b) == []
-    with pytest.raises(ValueError):
+    # Phase 2 (T2.5) deliberate flip: the tenant guard now raises the
+    # standardized AppError("session_not_found") instead of a raw ValueError.
+    from errors import AppError
+
+    with pytest.raises(AppError):
         await backend.session_append_event(b, sid, "evil", {"n": 99})

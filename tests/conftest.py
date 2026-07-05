@@ -45,8 +45,8 @@ ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS salience   int;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS confidence real;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS valid_until timestamptz;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS hyde_embedding vector(1024);
-CREATE UNIQUE INDEX IF NOT EXISTS memory_entry_event_id_uq
-    ON memory_entry (event_id) WHERE event_id IS NOT NULL;
+-- (memory_entry_event_id_uq, the pre-0006 GLOBAL event_id unique, is gone:
+--  0006 replaces it with the (namespace, actor, event_id) scope below.)
 CREATE INDEX IF NOT EXISTS memory_entry_embedding_hnsw
     ON memory_entry USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS memory_entry_ns_repo_sha ON memory_entry (namespace, repo_sha);

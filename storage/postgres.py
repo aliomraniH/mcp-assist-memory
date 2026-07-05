@@ -16,6 +16,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -26,6 +27,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from config import settings
+from errors import AppError
 from storage.base import StorageBackend
 from storage.curator import Curator, DisabledCurator
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
@@ -191,6 +193,10 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         "salience": row.get("salience"),
         "confidence": row.get("confidence"),
         "valid_until": valid_until.isoformat() if isinstance(valid_until, datetime) else valid_until,
+        # Phase 2 (T2.1/T2.3): the writing actor and the revision's globally
+        # unique id (usable in derived_from "key@revision_id" lineage refs).
+        "actor": row.get("actor"),
+        "revision_id": row.get("id"),
         # Version stamps persisted with the revision (0006, rule 3). Null on
         # rows written before the trust-spine migration — annotate forward only.
         "server_version": row.get("server_version"),
@@ -245,6 +251,7 @@ def _event_to_dict(row: dict) -> dict:
         "kind": row["kind"],
         "payload": wrap_value(row["payload"]),
         "created_at": row["created_at"].isoformat(),
+        "actor": row.get("actor"),
     }
 
 
@@ -318,16 +325,29 @@ class PostgresBackend(StorageBackend):
         return self._safe_literal(vecs)
 
     # ----------------------------------------------------------------- memory
-    async def _seen_event(self, conn, event_id: str) -> dict | None:
+    async def _seen_event(self, conn, namespace: str, actor: str, event_id: str) -> dict | None:
+        # T2.1: dedup is scoped to (namespace, actor, event_id) — two independent
+        # writers sharing an event_id no longer collapse to one write.
         cur = await conn.execute(
-            "SELECT * FROM memory_entry WHERE event_id = %s ORDER BY revision DESC LIMIT 1",
-            (event_id,),
+            "SELECT * FROM memory_entry WHERE namespace = %s AND actor = %s AND event_id = %s "
+            "ORDER BY revision DESC LIMIT 1",
+            (namespace, actor, event_id),
         )
         return await cur.fetchone()
 
+    @staticmethod
+    def _dedup_entry(row: dict) -> dict:
+        """T2.2: a replay returns the canonical original record, visibly marked."""
+        entry = _row_to_entry(row)
+        entry["deduplicated"] = True
+        entry["original_created_at"] = entry["created_at"]
+        # The dedup check itself just read the row back from the store.
+        entry["verified_persisted"] = True
+        return entry
+
     async def _append(
         self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None,
-        *, salience=None, confidence=None, valid_until=None, embeddings=None,
+        *, actor="unattributed", salience=None, confidence=None, valid_until=None, embeddings=None,
     ) -> dict:
         # Embed BEFORE taking a pooled connection so the (network) embedding call
         # never holds a connection, and compute it once so retries don't re-embed.
@@ -345,13 +365,15 @@ class PostgresBackend(StorageBackend):
         sanitized = sanitize(value)
         # Tombstones carry no content hash (the value is a delete marker, not a fact).
         content_hash = None if tombstone else _content_hash(sanitized)
+        actor = actor or "unattributed"
+        row: dict | None = None
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
-            # Exactly-once: if this event already landed, return it unchanged.
+            # Exactly-once within (namespace, actor): a landed event replays visibly.
             if event_id:
-                existing = await self._seen_event(conn, event_id)
+                existing = await self._seen_event(conn, namespace, actor, event_id)
                 if existing is not None:
-                    return _row_to_entry(existing)
+                    return self._dedup_entry(existing)
 
             payload = Jsonb(sanitized)
             tags = tags or []
@@ -365,13 +387,13 @@ class PostgresBackend(StorageBackend):
                                 (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding,
                                  repo_sha, base_sha, branch, dirty, session_id, meta, content_hash,
                                  salience, confidence, valid_until, hyde_embedding,
-                                 server_version, schema_version)
+                                 server_version, schema_version, actor)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
                                    %s, %s, %s, %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s, %s, %s,
                                    %s, %s, %s, %s::vector,
-                                   %s, %s
+                                   %s, %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
@@ -379,29 +401,65 @@ class PostgresBackend(StorageBackend):
                              tombstone, embedding,
                              repo_sha, base_sha, branch, dirty, session_id, meta_json, content_hash,
                              salience, confidence, valid_until, hyde_embedding,
-                             SERVER_VERSION, SCHEMA_VERSION,
+                             SERVER_VERSION, SCHEMA_VERSION, actor,
                              namespace, key),
                         )
                         row = await cur.fetchone()
-                        return _row_to_entry(row)
+                    break
+                except pg_errors.CheckViolation as exc:
+                    raise AppError("invalid_kind", f"invalid kind {kind!r}") from exc
                 except pg_errors.UniqueViolation as exc:
                     last_exc = exc
                     # Either a concurrent revision collision (retry) or a racing
-                    # duplicate event_id (return the winner).
+                    # duplicate event_id (return the winner, visibly deduplicated).
                     if event_id:
                         async with self.pool.connection() as c2:
                             c2.row_factory = dict_row
-                            existing = await self._seen_event(c2, event_id)
+                            existing = await self._seen_event(c2, namespace, actor, event_id)
                             if existing is not None:
-                                return _row_to_entry(existing)
+                                return self._dedup_entry(existing)
                     continue
-            raise last_exc  # exhausted retries
+            if row is None:
+                raise AppError(
+                    "write_conflict",
+                    f"revision-collision retries exhausted for {namespace}/{key}",
+                ) from last_exc
+
+        # T2.3: read-back-verified ack. Re-read through the same public read
+        # path a stranger would use — never the in-hand RETURNING row (the
+        # phantom-ack survived precisely because the in-hand object looked
+        # fine). Any miss or hash mismatch is a standardized error result,
+        # never a success ack. readback_latency_ms is logged via telemetry;
+        # if p95 write latency becomes a problem, that's a measured
+        # conversation later, not a reason to skip verification now.
+        entry = _row_to_entry(row)
+        t0 = time.monotonic()
+        history = await self.memory_history(namespace, key)
+        readback_ms = int((time.monotonic() - t0) * 1000)
+        match = next((h for h in history if h["revision"] == entry["revision"]), None)
+        if (
+            match is None
+            or match["content_hash"] != entry["content_hash"]
+            or bool(match["tombstone"]) != bool(tombstone)
+        ):
+            raise AppError(
+                "write_verification_failed",
+                f"read-back of {namespace}/{key} revision {entry['revision']} "
+                "did not return what was written",
+            )
+        entry["verified_persisted"] = True
+        entry["readback_latency_ms"] = readback_ms
+        entry["deduplicated"] = False
+        return entry
 
     @_retry_if_idempotent
     async def memory_save(
-        self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None, meta=None
+        self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None, meta=None,
+        actor="unattributed",
     ) -> dict:
-        return await self._append(namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta)
+        return await self._append(
+            namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta, actor=actor,
+        )
 
     @_retry_on_disconnect
     async def memory_get(self, namespace, key) -> dict | None:
@@ -455,7 +513,9 @@ class PostgresBackend(StorageBackend):
         return [_row_to_entry(r) for r in rows]
 
     @_retry_if_idempotent
-    async def memory_delete(self, namespace, key, *, source_surface=None, event_id=None, meta=None) -> dict:
+    async def memory_delete(
+        self, namespace, key, *, source_surface=None, event_id=None, meta=None, actor="unattributed",
+    ) -> dict:
         # Tombstone = append a deleting revision (history is preserved). `meta`
         # lets a delete record the provenance of the deletion (who/at-what-sha).
         async with self.pool.connection() as conn:
@@ -467,7 +527,10 @@ class PostgresBackend(StorageBackend):
             )
             latest = await cur.fetchone()
         kind = latest["kind"] if latest else "note"
-        return await self._append(namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True, meta=meta)
+        return await self._append(
+            namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True,
+            meta=meta, actor=actor,
+        )
 
     @_retry_on_disconnect
     async def memory_search(self, namespace, query, *, limit=20) -> list[dict]:
@@ -703,9 +766,11 @@ class PostgresBackend(StorageBackend):
         for r in rows:
             entry = _row_to_entry(r, wrap=False)
             verdict = await reconcile_claim(entry, self.resolver)
+            # Distinct actor (T2.1): the instrument recording a verdict must
+            # never share an actor with the subject under measurement.
             await self.memory_save(
                 r["namespace"], f"{self._RECONCILE_PREFIX}{r['key']}", verdict,
-                kind="config", tags=["reconcile", verdict["state"]],
+                kind="config", tags=["reconcile", verdict["state"]], actor="reconciler",
             )
             verdicts.append(verdict)
         return verdicts
@@ -802,7 +867,7 @@ class PostgresBackend(StorageBackend):
             latest.get("source_surface"),
             _curate_event_id(namespace, session_id, key, "supersede-boundary"),
             False, meta=meta, valid_until=datetime.now(timezone.utc),
-            embeddings=(None, None),
+            embeddings=(None, None), actor="curator",
         )
 
     async def _write_curation_op(self, namespace, op, *, session_id, action) -> dict:
@@ -828,7 +893,7 @@ class PostgresBackend(StorageBackend):
             namespace, key, value, kind, tags, op.get("source_surface"),
             _curate_event_id(namespace, session_id, key, action), False, meta=meta,
             salience=_as_int(op.get("salience")), confidence=_as_float(op.get("confidence")),
-            embeddings=embeddings,
+            embeddings=embeddings, actor="curator",
         )
         return {
             "op": action, "key": key, "kind": written["kind"],
@@ -875,7 +940,9 @@ class PostgresBackend(StorageBackend):
 
     def _trace_query_text(self, events: list[dict]) -> str:
         """A compact text blob of the session trace, used only to pull `similar_memories`
-        so the curator can dedup/supersede against what's already stored."""
+        so the curator can dedup/supersede against what's already stored. Best-effort
+        read-side helper: an unserializable payload chunk is skipped (it only weakens
+        the similarity query), never a write-path swallow."""
         chunks: list[str] = []
         for e in events:
             chunks.append(str(e.get("kind") or ""))
@@ -914,8 +981,12 @@ class PostgresBackend(StorageBackend):
     # Handoffs are cross-surface (web/cli/desktop) within ONE project: stored as
     # kind='handoff' rows inside the caller's namespace, never a shared space.
     @_retry_if_idempotent
-    async def handoff_save(self, namespace, key, value, *, source_surface=None, event_id=None, meta=None) -> dict:
-        return await self._append(namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta)
+    async def handoff_save(
+        self, namespace, key, value, *, source_surface=None, event_id=None, meta=None, actor="unattributed",
+    ) -> dict:
+        return await self._append(
+            namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta, actor=actor,
+        )
 
     async def handoff_load(self, namespace, key) -> dict | None:
         return await self.memory_get(namespace, key)
@@ -938,15 +1009,29 @@ class PostgresBackend(StorageBackend):
             row = await cur.fetchone()
         return _session_to_dict(row)
 
-    @_retry_on_disconnect  # at-least-once under a mid-failover drop: a replay in the
-                           # narrow commit-ack window may append one duplicate event —
-                           # acceptable for an append-only log vs. failing the call.
-    async def session_append_event(self, namespace, session_id, kind, payload) -> dict:
+    @_retry_on_disconnect  # without an event_id: at-least-once under a mid-failover
+                           # drop (a replay in the narrow commit-ack window may append
+                           # one duplicate event). WITH an event_id (T2.1) the
+                           # (namespace, actor, event_id) unique gate makes the retry
+                           # collapse to a visible dedup — exactly-once.
+    async def session_append_event(
+        self, namespace, session_id, kind, payload, *, actor="unattributed", event_id=None,
+    ) -> dict:
+        actor = actor or "unattributed"
         last_exc: Exception | None = None
         for _ in range(_MAX_RETRIES):
             try:
                 async with self.pool.connection() as conn:
                     conn.row_factory = dict_row
+                    if event_id:
+                        cur = await conn.execute(
+                            "SELECT * FROM session_event WHERE namespace = %s AND actor = %s "
+                            "AND event_id = %s",
+                            (namespace, actor, event_id),
+                        )
+                        existing = await cur.fetchone()
+                        if existing is not None:
+                            return {**_event_to_dict(existing), "deduplicated": True}
                     async with conn.transaction():
                         # Tenant guard: the session must exist under this namespace.
                         cur = await conn.execute(
@@ -954,22 +1039,30 @@ class PostgresBackend(StorageBackend):
                             (session_id, namespace),
                         )
                         if await cur.fetchone() is None:
-                            raise ValueError("session not found in namespace")
+                            raise AppError(
+                                "session_not_found",
+                                f"session {session_id} not found in namespace {namespace}",
+                            )
                         cur = await conn.execute(
                             """
-                            INSERT INTO session_event (session_id, namespace, seq, kind, payload)
-                            SELECT %s, %s, COALESCE(MAX(seq), 0) + 1, %s, %s
+                            INSERT INTO session_event (session_id, namespace, seq, kind, payload, actor, event_id)
+                            SELECT %s, %s, COALESCE(MAX(seq), 0) + 1, %s, %s, %s, %s
                             FROM session_event WHERE session_id = %s
                             RETURNING *
                             """,
-                            (session_id, namespace, kind, Jsonb(sanitize(payload)), session_id),
+                            (session_id, namespace, kind, Jsonb(sanitize(payload)),
+                             actor, event_id, session_id),
                         )
                         row = await cur.fetchone()
-                return _event_to_dict(row)
+                return {**_event_to_dict(row), "deduplicated": False}
             except pg_errors.UniqueViolation as exc:
+                # Either a seq collision (retry) or a racing duplicate event_id —
+                # the next iteration's dedup check returns the winner.
                 last_exc = exc
                 continue
-        raise last_exc
+        raise AppError(
+            "write_conflict", f"seq-collision retries exhausted for session {session_id}",
+        ) from last_exc
 
     @_retry_on_disconnect
     async def session_get(self, namespace, session_id) -> dict | None:
@@ -1025,7 +1118,27 @@ class PostgresBackend(StorageBackend):
                 (sha, data, size, content_type),
             )
             inserted = await cur.fetchone()
-        return {"sha256": sha, "size": size, "content_type": content_type, "deduped": inserted is None}
+
+        # T2.3: read the bytes back through the public read path and re-hash.
+        # Full-blob re-read doubles write IO up to the 50MB cap — measured
+        # honesty over speed; readback_latency_ms makes the cost visible.
+        t0 = time.monotonic()
+        meta = await self.artifact_get(sha)
+        stored = await self.artifact_read_range(sha, 0, size) if meta else None
+        if (
+            meta is None or meta["size"] != size
+            or stored is None or hashlib.sha256(stored).hexdigest() != sha
+        ):
+            raise AppError(
+                "write_verification_failed",
+                f"artifact {sha} read-back did not match the written bytes",
+            )
+        return {
+            "sha256": sha, "size": size, "content_type": content_type,
+            "deduped": inserted is None, "verified_persisted": True,
+            "content_hash": sha,
+            "readback_latency_ms": int((time.monotonic() - t0) * 1000),
+        }
 
     @_retry_on_disconnect
     async def artifact_get(self, sha256) -> dict | None:

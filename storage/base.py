@@ -35,6 +35,7 @@ class StorageBackend(abc.ABC):
         source_surface: str | None = None,
         event_id: str | None = None,
         meta: dict | None = None,
+        actor: str = "unattributed",
     ) -> dict: ...
 
     @abc.abstractmethod
@@ -51,7 +52,7 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     async def memory_delete(
         self, namespace: str, key: str, *, source_surface: str | None = None, event_id: str | None = None,
-        meta: dict | None = None,
+        meta: dict | None = None, actor: str = "unattributed",
     ) -> dict: ...
 
     @abc.abstractmethod
@@ -63,7 +64,7 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     async def handoff_save(
         self, namespace: str, key: str, value: Any, *, source_surface: str | None = None, event_id: str | None = None,
-        meta: dict | None = None,
+        meta: dict | None = None, actor: str = "unattributed",
     ) -> dict: ...
 
     @abc.abstractmethod
@@ -80,7 +81,8 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     async def session_append_event(
-        self, namespace: str, session_id: str, kind: str, payload: Any
+        self, namespace: str, session_id: str, kind: str, payload: Any,
+        *, actor: str = "unattributed", event_id: str | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod
