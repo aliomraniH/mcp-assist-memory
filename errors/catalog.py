@@ -64,10 +64,24 @@ CATALOG: dict[str, tuple[str, bool]] = {
         "this token's TOKEN_NAMESPACE_ACL does not allow that namespace — use "
         "a namespace within your allowlist or ask the operator to extend the "
         "ACL", False),
+    "observations_disabled": (
+        "observation_log is disabled in clinical=true namespaces (free-text "
+        "channel, PHI gate) — log the observation in a non-clinical namespace",
+        False),
+    "invalid_observation": (
+        "category must be one of ergonomics|error_recovery|advisory|screening|"
+        "docs_gap|surprise|suggestion and severity one of blocker|friction|note",
+        False),
     "curator_family_conflict": (
         "CURATOR_FAMILY_MUST_DIFFER_FROM forbids same-family curation of "
         "these entries — configure a curator from a different model family", False),
 }
+
+
+# T8.2: elicitation without nagging — the nudge lives exactly where friction is
+# fresh (error payloads, advisories, quarantine verdicts), never in every tool
+# description (bloat has its own unmeasured cost; Phase 10 backlog).
+FEEDBACK_NUDGE = "surprised by this? observation_log it (optional)"
 
 
 class AppError(Exception):

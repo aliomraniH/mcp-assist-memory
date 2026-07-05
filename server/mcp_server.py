@@ -1,4 +1,4 @@
-"""FastMCP instance and the 22 tools.
+"""FastMCP instance and the 23 tools.
 
 The tools are thin: they validate/relay to the injected ``StorageBackend``.
 The backend is set on ``deps`` during the FastAPI lifespan (one pool, injected),
@@ -9,12 +9,13 @@ project == tenant) and the backend filters every query on it — there are no
 implicit cross-project reads. Artifacts are content-addressed and global, and
 ``coord_drift_scan``/``stats`` are deliberately store-wide coordination/admin views.
 
-Tool surface (22):
+Tool surface (23):
   memory:   memory_save, memory_get, memory_list, memory_history, memory_delete, memory_search
   handoff:  handoff_save, handoff_load, handoff_list
   session:  session_create, session_append_event, session_get, session_list, session_events
   artifact: artifact_put, artifact_get, artifact_list
   coord:    coord_health, coord_drift_scan, coord_reconcile, coord_curate
+  feedback: observation_log
   admin:    stats
 """
 from __future__ import annotations
@@ -34,6 +35,7 @@ from fastmcp.server.middleware import Middleware
 
 from config import settings
 from errors import AppError
+from errors.catalog import FEEDBACK_NUDGE
 from errors.suggest import did_you_mean
 from storage.base import StorageBackend
 from storage.versioning import stamp
@@ -108,6 +110,7 @@ def instrument(fn):
                 payload = {"error": {**payload["error"], "remedy": None}}
             if profile is not None:
                 payload["error"]["variant_profile"] = profile
+            payload["error"]["feedback"] = FEEDBACK_NUDGE  # T8.2
             remedy_emitted = payload["error"].get("remedy") is not None
             raise ToolError(json.dumps(payload)) from exc
         except Exception as exc:
@@ -131,7 +134,16 @@ def instrument(fn):
     return wrapper
 
 
-mcp: FastMCP = FastMCP(name="assist-memory")
+mcp: FastMCP = FastMCP(
+    name="assist-memory",
+    instructions=(
+        "Shared memory / coordination spine. Write acks are read-back verified; "
+        "event_id dedup is scoped to (namespace, actor). If a tool ever surprises "
+        "you — an error, an advisory, a quarantine verdict, missing docs — call "
+        "observation_log (optional, small, never patient data): it is the feedback "
+        "channel this server's ergonomics decisions are made from."
+    ),
+)
 
 
 # ------------------------------------------------------------------ memory
@@ -459,6 +471,37 @@ async def coord_curate(namespace: str, session_id: str, dry_run: bool = False) -
     return await _backend().coord_curate(namespace, session_id, dry_run=dry_run)
 
 
+# ------------------------------------------------------------- observations
+@mcp.tool
+@instrument
+async def observation_log(
+    namespace: str,
+    category: str,
+    severity: str = "note",
+    tool_ref: str | None = None,
+    expected: str | None = None,
+    actual: str | None = None,
+    suggestion: str | None = None,
+    session_id: str | None = None,
+    actor: str = "unattributed",
+) -> dict:
+    """Log a qualitative observation about THIS server's ergonomics — the feedback
+    channel its design decisions are made from. category ∈ ergonomics |
+    error_recovery | advisory | screening | docs_gap | surprise | suggestion;
+    severity ∈ blocker | friction | note. Say what you expected vs what actually
+    happened; suggestion is optional. The server auto-attaches namespace,
+    session_id, variant_profile, the namespace's last error code, and the last
+    quarantine verdict. Observations are stored append-only under
+    _meta/observations (read back with memory_history), which is excluded from
+    normal lists and coord scans. Never include patient data or secrets —
+    disabled entirely in clinical namespaces."""
+    return await _backend().observation_log(
+        namespace, category=category, severity=severity, tool_ref=tool_ref,
+        expected=expected, actual=actual, suggestion=suggestion,
+        session_id=session_id, actor=actor,
+    )
+
+
 # -------------------------------------------------------------------- admin
 @mcp.tool
 @instrument
@@ -480,7 +523,8 @@ _TOOL_PARAMS: dict[str, set[str]] = {
         memory_search, handoff_save, handoff_load, handoff_list,
         session_create, session_append_event, session_get, session_list,
         session_events, artifact_put, artifact_get, artifact_list,
-        coord_health, coord_drift_scan, coord_reconcile, coord_curate, stats,
+        coord_health, coord_drift_scan, coord_reconcile, coord_curate,
+        observation_log, stats,
     )
 }
 

@@ -29,6 +29,7 @@ from psycopg.types.json import Jsonb
 
 from config import settings
 from errors import AppError
+from errors.catalog import FEEDBACK_NUDGE
 from storage.base import StorageBackend
 from storage.curator import Curator, DisabledCurator
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
@@ -294,6 +295,10 @@ class PostgresBackend(StorageBackend):
         self.curator: Curator = curator or DisabledCurator()
         # T7.0: per-namespace variant-profile cache (namespace -> (ts, profile)).
         self._profile_cache: dict[str, tuple[float, dict]] = {}
+        # T8.1: per-namespace friction context auto-attached to observations
+        # (in-memory, single-process dev server — documented tradeoff).
+        self._last_error_code: dict[str, str] = {}
+        self._last_quarantine: dict[str, list[str]] = {}
 
     async def _maybe_embed(self, key, value, tombstone) -> str | None:
         """Embed an entry's text for storage. Best-effort: returns None when
@@ -532,6 +537,8 @@ class PostgresBackend(StorageBackend):
             # Visible + telemetrable (v_screening_hit_rate counts override clears).
             entry["screening_override"] = True
             entry["advisories"] = list(entry.get("advisories") or []) + ["screening_override"]
+        if quarantined:
+            entry["feedback"] = FEEDBACK_NUDGE  # T8.2: nudge where friction is fresh
         if origin_detail_suppressed:
             entry["advisories"] = (list(entry.get("advisories") or [])
                                    + ["origin_detail_suppressed_clinical"])
@@ -562,6 +569,7 @@ class PostgresBackend(StorageBackend):
         advisory: dict[str, Any] = {
             "name": "stale_pin", "will_resolve_stale": True,
             "pinned_sha": pinned, "branch_head": head,
+            "feedback": FEEDBACK_NUDGE,  # T8.2
         }
         if mode == "full":
             advisory["remediation"] = (
@@ -635,6 +643,11 @@ class PostgresBackend(StorageBackend):
                              .replace("_", "\\_"))
             clauses.append("key LIKE %s")
             params.append(escaped + "%")
+        # T8.1: the `_meta/` house band (observations, future spine records) is
+        # hidden from normal lists — ask for it explicitly via a _meta prefix.
+        if not (prefix and prefix.startswith("_meta")):
+            clauses.append("key NOT LIKE %s")
+            params.append(r"\_meta/%")
         if cursor:
             try:
                 after_key = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
@@ -862,7 +875,9 @@ class PostgresBackend(StorageBackend):
                 """,
                 (namespace,),
             )
-            rows = [r for r in await cur.fetchall() if _is_live(r)]
+            # `_meta/` records (observations …) are outside the drift detectors.
+            rows = [r for r in await cur.fetchall()
+                    if _is_live(r) and not r["key"].startswith("_meta/")]
         quarantined_count = sum(1 for r in rows if r.get("quarantined"))
 
         with_sha = [r for r in rows if r["repo_sha"]]
@@ -1043,7 +1058,7 @@ class PostgresBackend(StorageBackend):
 
         groups: dict[str, list[tuple]] = defaultdict(list)
         for r in rows:
-            if not _is_live(r):
+            if not _is_live(r) or r["key"].startswith("_meta/"):
                 continue
             h = r["content_hash"] or _content_hash(r["value"])
             groups[h].append((r["namespace"], r["key"]))
@@ -1560,6 +1575,64 @@ class PostgresBackend(StorageBackend):
             for r in rows
         ]
 
+    # ------------------------------------------------------------ observations
+    _OBSERVATION_KEY = "_meta/observations"
+    _OBS_CATEGORIES = ("ergonomics", "error_recovery", "advisory", "screening",
+                       "docs_gap", "surprise", "suggestion")
+    _OBS_SEVERITIES = ("blocker", "friction", "note")
+
+    async def observation_log(
+        self, namespace, *, category, severity="note", tool_ref=None,
+        expected=None, actual=None, suggestion=None, session_id=None,
+        actor="unattributed",
+    ) -> dict:
+        """T8.1: the LLM's feedback channel. Each observation is an ordinary
+        append-only revision of `_meta/observations` (memory_history is the
+        log; existing read tools work on it for free). `_meta/` is excluded
+        from normal memory_list and coord_* scans unless explicitly requested.
+
+        Bias controls (T8.3, pre-committed): observations are prompted at
+        friction, so they over-sample error/quarantine paths and under-sample
+        silent success; models perform agreeableness. They are qualitative
+        annotations that must corroborate a log-derived metric — tool_events
+        is the denominator, never the vote count."""
+        profile = resolve_profile(await self._namespace_profile(namespace))
+        if profile.get("clinical"):
+            raise AppError(
+                "observations_disabled",
+                f"observation_log is disabled in clinical namespace {namespace}",
+            )
+        if category not in self._OBS_CATEGORIES or severity not in self._OBS_SEVERITIES:
+            raise AppError(
+                "invalid_observation",
+                f"invalid category {category!r} or severity {severity!r}",
+            )
+        value = {
+            "category": category, "severity": severity, "tool_ref": tool_ref,
+            "expected": expected, "actual": actual, "suggestion": suggestion,
+            # server-attached context — codes and names, never argument content
+            "auto": {
+                "namespace": namespace,
+                "session_id": session_id,
+                "variant_profile": profile,
+                "last_error_code": self._last_error_code.get(namespace),
+                "last_quarantine": self._last_quarantine.get(namespace),
+                "ts": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+        entry = await self._append(
+            namespace, self._OBSERVATION_KEY, value, "note",
+            ["observation", category, severity], None, None, False, actor=actor,
+            origin="synthesized",
+        )
+        return {
+            "recorded": True, "revision": entry["revision"],
+            "revision_id": entry["revision_id"],
+            "verified_persisted": entry["verified_persisted"],
+            "quarantined": entry["quarantined"],
+            "read_back_with": f"memory_history('{namespace}', '{self._OBSERVATION_KEY}')",
+        }
+
     # --------------------------------------------------------------- telemetry
     async def record_tool_event(
         self, *, tool: str, args: dict, result: Any = None, outcome: str = "ok",
@@ -1574,6 +1647,14 @@ class PostgresBackend(StorageBackend):
             tool=tool, args=args, result=result, outcome=outcome,
             error_code=error_code, remedy_emitted=remedy_emitted, latency_ms=latency_ms,
         )
+        # T8.1: remember the namespace's most recent friction so observation_log
+        # can auto-attach it (codes/pattern names only — PHI-safe by shape).
+        ns = row.get("namespace")
+        if ns:
+            if row["outcome"] == "error" and row.get("error_code"):
+                self._last_error_code[ns] = row["error_code"]
+            if row["outcome"] == "quarantined":
+                self._last_quarantine[ns] = row.get("screening_patterns") or []
         cols = list(row)
         placeholders = ", ".join(["%s"] * len(cols))
         values = [
