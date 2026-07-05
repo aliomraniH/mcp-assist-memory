@@ -34,6 +34,7 @@ from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector
 from storage.phi import assert_no_phi
 from storage.reconcile import DisabledResolver, Resolver, reconcile_claim
 from storage.sanitize import sanitize, wrap_value
+from storage.screening import screen_value
 from storage.telemetry import build_event_row
 from storage.versioning import SCHEMA_VERSION, SERVER_VERSION
 
@@ -197,6 +198,11 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         # unique id (usable in derived_from "key@revision_id" lineage refs).
         "actor": row.get("actor"),
         "revision_id": row.get("id"),
+        # Phase 3 (T3.2): the screening verdict travels with the entry. The
+        # writer learns it at write time (in the save ack), not at
+        # failed-retrieval time; `screening` holds pattern NAMES only.
+        "quarantined": row.get("quarantined", False),
+        "screening": list(row["screening"]) if row.get("screening") else None,
         # Version stamps persisted with the revision (0006, rule 3). Null on
         # rows written before the trust-spine migration — annotate forward only.
         "server_version": row.get("server_version"),
@@ -366,6 +372,19 @@ class PostgresBackend(StorageBackend):
         # Tombstones carry no content hash (the value is a delete marker, not a fact).
         content_hash = None if tombstone else _content_hash(sanitized)
         actor = actor or "unattributed"
+
+        # Phase 3 (T3.1/T3.2): deterministic write-time screen — quarantine,
+        # don't reject. A flagged write persists with quarantined=true and is
+        # excluded from default reads. Un-quarantining happens ONLY via a new
+        # revision carrying meta.screening_override + a real actor, which keeps
+        # an append-only audit trail of who cleared what.
+        hits = [] if tombstone else screen_value(sanitized)
+        override = bool(
+            hits
+            and isinstance(meta, dict) and meta.get("screening_override")
+            and actor != "unattributed"
+        )
+        quarantined = bool(hits) and not override
         row: dict | None = None
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -387,13 +406,13 @@ class PostgresBackend(StorageBackend):
                                 (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding,
                                  repo_sha, base_sha, branch, dirty, session_id, meta, content_hash,
                                  salience, confidence, valid_until, hyde_embedding,
-                                 server_version, schema_version, actor)
+                                 server_version, schema_version, actor, quarantined, screening)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
                                    %s, %s, %s, %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s, %s, %s,
                                    %s, %s, %s, %s::vector,
-                                   %s, %s, %s
+                                   %s, %s, %s, %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
@@ -401,7 +420,7 @@ class PostgresBackend(StorageBackend):
                              tombstone, embedding,
                              repo_sha, base_sha, branch, dirty, session_id, meta_json, content_hash,
                              salience, confidence, valid_until, hyde_embedding,
-                             SERVER_VERSION, SCHEMA_VERSION, actor,
+                             SERVER_VERSION, SCHEMA_VERSION, actor, quarantined, hits or None,
                              namespace, key),
                         )
                         row = await cur.fetchone()
@@ -450,6 +469,10 @@ class PostgresBackend(StorageBackend):
         entry["verified_persisted"] = True
         entry["readback_latency_ms"] = readback_ms
         entry["deduplicated"] = False
+        if override:
+            # Visible + telemetrable (v_screening_hit_rate counts override clears).
+            entry["screening_override"] = True
+            entry["advisories"] = list(entry.get("advisories") or []) + ["screening_override"]
         return entry
 
     @_retry_if_idempotent
@@ -475,7 +498,9 @@ class PostgresBackend(StorageBackend):
         return _row_to_entry(row)
 
     @_retry_on_disconnect
-    async def memory_list(self, namespace, *, kind=None, tag=None, limit=100) -> list[dict]:
+    async def memory_list(
+        self, namespace, *, kind=None, tag=None, limit=100, include_quarantined=False,
+    ) -> list[dict]:
         clauses = ["namespace = %s"]
         params: list[Any] = [namespace]
         if kind:
@@ -497,7 +522,12 @@ class PostgresBackend(StorageBackend):
                 params,
             )
             rows = await cur.fetchall()
-        live = [_row_to_entry(r) for r in rows if _is_live(r)]
+        # T3.2: quarantined entries are excluded from default reads; opt back
+        # in with include_quarantined=True (verdict stays visible on the entry).
+        live = [
+            _row_to_entry(r) for r in rows
+            if _is_live(r) and (include_quarantined or not r.get("quarantined"))
+        ]
         return live[:limit]
 
     @_retry_on_disconnect
@@ -533,7 +563,9 @@ class PostgresBackend(StorageBackend):
         )
 
     @_retry_on_disconnect
-    async def memory_search(self, namespace, query, *, limit=20) -> list[dict]:
+    async def memory_search(
+        self, namespace, query, *, limit=20, include_quarantined=False,
+    ) -> list[dict]:
         # Tenant-scoped: every leg filters on a single namespace first — no
         # implicit cross-project reads.
         #
@@ -561,10 +593,11 @@ class PostgresBackend(StorageBackend):
                         ORDER BY key, revision DESC
                     ) latest
                     WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                          AND (%s OR NOT quarantined)
                           AND value::text ILIKE %s
                     LIMIT %s
                     """,
-                    (namespace, f"%{query}%", limit),
+                    (namespace, include_quarantined, f"%{query}%", limit),
                 )
                 rows = await cur.fetchall()
                 return [_row_to_entry(r) for r in rows[:limit]]
@@ -595,11 +628,12 @@ class PostgresBackend(StorageBackend):
                         ORDER BY key, revision DESC
                     ) latest
                     WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                          AND (%s OR NOT quarantined)
                           AND embedding IS NOT NULL
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    (namespace, qvec, limit),
+                    (namespace, include_quarantined, qvec, limit),
                 )
                 semantic_rows = await cur.fetchall()
 
@@ -617,11 +651,12 @@ class PostgresBackend(StorageBackend):
                         ORDER BY key, revision DESC
                     ) latest
                     WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                          AND (%s OR NOT quarantined)
                           AND hyde_embedding IS NOT NULL
                     ORDER BY hyde_embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    (namespace, qvec, limit),
+                    (namespace, include_quarantined, qvec, limit),
                 )
                 hyde_rows = await cur.fetchall()
 
@@ -636,10 +671,11 @@ class PostgresBackend(StorageBackend):
                     ORDER BY key, revision DESC
                 ) latest
                 WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
+                      AND (%s OR NOT quarantined)
                       AND value::text ILIKE %s
                 LIMIT %s
                 """,
-                (namespace, f"%{query}%", limit),
+                (namespace, include_quarantined, f"%{query}%", limit),
             )
             keyword_rows = await cur.fetchall()
 
@@ -667,13 +703,15 @@ class PostgresBackend(StorageBackend):
             cur = await conn.execute(
                 """
                 SELECT DISTINCT ON (key) key, revision, kind, repo_sha,
-                       content_hash, value, meta, tombstone, valid_until, created_at
+                       content_hash, value, meta, tombstone, valid_until, created_at,
+                       quarantined, screening
                 FROM memory_entry WHERE namespace = %s
                 ORDER BY key, revision DESC
                 """,
                 (namespace,),
             )
             rows = [r for r in await cur.fetchall() if _is_live(r)]
+        quarantined_count = sum(1 for r in rows if r.get("quarantined"))
 
         with_sha = [r for r in rows if r["repo_sha"]]
         latest_repo_sha = (
@@ -715,6 +753,8 @@ class PostgresBackend(StorageBackend):
             "stale": stale[:limit],
             "duplicate_content": duplicate_content[:limit],
             "claim_collisions": claim_collisions[:limit],
+            # Phase 3 (T3.2): live entries currently held in quarantine.
+            "quarantined_count": quarantined_count,
         }
 
     @_retry_on_disconnect
@@ -988,11 +1028,16 @@ class PostgresBackend(StorageBackend):
             namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta, actor=actor,
         )
 
-    async def handoff_load(self, namespace, key) -> dict | None:
-        return await self.memory_get(namespace, key)
+    async def handoff_load(self, namespace, key, *, include_quarantined=False) -> dict | None:
+        entry = await self.memory_get(namespace, key)
+        if entry is not None and entry.get("quarantined") and not include_quarantined:
+            return None  # T3.2: quarantined handoffs are excluded by default
+        return entry
 
-    async def handoff_list(self, namespace, *, limit=100) -> list[dict]:
-        return await self.memory_list(namespace, kind="handoff", limit=limit)
+    async def handoff_list(self, namespace, *, limit=100, include_quarantined=False) -> list[dict]:
+        return await self.memory_list(
+            namespace, kind="handoff", limit=limit, include_quarantined=include_quarantined,
+        )
 
     # --------------------------------------------------------------- sessions
     @_retry_on_disconnect  # a drop in the commit-ack window at worst orphans an

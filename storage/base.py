@@ -43,7 +43,8 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     async def memory_list(
-        self, namespace: str, *, kind: str | None = None, tag: str | None = None, limit: int = 100
+        self, namespace: str, *, kind: str | None = None, tag: str | None = None, limit: int = 100,
+        include_quarantined: bool = False,
     ) -> list[dict]: ...
 
     @abc.abstractmethod
@@ -57,7 +58,7 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     async def memory_search(
-        self, namespace: str, query: str, *, limit: int = 20
+        self, namespace: str, query: str, *, limit: int = 20, include_quarantined: bool = False
     ) -> list[dict]: ...
 
     # ---------------- handoff: cross-surface convention, scoped to a project ----------------
@@ -68,10 +69,14 @@ class StorageBackend(abc.ABC):
     ) -> dict: ...
 
     @abc.abstractmethod
-    async def handoff_load(self, namespace: str, key: str) -> dict | None: ...
+    async def handoff_load(
+        self, namespace: str, key: str, *, include_quarantined: bool = False
+    ) -> dict | None: ...
 
     @abc.abstractmethod
-    async def handoff_list(self, namespace: str, *, limit: int = 100) -> list[dict]: ...
+    async def handoff_list(
+        self, namespace: str, *, limit: int = 100, include_quarantined: bool = False
+    ) -> list[dict]: ...
 
     # ---------------- sessions: episodic memory (tenant-scoped) ----------------
     @abc.abstractmethod

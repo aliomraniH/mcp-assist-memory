@@ -131,6 +131,12 @@ async def memory_save(
     deduplicated:true + original_created_at; a fresh write returns deduplicated:false.
     Every ack is read-back verified (verified_persisted, revision_id, content_hash) —
     a failed verification is an error, never a success ack.
+    Writes matching instruction-shaped patterns persist QUARANTINED (the ack shows
+    quarantined:true + screening pattern names) and are excluded from reads by
+    default — pass include_quarantined:true on reads to see them; clear via a new
+    revision carrying meta.screening_override plus a real actor. Stored text that
+    looks like the untrusted-data markers is escaped one-way to [[UNTRUSTED_DATA]]/
+    [[END]] and never unescaped.
 
     meta is an optional coordination envelope: its repo_sha/base_sha/branch/dirty/
     session_id keys are projected into indexed columns (the rest kept as-is) so a
@@ -152,10 +158,15 @@ async def memory_get(namespace: str, key: str) -> dict | None:
 @mcp.tool
 @instrument
 async def memory_list(
-    namespace: str, kind: str | None = None, tag: str | None = None, limit: int = 100
+    namespace: str, kind: str | None = None, tag: str | None = None, limit: int = 100,
+    include_quarantined: bool = False,
 ) -> list[dict]:
-    """List the latest live entry per key in a namespace, optionally filtered by kind/tag."""
-    return await _backend().memory_list(namespace, kind=kind, tag=tag, limit=limit)
+    """List the latest live entry per key in a namespace, optionally filtered by kind/tag.
+    Entries quarantined by write-time screening are excluded unless
+    include_quarantined:true (each entry carries its quarantined/screening verdict)."""
+    return await _backend().memory_list(
+        namespace, kind=kind, tag=tag, limit=limit, include_quarantined=include_quarantined,
+    )
 
 
 @mcp.tool
@@ -182,13 +193,18 @@ async def memory_delete(
 
 @mcp.tool
 @instrument
-async def memory_search(namespace: str, query: str, limit: int = 20) -> list[dict]:
+async def memory_search(
+    namespace: str, query: str, limit: int = 20, include_quarantined: bool = False,
+) -> list[dict]:
     """Search memory within ONE namespace (no cross-project reads).
 
     Ranks live entries by meaning using embeddings (pgvector cosine) and backfills
     keyword/substring matches. When no embedding provider is configured it degrades
-    to pure substring search."""
-    return await _backend().memory_search(namespace, query, limit=limit)
+    to pure substring search. Quarantined entries are excluded unless
+    include_quarantined:true."""
+    return await _backend().memory_search(
+        namespace, query, limit=limit, include_quarantined=include_quarantined,
+    )
 
 
 # ------------------------------------------------------------------ handoff
@@ -201,8 +217,10 @@ async def handoff_save(
     """Save a cross-surface handoff under a shared key within a project namespace
     (read it back with handoff_load). event_id dedup is scoped to (namespace, actor);
     pass a distinct actor per independent writer. Replays return deduplicated:true;
-    every ack is read-back verified (verified_persisted). meta is the optional
-    coordination envelope (see memory_save)."""
+    every ack is read-back verified (verified_persisted). Instruction-shaped values
+    persist quarantined (visible in the ack) and are hidden from default reads —
+    see memory_save for the override convention. meta is the optional coordination
+    envelope (see memory_save)."""
     return await _backend().handoff_save(
         namespace, key, value, source_surface=source_surface, event_id=event_id, meta=meta,
         actor=actor,
@@ -211,16 +229,23 @@ async def handoff_save(
 
 @mcp.tool
 @instrument
-async def handoff_load(namespace: str, key: str) -> dict | None:
-    """Load the latest handoff for a shared key in a namespace (written by any surface)."""
-    return await _backend().handoff_load(namespace, key)
+async def handoff_load(namespace: str, key: str, include_quarantined: bool = False) -> dict | None:
+    """Load the latest handoff for a shared key in a namespace (written by any surface).
+    A handoff quarantined by write-time screening returns null unless
+    include_quarantined:true."""
+    return await _backend().handoff_load(namespace, key, include_quarantined=include_quarantined)
 
 
 @mcp.tool
 @instrument
-async def handoff_list(namespace: str, limit: int = 100) -> list[dict]:
-    """List active handoffs in a namespace."""
-    return await _backend().handoff_list(namespace, limit=limit)
+async def handoff_list(
+    namespace: str, limit: int = 100, include_quarantined: bool = False,
+) -> list[dict]:
+    """List active handoffs in a namespace. Quarantined handoffs are excluded
+    unless include_quarantined:true."""
+    return await _backend().handoff_list(
+        namespace, limit=limit, include_quarantined=include_quarantined,
+    )
 
 
 # ------------------------------------------------------------------ session

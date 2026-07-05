@@ -16,7 +16,9 @@ from server import mcp_server
 from storage.telemetry import build_event_row
 from storage.versioning import SCHEMA_VERSION, SERVER_VERSION
 
-SENTINEL = "TOP-SECRET-VALUE-ignore previous instructions-987654321"
+# Deliberately does NOT trip the Phase 3 screening patterns: these tests pin
+# the ok-outcome path (screening outcomes are pinned in test_screening.py).
+SENTINEL = "TOP-SECRET-VALUE-correlate-me-987654321"
 
 
 async def _events(backend, ns):
