@@ -32,6 +32,8 @@ from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector
 from storage.phi import assert_no_phi
 from storage.reconcile import DisabledResolver, Resolver, reconcile_claim
 from storage.sanitize import sanitize, wrap_value
+from storage.telemetry import build_event_row
+from storage.versioning import SCHEMA_VERSION, SERVER_VERSION
 
 _MAX_RETRIES = 3
 
@@ -189,6 +191,10 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         "salience": row.get("salience"),
         "confidence": row.get("confidence"),
         "valid_until": valid_until.isoformat() if isinstance(valid_until, datetime) else valid_until,
+        # Version stamps persisted with the revision (0006, rule 3). Null on
+        # rows written before the trust-spine migration — annotate forward only.
+        "server_version": row.get("server_version"),
+        "schema_version": row.get("schema_version"),
     }
 
 
@@ -358,12 +364,14 @@ class PostgresBackend(StorageBackend):
                             INSERT INTO memory_entry
                                 (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding,
                                  repo_sha, base_sha, branch, dirty, session_id, meta, content_hash,
-                                 salience, confidence, valid_until, hyde_embedding)
+                                 salience, confidence, valid_until, hyde_embedding,
+                                 server_version, schema_version)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
                                    %s, %s, %s, %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s, %s, %s,
-                                   %s, %s, %s, %s::vector
+                                   %s, %s, %s, %s::vector,
+                                   %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
@@ -371,6 +379,7 @@ class PostgresBackend(StorageBackend):
                              tombstone, embedding,
                              repo_sha, base_sha, branch, dirty, session_id, meta_json, content_hash,
                              salience, confidence, valid_until, hyde_embedding,
+                             SERVER_VERSION, SCHEMA_VERSION,
                              namespace, key),
                         )
                         row = await cur.fetchone()
@@ -1071,6 +1080,33 @@ class PostgresBackend(StorageBackend):
             }
             for r in rows
         ]
+
+    # --------------------------------------------------------------- telemetry
+    async def record_tool_event(
+        self, *, tool: str, args: dict, result: Any = None, outcome: str = "ok",
+        error_code: str | None = None, remedy_emitted: bool = False,
+        latency_ms: int | None = None,
+    ) -> None:
+        """Append one PHI-safe row to tool_events (Phase 1). Values pass through
+        redact() in build_event_row — names/lengths/hashes only. Raises on
+        failure; the TOOL layer swallows+logs so telemetry can never fail a
+        call (telemetry is observability, not the user's persistence ack)."""
+        row = build_event_row(
+            tool=tool, args=args, result=result, outcome=outcome,
+            error_code=error_code, remedy_emitted=remedy_emitted, latency_ms=latency_ms,
+        )
+        cols = list(row)
+        placeholders = ", ".join(["%s"] * len(cols))
+        values = [
+            Jsonb(row[c]) if c in ("arg_value_meta", "variant_profile") and row[c] is not None
+            else row[c]
+            for c in cols
+        ]
+        async with self.pool.connection() as conn:
+            await conn.execute(
+                f"INSERT INTO tool_events ({', '.join(cols)}) VALUES ({placeholders})",
+                values,
+            )
 
     # ------------------------------------------------------------------ admin
     @_retry_on_disconnect

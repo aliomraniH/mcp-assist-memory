@@ -20,13 +20,20 @@ Tool surface (22):
 from __future__ import annotations
 
 import base64
+import functools
+import inspect
+import time
 from dataclasses import dataclass
 from typing import Any
 
+import structlog
 from fastmcp import FastMCP
 
 from config import settings
 from storage.base import StorageBackend
+from storage.versioning import stamp
+
+log = structlog.get_logger("assist-memory.tools")
 
 
 @dataclass
@@ -43,11 +50,60 @@ def _backend() -> StorageBackend:
     return deps.backend
 
 
+def instrument(fn):
+    """Telemetry + version stamping for every tool (Phase 1).
+
+    Records one PHI-safe tool_events row per call (arguments pass through
+    redact() — names/lengths/hashes only) and stamps dict-shaped responses with
+    server_version/schema_version. Telemetry failure is logged and swallowed:
+    it is observability, never part of the user's persistence ack, so it must
+    never fail (or slow-fail) a tool call. Errors from the tool itself re-raise
+    unchanged after being recorded.
+    """
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        start = time.monotonic()
+        call_args = dict(sig.bind_partial(*args, **kwargs).arguments)
+        outcome, error_code, remedy_emitted, result = "ok", None, False, None
+        try:
+            result = await fn(*args, **kwargs)
+            if isinstance(result, dict):
+                result = stamp(result)
+            return result
+        except Exception as exc:
+            outcome = "error"
+            # AppError (Phase 2) carries a machine code + remedy; anything else
+            # falls back to the exception class name.
+            error_code = getattr(exc, "code", None) or type(exc).__name__
+            payload = getattr(exc, "payload", None)
+            if isinstance(payload, dict):
+                remedy_emitted = bool((payload.get("error") or {}).get("remedy"))
+            raise
+        finally:
+            backend = deps.backend
+            if backend is not None:
+                try:
+                    await backend.record_tool_event(
+                        tool=fn.__name__, args=call_args, result=result,
+                        outcome=outcome, error_code=error_code,
+                        remedy_emitted=remedy_emitted,
+                        latency_ms=int((time.monotonic() - start) * 1000),
+                    )
+                except Exception as tel_exc:  # noqa: BLE001 - observability only
+                    log.warning("tool_event_record_failed", tool=fn.__name__,
+                                error=str(tel_exc))
+
+    return wrapper
+
+
 mcp: FastMCP = FastMCP(name="assist-memory")
 
 
 # ------------------------------------------------------------------ memory
 @mcp.tool
+@instrument
 async def memory_save(
     namespace: str,
     key: str,
@@ -74,12 +130,14 @@ async def memory_save(
 
 
 @mcp.tool
+@instrument
 async def memory_get(namespace: str, key: str) -> dict | None:
     """Return the latest live revision of a key in a namespace, or null if missing/deleted."""
     return await _backend().memory_get(namespace, key)
 
 
 @mcp.tool
+@instrument
 async def memory_list(
     namespace: str, kind: str | None = None, tag: str | None = None, limit: int = 100
 ) -> list[dict]:
@@ -88,12 +146,14 @@ async def memory_list(
 
 
 @mcp.tool
+@instrument
 async def memory_history(namespace: str, key: str, limit: int = 50) -> list[dict]:
     """Return revision history (newest first) for a key in a namespace, including tombstones."""
     return await _backend().memory_history(namespace, key, limit=limit)
 
 
 @mcp.tool
+@instrument
 async def memory_delete(
     namespace: str, key: str, source_surface: str | None = None, event_id: str | None = None,
     meta: dict | None = None,
@@ -106,6 +166,7 @@ async def memory_delete(
 
 
 @mcp.tool
+@instrument
 async def memory_search(namespace: str, query: str, limit: int = 20) -> list[dict]:
     """Search memory within ONE namespace (no cross-project reads).
 
@@ -117,6 +178,7 @@ async def memory_search(namespace: str, query: str, limit: int = 20) -> list[dic
 
 # ------------------------------------------------------------------ handoff
 @mcp.tool
+@instrument
 async def handoff_save(
     namespace: str, key: str, value: Any, source_surface: str | None = None, event_id: str | None = None,
     meta: dict | None = None,
@@ -130,12 +192,14 @@ async def handoff_save(
 
 
 @mcp.tool
+@instrument
 async def handoff_load(namespace: str, key: str) -> dict | None:
     """Load the latest handoff for a shared key in a namespace (written by any surface)."""
     return await _backend().handoff_load(namespace, key)
 
 
 @mcp.tool
+@instrument
 async def handoff_list(namespace: str, limit: int = 100) -> list[dict]:
     """List active handoffs in a namespace."""
     return await _backend().handoff_list(namespace, limit=limit)
@@ -143,30 +207,35 @@ async def handoff_list(namespace: str, limit: int = 100) -> list[dict]:
 
 # ------------------------------------------------------------------ session
 @mcp.tool
+@instrument
 async def session_create(namespace: str, surface: str | None = None, metadata: dict | None = None) -> dict:
     """Start an episodic session in a project namespace; returns its session_id."""
     return await _backend().session_create(namespace, surface=surface, metadata=metadata)
 
 
 @mcp.tool
+@instrument
 async def session_append_event(namespace: str, session_id: str, kind: str, payload: Any) -> dict:
     """Append an ordered event to a session in this namespace; returns the assigned seq."""
     return await _backend().session_append_event(namespace, session_id, kind, payload)
 
 
 @mcp.tool
+@instrument
 async def session_get(namespace: str, session_id: str) -> dict | None:
     """Fetch session metadata (scoped to the namespace)."""
     return await _backend().session_get(namespace, session_id)
 
 
 @mcp.tool
+@instrument
 async def session_list(namespace: str, limit: int = 50) -> list[dict]:
     """List recent sessions in a namespace (newest first)."""
     return await _backend().session_list(namespace, limit=limit)
 
 
 @mcp.tool
+@instrument
 async def session_events(namespace: str, session_id: str, limit: int = 200) -> list[dict]:
     """Return a session's events in seq order (scoped to the namespace)."""
     return await _backend().session_events(namespace, session_id, limit=limit)
@@ -174,6 +243,7 @@ async def session_events(namespace: str, session_id: str, limit: int = 200) -> l
 
 # ----------------------------------------------------------------- artifact
 @mcp.tool
+@instrument
 async def artifact_put(content_base64: str, content_type: str | None = None) -> dict:
     """Store an immutable blob (base64). Rejects blobs over the configured size cap.
     Returns its sha256 (content address). Artifacts are content-addressed and global."""
@@ -190,6 +260,7 @@ async def artifact_put(content_base64: str, content_type: str | None = None) -> 
 
 
 @mcp.tool
+@instrument
 async def artifact_get(sha256: str) -> dict | None:
     """Return artifact metadata. Small blobs (< inline limit) include base64 content;
     larger blobs are fetched via GET /artifact/{sha256} (streamed)."""
@@ -205,6 +276,7 @@ async def artifact_get(sha256: str) -> dict | None:
 
 
 @mcp.tool
+@instrument
 async def artifact_list(limit: int = 100) -> list[dict]:
     """List stored artifacts (newest first)."""
     return await _backend().artifact_list(limit=limit)
@@ -212,6 +284,7 @@ async def artifact_list(limit: int = 100) -> list[dict]:
 
 # ------------------------------------------------------------- coordination
 @mcp.tool
+@instrument
 async def coord_health(namespace: str, limit: int = 200) -> dict:
     """Drift report for ONE namespace, computed from stored provenance (no git
     required): `stale` entries whose repo_sha is behind the namespace's latest,
@@ -222,6 +295,7 @@ async def coord_health(namespace: str, limit: int = 200) -> dict:
 
 
 @mcp.tool
+@instrument
 async def coord_drift_scan(limit: int = 50) -> dict:
     """Store-wide scan for the same fact living under more than one namespace
     (namespace drift, e.g. a project split across two namespaces). Like `stats`,
@@ -231,6 +305,7 @@ async def coord_drift_scan(limit: int = 50) -> dict:
 
 
 @mcp.tool
+@instrument
 async def coord_reconcile(namespace: str, limit: int = 100) -> dict:
     """Reconcile every live claim in a namespace against GitHub and record an
     append-only verdict (current | stale | unverifiable) per claim under
@@ -243,6 +318,7 @@ async def coord_reconcile(namespace: str, limit: int = 100) -> dict:
 
 
 @mcp.tool
+@instrument
 async def coord_curate(namespace: str, session_id: str, dry_run: bool = False) -> dict:
     """Pull-triggered, write-side LLM curation of a finished session. Reads the
     session's execution trace plus similar existing memories, asks the curator what
@@ -260,6 +336,7 @@ async def coord_curate(namespace: str, session_id: str, dry_run: bool = False) -
 
 # -------------------------------------------------------------------- admin
 @mcp.tool
+@instrument
 async def stats() -> dict:
     """Return store-wide counts (memory revisions/keys, sessions, events, artifacts, bytes)."""
     return await _backend().stats()

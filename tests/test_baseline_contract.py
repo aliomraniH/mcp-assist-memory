@@ -6,7 +6,9 @@ record the flip in the ledger below. A baseline test failing in any other
 circumstance means an accidental behavior change — that is the point of the file.
 
 Flip ledger (append an entry when a phase flips a pin):
-  * (none yet — all pins are at their Phase 0 state)
+  * Phase 1 — test_baseline_unverified_ack: persisted revisions and their entry
+    dicts now carry server_version/schema_version (rule 3); the ack remains
+    UNVERIFIED (no verified_persisted / revision_id) until Phase 2.
 """
 from __future__ import annotations
 
@@ -42,13 +44,14 @@ async def test_baseline_global_dedup_scope(backend, ns):
 
 
 async def test_baseline_unverified_ack(backend, ns):
-    """BASELINE: a save ack is built from the in-hand RETURNING row only — no
-    public-read-path verification, no version stamps. Flip target: Phase 2 (T2.3)."""
+    """BASELINE (part-flipped in Phase 1): revisions are version-stamped (rule 3),
+    but the save ack is still built from the in-hand RETURNING row only — no
+    public-read-path verification. Flip target for the rest: Phase 2 (T2.3)."""
     out = await backend.memory_save(ns, "k2", {"v": 1})
     assert "verified_persisted" not in out
     assert "revision_id" not in out
-    assert "schema_version" not in out
-    assert "server_version" not in out
+    assert out["schema_version"] == 6      # flipped: Phase 1 (rule 3)
+    assert out["server_version"]           # flipped: Phase 1 (rule 3)
 
 
 async def test_baseline_raw_error_shapes(backend, ns):
