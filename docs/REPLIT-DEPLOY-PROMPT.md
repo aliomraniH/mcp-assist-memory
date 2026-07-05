@@ -2,18 +2,19 @@
 
 Copy everything below the line into the Replit agent. It is self-contained:
 context, hard requirements, step-by-step deployment, verification tests, and
-rollback. Fill in the two `<placeholders>` before sending.
+rollback. The v2 program is already **merged to `main`** (merge commit
+`0fa971e`), so the agent deploys from `main` — no branch juggling.
 
 ---
 
 ## Your task
 
-Deploy the updated `mcp-assist-memory` service (branch
-`claude/mcp-assist-v2-plan-9u0025`, the "Trust Boundary + Ergonomics v2"
-program) to this Repl's **Reserved VM** deployment at
-`mcp-assist-memory.replit.app`, run its database migration, and verify the
-deployment with the checks in the "Post-deploy verification" section. Do not
-mark the task done until every verification check passes.
+Deploy the updated `mcp-assist-memory` service from **`main`** (merge commit
+`0fa971e`, the "Trust Boundary + Ergonomics v2" program, Phases 0–10) to this
+Repl's **Reserved VM** deployment at `mcp-assist-memory.replit.app`, run its
+database migration, and verify the deployment with the checks in the
+"Post-deploy verification" section. Do not mark the task done until every
+verification check passes.
 
 ## Context — what this service is and what changed
 
@@ -99,12 +100,15 @@ for this deployment** (they default to off/inert):
 
 ## Deployment steps
 
-1. **Sync the code.** Pull branch `claude/mcp-assist-v2-plan-9u0025` from
-   `<GITHUB_REMOTE: aliomraniH/mcp-assist-memory>` into the Repl (or merge it
-   to the branch the deployment tracks, if the Repl deploys from main —
-   confirm which and say what you did). `git log --oneline` must show the ten
-   phase commits ending at "Phases 9+10: namespace ACL (minimal), decision
-   protocol, changelog, acceptance checks".
+1. **Sync the code.** Pull `main` from GitHub
+   (`aliomraniH/mcp-assist-memory`) into the Repl. `git log --oneline -3`
+   must show merge commit `0fa971e` ("Merge branch
+   'claude/mcp-assist-v2-plan-9u0025': Trust Boundary + Ergonomics v2
+   (Phases 0-10)") at the tip, and `git log --oneline` must contain the ten
+   phase commits (`2154a19` Phase 0 … `8dca385` Phases 9+10) plus `c657c83`
+   (this deployment prompt). If the Repl's working tree has local drift from
+   the Replit editor, stash or discard it ONLY after telling me what it was —
+   never silently.
 2. **Install deps.** `pip install -e .` (the deployment build command does
    this too). Python 3.11; key deps: fastapi, fastmcp>=2.3, psycopg[binary],
    psycopg-pool, pydantic-settings, structlog, httpx.
@@ -214,10 +218,12 @@ The migration is additive (new columns/tables/views, plus swapping one unique
 index for a wider one) — **old code runs fine against the migrated schema**,
 with one caveat: the pre-0006 code relied on the *global* `event_id` unique
 index for cross-namespace dedup; after 0006, dedup is scoped per
-(namespace, actor). So rollback = redeploy the previous git revision
-(`2d99cb9`, "Merge pull request #11") with the same run command. Do NOT
-attempt to reverse the migration or drop the new columns. If you roll back,
-say so explicitly and include the failing verification output that forced it.
+(namespace, actor). So rollback = check out and redeploy the pre-merge
+revision `2d99cb9` ("Merge pull request #11" — the parent of merge commit
+`0fa971e` on main) with the same run command. Do NOT revert or force-push
+`main`, do NOT attempt to reverse the migration, and do NOT drop the new
+columns. If you roll back, say so explicitly and include the failing
+verification output that forced it.
 
 ## Report back
 
