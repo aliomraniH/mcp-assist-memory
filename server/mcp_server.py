@@ -120,6 +120,11 @@ async def memory_save(
     event_id: str | None = None,
     meta: dict | None = None,
     actor: str = "unattributed",
+    origin: str = "unknown",
+    origin_detail: str | None = None,
+    origin_model_id: str | None = None,
+    origin_model_family: str | None = None,
+    derived_from: list[str] | None = None,
 ) -> dict:
     """Append a new revision of a memory entry in a project namespace.
     kind ∈ note|decision|todo|handoff|config|claim|knowledge (claim = a verifiable
@@ -137,6 +142,13 @@ async def memory_save(
     revision carrying meta.screening_override plus a real actor. Stored text that
     looks like the untrusted-data markers is escaped one-way to [[UNTRUSTED_DATA]]/
     [[END]] and never unescaped.
+    Provenance: origin ∈ tool|retrieval|synthesized|human|unknown says where the
+    value came from; origin_model_id/origin_model_family attribute the producing
+    model structurally (enforcement compares these, never prose — origin_detail is
+    color only and is suppressed in clinical namespaces). derived_from lists
+    "key@revision_id" refs of the entries this one was curated/summarized from;
+    coord_health reports downstream entries whose lineage contains a quarantined
+    or falsified ancestor.
 
     meta is an optional coordination envelope: its repo_sha/base_sha/branch/dirty/
     session_id keys are projected into indexed columns (the rest kept as-is) so a
@@ -145,6 +157,8 @@ async def memory_save(
     return await _backend().memory_save(
         namespace, key, value, kind=kind, tags=tags,
         source_surface=source_surface, event_id=event_id, meta=meta, actor=actor,
+        origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
+        origin_model_family=origin_model_family, derived_from=derived_from,
     )
 
 
@@ -228,17 +242,23 @@ async def memory_search(
 async def handoff_save(
     namespace: str, key: str, value: Any, source_surface: str | None = None, event_id: str | None = None,
     meta: dict | None = None, actor: str = "unattributed",
+    origin: str = "unknown", origin_detail: str | None = None,
+    origin_model_id: str | None = None, origin_model_family: str | None = None,
+    derived_from: list[str] | None = None,
 ) -> dict:
     """Save a cross-surface handoff under a shared key within a project namespace
     (read it back with handoff_load). event_id dedup is scoped to (namespace, actor);
     pass a distinct actor per independent writer. Replays return deduplicated:true;
     every ack is read-back verified (verified_persisted). Instruction-shaped values
     persist quarantined (visible in the ack) and are hidden from default reads —
-    see memory_save for the override convention. meta is the optional coordination
-    envelope (see memory_save)."""
+    see memory_save for the override convention. Provenance fields (origin,
+    origin_model_id/family, derived_from) work as on memory_save. meta is the
+    optional coordination envelope (see memory_save)."""
     return await _backend().handoff_save(
         namespace, key, value, source_surface=source_surface, event_id=event_id, meta=meta,
-        actor=actor,
+        actor=actor, origin=origin, origin_detail=origin_detail,
+        origin_model_id=origin_model_id, origin_model_family=origin_model_family,
+        derived_from=derived_from,
     )
 
 

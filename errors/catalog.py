@@ -48,6 +48,8 @@ CATALOG: dict[str, tuple[str, bool]] = {
         "session_create first, and check you passed the right namespace", False),
     "invalid_kind": (
         "kind must be one of note|decision|todo|handoff|config|claim|knowledge", False),
+    "invalid_origin": (
+        "origin must be one of tool|retrieval|synthesized|human|unknown", False),
     "write_verification_failed": (
         "the write could not be verified through the public read path — the "
         "ack would have been a lie; retry the write (it may not have "

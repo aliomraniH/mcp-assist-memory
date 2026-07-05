@@ -36,6 +36,11 @@ class StorageBackend(abc.ABC):
         event_id: str | None = None,
         meta: dict | None = None,
         actor: str = "unattributed",
+        origin: str = "unknown",
+        origin_detail: str | None = None,
+        origin_model_id: str | None = None,
+        origin_model_family: str | None = None,
+        derived_from: list[str] | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod
@@ -73,6 +78,9 @@ class StorageBackend(abc.ABC):
     async def handoff_save(
         self, namespace: str, key: str, value: Any, *, source_surface: str | None = None, event_id: str | None = None,
         meta: dict | None = None, actor: str = "unattributed",
+        origin: str = "unknown", origin_detail: str | None = None,
+        origin_model_id: str | None = None, origin_model_family: str | None = None,
+        derived_from: list[str] | None = None,
     ) -> dict: ...
 
     @abc.abstractmethod

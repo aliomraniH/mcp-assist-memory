@@ -33,7 +33,7 @@ from storage.base import StorageBackend
 from storage.curator import Curator, DisabledCurator
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
 from storage.phi import assert_no_phi
-from storage.reconcile import DisabledResolver, Resolver, reconcile_claim
+from storage.reconcile import STALE, DisabledResolver, Resolver, reconcile_claim
 from storage.sanitize import sanitize, wrap_value
 from storage.screening import screen_value
 from storage.telemetry import build_event_row
@@ -99,6 +99,10 @@ def _retry_if_idempotent(fn):
 # Coordination-envelope keys projected out of `meta` into indexed columns. The
 # full envelope is still stored in the `meta` jsonb column, losslessly.
 _META_COLS = ("repo_sha", "base_sha", "branch", "dirty", "session_id")
+
+# Phase 5 (T5.1): provenance tiers, aligned with the four-tier source-provenance
+# model. Backfill default is 'unknown' — historical rows annotate forward only.
+_ORIGINS = ("tool", "retrieval", "synthesized", "human", "unknown")
 
 
 def _content_hash(value: Any) -> str:
@@ -204,6 +208,13 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         # failed-retrieval time; `screening` holds pattern NAMES only.
         "quarantined": row.get("quarantined", False),
         "screening": list(row["screening"]) if row.get("screening") else None,
+        # Phase 5 (T5.1–T5.3): provenance tier, structured model attribution,
+        # and lineage refs ("key@revision_id"). All optional / annotate-forward.
+        "origin": row.get("origin", "unknown"),
+        "origin_detail": row.get("origin_detail"),
+        "origin_model_id": row.get("origin_model_id"),
+        "origin_model_family": row.get("origin_model_family"),
+        "derived_from": list(row["derived_from"]) if row.get("derived_from") else None,
         # Version stamps persisted with the revision (0006, rule 3). Null on
         # rows written before the trust-spine migration — annotate forward only.
         "server_version": row.get("server_version"),
@@ -352,9 +363,21 @@ class PostgresBackend(StorageBackend):
         entry["verified_persisted"] = True
         return entry
 
+    async def _namespace_profile(self, namespace: str) -> dict:
+        """The namespace's variant/config profile (Phase 5/6/7 shared lookup).
+        Missing row ⇒ {} (all defaults)."""
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                "SELECT profile FROM variant_profiles WHERE namespace = %s", (namespace,))
+            row = await cur.fetchone()
+        return (row or {}).get("profile") or {}
+
     async def _append(
         self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None,
         *, actor="unattributed", salience=None, confidence=None, valid_until=None, embeddings=None,
+        origin="unknown", origin_detail=None, origin_model_id=None, origin_model_family=None,
+        derived_from=None,
     ) -> dict:
         # Embed BEFORE taking a pooled connection so the (network) embedding call
         # never holds a connection, and compute it once so retries don't re-embed.
@@ -386,6 +409,20 @@ class PostgresBackend(StorageBackend):
             and actor != "unattributed"
         )
         quarantined = bool(hits) and not override
+
+        # Phase 5 (T5.1): provenance tier is a closed enum; free-text
+        # origin_detail is a PHI channel and is suppressed (visibly, via an
+        # advisory) in clinical=true namespaces.
+        origin = origin or "unknown"
+        if origin not in _ORIGINS:
+            raise AppError("invalid_origin", f"invalid origin {origin!r}")
+        origin_detail_suppressed = False
+        if origin_detail:
+            profile = await self._namespace_profile(namespace)
+            if profile.get("clinical"):
+                origin_detail = None
+                origin_detail_suppressed = True
+        derived_from = [str(d) for d in derived_from] if derived_from else None
         row: dict | None = None
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -407,12 +444,15 @@ class PostgresBackend(StorageBackend):
                                 (namespace, key, revision, kind, value, source_surface, tags, event_id, tombstone, embedding,
                                  repo_sha, base_sha, branch, dirty, session_id, meta, content_hash,
                                  salience, confidence, valid_until, hyde_embedding,
-                                 server_version, schema_version, actor, quarantined, screening)
+                                 server_version, schema_version, actor, quarantined, screening,
+                                 origin, origin_detail, origin_model_id, origin_model_family,
+                                 derived_from)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
                                    %s, %s, %s, %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s, %s, %s,
                                    %s, %s, %s, %s::vector,
+                                   %s, %s, %s, %s, %s,
                                    %s, %s, %s, %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
@@ -422,6 +462,8 @@ class PostgresBackend(StorageBackend):
                              repo_sha, base_sha, branch, dirty, session_id, meta_json, content_hash,
                              salience, confidence, valid_until, hyde_embedding,
                              SERVER_VERSION, SCHEMA_VERSION, actor, quarantined, hits or None,
+                             origin, origin_detail, origin_model_id, origin_model_family,
+                             derived_from,
                              namespace, key),
                         )
                         row = await cur.fetchone()
@@ -474,15 +516,21 @@ class PostgresBackend(StorageBackend):
             # Visible + telemetrable (v_screening_hit_rate counts override clears).
             entry["screening_override"] = True
             entry["advisories"] = list(entry.get("advisories") or []) + ["screening_override"]
+        if origin_detail_suppressed:
+            entry["advisories"] = (list(entry.get("advisories") or [])
+                                   + ["origin_detail_suppressed_clinical"])
         return entry
 
     @_retry_if_idempotent
     async def memory_save(
         self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None, meta=None,
-        actor="unattributed",
+        actor="unattributed", origin="unknown", origin_detail=None,
+        origin_model_id=None, origin_model_family=None, derived_from=None,
     ) -> dict:
         return await self._append(
             namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta, actor=actor,
+            origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
+            origin_model_family=origin_model_family, derived_from=derived_from,
         )
 
     @_retry_on_disconnect
@@ -743,9 +791,9 @@ class PostgresBackend(StorageBackend):
             conn.row_factory = dict_row
             cur = await conn.execute(
                 """
-                SELECT DISTINCT ON (key) key, revision, kind, repo_sha,
+                SELECT DISTINCT ON (key) id, key, revision, kind, repo_sha,
                        content_hash, value, meta, tombstone, valid_until, created_at,
-                       quarantined, screening
+                       quarantined, screening, derived_from
                 FROM memory_entry WHERE namespace = %s
                 ORDER BY key, revision DESC
                 """,
@@ -787,6 +835,44 @@ class PostgresBackend(StorageBackend):
             for s, keys in by_subject.items() if len(keys) > 1
         ]
 
+        # Phase 5 (T5.3): tainted lineage — downstream entries whose derived_from
+        # chain contains a quarantined or reconcile-falsified ancestor. REPORT
+        # ONLY, no automatic cascade: human judgment decides what's actually
+        # poisoned (auto-cascade is how one false positive nukes a namespace).
+        tainted: dict[str, str] = {}  # key -> why it's a tainted ROOT
+        for r in rows:
+            if r.get("quarantined"):
+                tainted[r["key"]] = "quarantined"
+            if r["key"].startswith(self._RECONCILE_PREFIX):
+                verdict = r["value"] if isinstance(r["value"], dict) else {}
+                if verdict.get("state") == STALE:
+                    tainted.setdefault(
+                        r["key"][len(self._RECONCILE_PREFIX):], "reconcile_falsified")
+        # lineage refs are "key@revision_id" (or bare keys); resolve both forms
+        parents = {
+            r["key"]: {str(ref).split("@", 1)[0] for ref in (r.get("derived_from") or [])}
+            for r in rows if r.get("derived_from")
+        }
+        tainted_lineage: list[dict] = []
+        for key, parent_keys in parents.items():
+            seen: set[str] = set()
+            frontier = set(parent_keys)
+            hit_roots: set[str] = set()
+            while frontier:
+                p = frontier.pop()
+                if p in seen:
+                    continue
+                seen.add(p)
+                if p in tainted:
+                    hit_roots.add(p)
+                frontier |= parents.get(p, set())
+            if hit_roots:
+                tainted_lineage.append({
+                    "key": key,
+                    "tainted_ancestors": sorted(hit_roots),
+                    "reasons": {root: tainted[root] for root in sorted(hit_roots)},
+                })
+
         return {
             "namespace": namespace,
             "entry_count": len(rows),
@@ -796,6 +882,8 @@ class PostgresBackend(StorageBackend):
             "claim_collisions": claim_collisions[:limit],
             # Phase 3 (T3.2): live entries currently held in quarantine.
             "quarantined_count": quarantined_count,
+            # Phase 5 (T5.3): report-only lineage taint (no automatic cascade).
+            "tainted_lineage": tainted_lineage[:limit],
         }
 
     @_retry_on_disconnect
@@ -951,6 +1039,13 @@ class PostgresBackend(StorageBackend):
             embeddings=(None, None), actor="curator",
         )
 
+    def _curator_identity(self) -> tuple[str | None, str | None]:
+        """(curator_model_id, curator_family) — structured attribution (T5.2/T5.4);
+        enforcement compares these fields, never origin_detail prose."""
+        model_id = getattr(self.curator, "model_id", None) or getattr(settings, "curator_model", None)
+        family = getattr(self.curator, "family", None) or getattr(settings, "curator_family", None)
+        return model_id, family
+
     async def _write_curation_op(self, namespace, op, *, session_id, action) -> dict:
         key = op["key"]
         kind = op.get("kind") or "note"
@@ -961,6 +1056,10 @@ class PostgresBackend(StorageBackend):
         meta = self._op_meta(op, session_id)
         emb = op.get("embeddings") or {}
         embeddings = (emb.get("summary"), emb.get("hyde"))
+        curator_model_id, curator_family = self._curator_identity()
+        # T5.4: curation accountability — stamp who curated, structurally.
+        meta["curator_model_id"] = curator_model_id
+        meta["curator_family"] = curator_family
 
         # SUPERSEDE/MERGE close out the old revisions BEFORE writing the survivor.
         if action == "SUPERSEDE" and op.get("supersedes"):
@@ -975,11 +1074,42 @@ class PostgresBackend(StorageBackend):
             _curate_event_id(namespace, session_id, key, action), False, meta=meta,
             salience=_as_int(op.get("salience")), confidence=_as_float(op.get("confidence")),
             embeddings=embeddings, actor="curator",
+            origin="synthesized", origin_model_id=curator_model_id,
+            origin_model_family=curator_family,
+            derived_from=op.get("derived_from"),
         )
         return {
             "op": action, "key": key, "kind": written["kind"],
             "revision": written["revision"], "downgraded": bool(op.get("_downgraded")),
         }
+
+    def _family_blocklist(self) -> set[str]:
+        raw = getattr(settings, "curator_family_must_differ_from", None) or ""
+        return {f.strip().lower() for f in raw.split(",") if f.strip()}
+
+    async def _family_conflict(self, namespace, op) -> dict | None:
+        """T5.4: when CURATOR_FAMILY_MUST_DIFFER_FROM is set, refuse to curate an
+        entry whose origin_model_family matches the curator's own family — enum
+        comparison on structured fields, never prose parsing. Returns the
+        standardized error object for the refused op, or None when allowed."""
+        blocklist = self._family_blocklist()
+        _, curator_family = self._curator_identity()
+        if not blocklist or not curator_family or curator_family.lower() not in blocklist:
+            return None
+        target_key = op.get("key")
+        candidates = [target_key, op.get("supersedes"),
+                      *(op.get("merge_from") or op.get("supersedes_keys") or [])]
+        for cand in filter(None, candidates):
+            existing = await self.memory_get(namespace, cand)
+            if existing and (existing.get("origin_model_family") or "").lower() == curator_family.lower():
+                return AppError(
+                    "curator_family_conflict",
+                    f"refusing to curate {cand}: its origin_model_family "
+                    f"({existing['origin_model_family']}) matches the curator's family "
+                    f"({curator_family}) and CURATOR_FAMILY_MUST_DIFFER_FROM forbids "
+                    "same-family self-review",
+                ).payload
+        return None
 
     async def apply_curation(self, namespace, result, *, session_id) -> dict:
         """Deterministically apply a curator result. Each op is PHI-gated first
@@ -988,9 +1118,11 @@ class PostgresBackend(StorageBackend):
         the same session is exactly-once."""
         operations = (result or {}).get("operations") or []
         counts = {"added": 0, "updated": 0, "merged": 0, "superseded": 0,
-                  "noop": 0, "phi_dropped": 0, "downgraded": 0, "invalid": 0}
+                  "noop": 0, "phi_dropped": 0, "downgraded": 0, "invalid": 0,
+                  "family_conflict": 0}
         applied: list[dict] = []
         noops: list[dict] = []
+        family_conflicts: list[dict] = []
         for op in operations:
             if not isinstance(op, dict):
                 counts["invalid"] += 1
@@ -1007,6 +1139,12 @@ class PostgresBackend(StorageBackend):
             if not assert_no_phi(op):
                 counts["phi_dropped"] += 1
                 continue
+            # T5.4: same-family self-review gate (structured enum comparison).
+            conflict = await self._family_conflict(namespace, op)
+            if conflict is not None:
+                counts["family_conflict"] += 1
+                family_conflicts.append({"key": op.get("key"), **conflict})
+                continue
             # A claim without mechanical provenance is downgraded to a plain note.
             if (op.get("kind") or "note") == "claim" and not _claim_has_provenance(op):
                 op = {**op, "kind": "note", "_downgraded": True,
@@ -1017,7 +1155,10 @@ class PostgresBackend(StorageBackend):
             applied.append(written)
             counts[{"ADD": "added", "UPDATE": "updated",
                     "MERGE": "merged", "SUPERSEDE": "superseded"}[action]] += 1
-        return {"applied": applied, "noops": noops, "counts": counts}
+        out = {"applied": applied, "noops": noops, "counts": counts}
+        if family_conflicts:
+            out["family_conflicts"] = family_conflicts
+        return out
 
     def _trace_query_text(self, events: list[dict]) -> str:
         """A compact text blob of the session trace, used only to pull `similar_memories`
@@ -1064,9 +1205,13 @@ class PostgresBackend(StorageBackend):
     @_retry_if_idempotent
     async def handoff_save(
         self, namespace, key, value, *, source_surface=None, event_id=None, meta=None, actor="unattributed",
+        origin="unknown", origin_detail=None, origin_model_id=None, origin_model_family=None,
+        derived_from=None,
     ) -> dict:
         return await self._append(
             namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta, actor=actor,
+            origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
+            origin_model_family=origin_model_family, derived_from=derived_from,
         )
 
     async def handoff_load(self, namespace, key, *, include_quarantined=False) -> dict | None:

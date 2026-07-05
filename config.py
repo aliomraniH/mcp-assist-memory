@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     # is reused to embed the curator's two strings (summary + hyde); absent ⇒ keyword-only.
     curator_model: str = "claude-opus-4-1"
     curator_max_output_tokens: int = 4096
+    # Curation accountability (Phase 5, T5.4). curator_family is stamped on every
+    # curated write (structured enum-ish string, e.g. "anthropic" — enforcement
+    # compares these fields, never origin_detail prose). When
+    # CURATOR_FAMILY_MUST_DIFFER_FROM is set (comma-separated families), the
+    # apply-worker refuses to curate entries whose origin_model_family matches —
+    # same-family self-review is a verified bias; this bakes the referee-protocol
+    # workaround into the spine.
+    curator_family: str = "anthropic"
+    curator_family_must_differ_from: str | None = None
 
     # --- coordination reconciler (Phase 3): only active when github_token is set ---
     # A READ-ONLY GitHub token lets the backend resolve a claim's truth (is PR #N
