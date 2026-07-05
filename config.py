@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     curator_family: str = "anthropic"
     curator_family_must_differ_from: str | None = None
 
+    # --- trust decay (Phase 6): a reconcile verdict is a snapshot, not a
+    # subscription. Claims whose latest verdict is older than this window are
+    # demoted to needs_reverification by coord_health, even if the verdict was
+    # `current`. Override per namespace via variant_profiles.profile
+    # .claim_staleness_hours (dev namespaces that reconcile weekly may want 168
+    # so the signal stays legible on a low-traffic server).
+    default_claim_staleness_hours: int = 72
+
     # --- coordination reconciler (Phase 3): only active when github_token is set ---
     # A READ-ONLY GitHub token lets the backend resolve a claim's truth (is PR #N
     # merged? what is branch X's head?) off the agent's critical path. Without it

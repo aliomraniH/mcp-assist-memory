@@ -380,8 +380,15 @@ async def coord_health(namespace: str, limit: int = 200) -> dict:
     """Drift report for ONE namespace, computed from stored provenance (no git
     required): `stale` entries whose repo_sha is behind the namespace's latest,
     `duplicate_content` (distinct keys holding an identical fact), and
-    `claim_collisions` (multiple live claims about the same subject/PR). Read it
-    at session start to see what needs re-verifying before trusting the store."""
+    `claim_collisions` (multiple live claims about the same subject/PR). Also:
+    `quarantined_count` (write-screened entries held in quarantine),
+    `tainted_lineage` (entries whose derived_from chain contains a quarantined or
+    falsified ancestor — report only, no cascade), `needs_reverification` (claims
+    whose latest reconcile verdict is older than the namespace's
+    claim_staleness_hours window — a verdict is a snapshot, not a subscription),
+    and `skepticism` (too-clean signals: all-current verdicts, identical content
+    from different actors — prompts to investigate, never blockers). Read it at
+    session start to see what needs re-verifying before trusting the store."""
     return await _backend().coord_health(namespace, limit=limit)
 
 

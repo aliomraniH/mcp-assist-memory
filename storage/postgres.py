@@ -793,7 +793,7 @@ class PostgresBackend(StorageBackend):
                 """
                 SELECT DISTINCT ON (key) id, key, revision, kind, repo_sha,
                        content_hash, value, meta, tombstone, valid_until, created_at,
-                       quarantined, screening, derived_from
+                       quarantined, screening, derived_from, actor
                 FROM memory_entry WHERE namespace = %s
                 ORDER BY key, revision DESC
                 """,
@@ -873,6 +873,73 @@ class PostgresBackend(StorageBackend):
                     "reasons": {root: tainted[root] for root in sorted(hit_roots)},
                 })
 
+        # Phase 6 (T6.1): staleness demotion. A reconcile verdict is a snapshot,
+        # not a subscription — a claim whose latest verdict is older than the
+        # namespace's staleness window needs re-verifying EVEN IF that verdict
+        # was `current`. Claims never reconciled at all are flagged too.
+        profile = await self._namespace_profile(namespace)
+        staleness_hours = float(
+            profile.get("claim_staleness_hours")
+            or settings.default_claim_staleness_hours)
+        now = datetime.now(timezone.utc)
+        verdict_by_claim = {
+            r["key"][len(self._RECONCILE_PREFIX):]: r
+            for r in rows if r["key"].startswith(self._RECONCILE_PREFIX)
+        }
+        claims = [r for r in rows
+                  if r["kind"] == "claim" and not r["key"].startswith(self._RECONCILE_PREFIX)]
+        needs_reverification = []
+        for c in claims:
+            verdict = verdict_by_claim.get(c["key"])
+            if verdict is None:
+                needs_reverification.append({
+                    "key": c["key"], "reason": "never_reconciled",
+                    "last_verdict_state": None, "verdict_age_hours": None,
+                })
+                continue
+            age_hours = (now - verdict["created_at"]).total_seconds() / 3600.0
+            state = (verdict["value"] or {}).get("state") if isinstance(verdict["value"], dict) else None
+            if age_hours > staleness_hours:
+                needs_reverification.append({
+                    "key": c["key"], "reason": "verdict_expired",
+                    "last_verdict_state": state,
+                    "verdict_age_hours": round(age_hours, 1),
+                })
+
+        # Phase 6 (T6.2): too-clean heuristic — informational prompts to
+        # investigate, never blockers. Fabricated success survives longer than
+        # fabricated failure because nobody interrogates good news.
+        skepticism: dict[str, Any] = {}
+        verdict_states = [
+            (verdict_by_claim[c["key"]]["value"] or {}).get("state")
+            for c in claims if c["key"] in verdict_by_claim
+            and isinstance(verdict_by_claim[c["key"]]["value"], dict)
+        ]
+        if len(verdict_states) > 20 and verdict_states and all(s == "current" for s in verdict_states):
+            skepticism["all_verdicts_current"] = {
+                "claims": len(verdict_states),
+                "note": "every reconciled claim reads current — too clean; spot-check a few",
+            }
+        # runs of identical content written by DIFFERENT actors
+        run: list[dict] = []
+        identical_runs = []
+        for r in sorted(rows, key=lambda r: r["created_at"]):
+            h = r["content_hash"] or _content_hash(r["value"])
+            if run and (run[0]["content_hash"] or _content_hash(run[0]["value"])) == h:
+                run.append(r)
+            else:
+                run = [r]
+            actors = {x.get("actor") or "unattributed" for x in run}
+            if len(run) >= 5 and len(actors) > 1:
+                entry = {"content_hash": h, "count": len(run),
+                         "actors": sorted(actors), "keys": sorted(x["key"] for x in run)}
+                if not identical_runs or identical_runs[-1]["content_hash"] != h:
+                    identical_runs.append(entry)
+                else:
+                    identical_runs[-1] = entry
+        if identical_runs:
+            skepticism["identical_content_runs"] = identical_runs[:limit]
+
         return {
             "namespace": namespace,
             "entry_count": len(rows),
@@ -884,6 +951,11 @@ class PostgresBackend(StorageBackend):
             "quarantined_count": quarantined_count,
             # Phase 5 (T5.3): report-only lineage taint (no automatic cascade).
             "tainted_lineage": tainted_lineage[:limit],
+            # Phase 6 (T6.1): verdicts past the namespace's staleness window.
+            "claim_staleness_hours": staleness_hours,
+            "needs_reverification": needs_reverification[:limit],
+            # Phase 6 (T6.2): informational only, never a blocker.
+            "skepticism": skepticism,
         }
 
     @_retry_on_disconnect
