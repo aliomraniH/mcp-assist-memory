@@ -5,10 +5,17 @@ name: smoke
 # transport/auth/host regression (like the fastmcp 3.4.3 421) is flagged instead
 # of being discovered by a user whose connector won't connect.
 #
-# Trigger it manually (Actions -> smoke -> Run workflow) right after a deploy, or
-# on the schedule below. The in-process half of this check runs on every push via
-# the `test` job (pytest picks up tests/test_smoke_mcp.py) — that gate BLOCKS a
-# broken build from shipping; this workflow FLAGS an unhealthy live deployment.
+# It fires AUTOMATICALLY the moment a deploy goes live: the deployment
+# (.replit [deployment].run) launches scripts/post_deploy_dispatch.py in the
+# background, which waits for the server to become healthy and then sends a
+# `repository_dispatch` (event type `post-deploy-smoke`) that triggers the
+# `repository_dispatch` branch below — so a regression behind the Replit edge is
+# flagged within seconds of a deploy instead of up to 6 hours later. You can also
+# trigger it manually (Actions -> smoke -> Run workflow), and the schedule below
+# stays as a periodic backstop. The in-process half of this check runs on every
+# push via the `test` job (pytest picks up tests/test_smoke_mcp.py) — that gate
+# BLOCKS a broken build from shipping; this workflow FLAGS an unhealthy live
+# deployment.
 #
 # Requires two repo secrets (Settings -> Secrets and variables -> Actions):
 #   SMOKE_BASE_URL   — the deployed base URL, e.g. https://your-vm.example
@@ -22,6 +29,11 @@ on:
         description: "Base URL to probe (overrides the SMOKE_BASE_URL secret)"
         required: false
         type: string
+  # Fired automatically by scripts/post_deploy_dispatch.py right after a deploy
+  # goes live. client_payload.base_url (when present) probes the exact deployed
+  # URL; otherwise the SMOKE_BASE_URL secret is used.
+  repository_dispatch:
+    types: [post-deploy-smoke]
   schedule:
     - cron: "0 */6 * * *"  # every 6 hours
 
@@ -38,7 +50,7 @@ jobs:
       - name: Resolve target + gate on secrets
         id: gate
         env:
-          BASE_URL: ${{ inputs.base_url || secrets.SMOKE_BASE_URL }}
+          BASE_URL: ${{ inputs.base_url || github.event.client_payload.base_url || secrets.SMOKE_BASE_URL }}
           SMOKE_TOKEN: ${{ secrets.SMOKE_TOKEN }}
         run: |
           if [ -n "$BASE_URL" ] && [ -n "$SMOKE_TOKEN" ]; then
@@ -60,6 +72,6 @@ jobs:
       - name: Probe the deployed MCP surface
         if: steps.gate.outputs.enabled == 'true'
         env:
-          SMOKE_BASE_URL: ${{ inputs.base_url || secrets.SMOKE_BASE_URL }}
+          SMOKE_BASE_URL: ${{ inputs.base_url || github.event.client_payload.base_url || secrets.SMOKE_BASE_URL }}
           SMOKE_TOKEN: ${{ secrets.SMOKE_TOKEN }}
         run: python scripts/smoke_mcp.py

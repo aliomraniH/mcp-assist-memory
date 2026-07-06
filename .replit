@@ -4,7 +4,7 @@ run = ["sh", "-c", "python scripts/migrate.py && uvicorn app:app --host 0.0.0.0 
 entrypoint = "app.py"
 
 [deployment]
-run = ["sh", "-c", "python scripts/migrate.py && uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+run = ["sh", "-c", "python scripts/migrate.py && (python scripts/post_deploy_dispatch.py &) && uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
 deploymentTarget = "vm"
 build = ["sh", "-c", "pip install -c constraints.txt -e ."]
 
