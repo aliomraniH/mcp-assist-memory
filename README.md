@@ -185,7 +185,7 @@ restarts/redeploys, and the three surfaces share no server-side session state.
 
 ```bash
 cp .env.example .env          # DATABASE_URL + MCP_AUTH_TOKEN + ADMIN_PASSWORD
-make install                  # pip install -e ".[test]"
+make install                  # pip install -c constraints.txt -e ".[test]"
 make migrate                  # apply migrations/0001_init.sql
 make run                      # uvicorn app:app
 curl localhost:8000/healthz   # {"status":"ok","db":"ok"}
@@ -214,6 +214,25 @@ migrates it, runs `pytest`, and deletes the branch. Set repo secrets
 3. The deploy `run` step runs `python scripts/migrate.py` then starts uvicorn.
 4. Open `https://<your-vm>/admin`, sign in, and copy/rotate the token. Point each
    client at `https://<your-vm>/mcp`.
+
+### Pinned dependencies (deterministic builds)
+
+`pyproject.toml` declares loose ranges, but the deploy build, `post-merge.sh`, and
+`make install` all pass `-c constraints.txt`, so **prod installs the exact versions
+verified in dev**. This is the guardrail against the class of failure that caused the
+prod `/mcp` 421 outage (an unpinned build silently resolving a newer `fastmcp`).
+
+To **intentionally upgrade** a dependency (so pins don't rot):
+
+```bash
+pip install -U <pkg>          # or `pip install -e .` to re-resolve a widened range
+make test                     # AND exercise /mcp locally
+make lock                     # regenerate constraints.txt from the verified env
+# then redeploy — prod now installs the newly verified set
+```
+
+Never hand-edit versions in `constraints.txt`; always regenerate with `make lock`
+(`scripts/lock-deps.sh`). The file header documents the same procedure.
 
 ### Postgres / Neon
 

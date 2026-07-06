@@ -1,7 +1,11 @@
-.PHONY: install migrate run test backfill
+.PHONY: install lock migrate run test backfill
 
 install:
-	pip install -e ".[test]"
+	pip install -c constraints.txt -e ".[test]"
+
+# Regenerate constraints.txt after an intentional, verified dependency upgrade.
+lock:
+	./scripts/lock-deps.sh
 
 migrate:
 	python scripts/migrate.py

@@ -49,7 +49,10 @@ jobs:
 
       - name: Install
         if: steps.gate.outputs.enabled == 'true'
-        run: pip install -e ".[test]"
+        # Use the pinned constraints so CI verifies the SAME versions the deploy
+        # build installs (see constraints.txt). This is the verification step that
+        # keeps prod == the versions verified in dev/CI.
+        run: pip install -c constraints.txt -e ".[test]"
 
       - name: Migrate + test (direct endpoint, no PgBouncer)
         if: steps.gate.outputs.enabled == 'true'
