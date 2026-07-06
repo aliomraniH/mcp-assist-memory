@@ -37,10 +37,30 @@ import json
 import os
 import sys
 
-# The current tool surface. Bump this in the SAME commit that adds/removes a tool
-# in server/mcp_server.py — a mismatch is exactly the "connector half-broke"
-# signal this smoke test exists to catch.
-EXPECTED_TOOL_COUNT = 23
+# The documented tool surface. This literal is only the FALLBACK the standalone
+# post-deploy probe uses when the server package can't be imported (the GitHub
+# Actions smoke job installs only httpx, so `import server.mcp_server` fails there).
+# In any full-dependency env (pytest, `make smoke`) EXPECTED_TOOL_COUNT is DERIVED
+# from the live tool registry instead — so an intentional tool add/remove needs no
+# edit here. A test (tests/test_smoke_mcp.py) cross-checks this literal AND the
+# mcp_server / README "N tools" docs against the real registry, so an accidental
+# tool drop (or a stale number) fails CI loudly instead of shipping a half-broken
+# connector.
+DOCUMENTED_TOOL_COUNT = 23
+
+
+def _derive_expected_tool_count(default: int) -> int:
+    """Prefer the live registry as the source of truth; fall back to the documented
+    literal when the server package isn't importable (the bare post-deploy probe)."""
+    try:
+        from server.mcp_server import registered_tool_names
+
+        return len(registered_tool_names())
+    except Exception:  # noqa: BLE001 - bare probe env: httpx only, no server deps
+        return default
+
+
+EXPECTED_TOOL_COUNT = _derive_expected_tool_count(DOCUMENTED_TOOL_COUNT)
 
 MCP_HEADERS = {
     "Content-Type": "application/json",

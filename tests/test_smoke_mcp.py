@@ -21,6 +21,7 @@ os.environ.setdefault("ADMIN_PASSWORD", "test-admin-pw")
 os.environ.setdefault("MCP_AUTH_TOKEN", "seed-token-xyz")
 
 from scripts.smoke_mcp import (  # noqa: E402
+    DOCUMENTED_TOOL_COUNT,
     EXPECTED_TOOL_COUNT,
     SmokeError,
     check_handshake,
@@ -89,3 +90,80 @@ def test_smoke_wrong_tool_count_fails(client):
 def test_smoke_missing_token_raises(client):
     with pytest.raises(SmokeError, match="no token supplied"):
         run_smoke(client, "")
+
+
+# --- the count-never-goes-stale guards -----------------------------------------
+# These pin every hand-written "N tools" number to the ONE source of truth (the
+# live tool registry). An intentional add/remove auto-updates the derived
+# EXPECTED_TOOL_COUNT; an accidental tool drop (or a stale doc/literal) fails here
+# with a message that says exactly which number to fix.
+
+import re  # noqa: E402
+
+
+def _registered_count() -> int:
+    from server.mcp_server import registered_tool_names
+
+    return len(registered_tool_names())
+
+
+_SURFACE_COUNT_PATTERNS = (
+    r"(\d+)-tools?\b",          # "23-tool MCP", "23-tool surface"
+    r"\bThe (\d+) tools?\b",    # "## The 23 tools"
+    r"and the (\d+) tools?\b",  # docstring: "FastMCP instance and the 23 tools"
+    r"surface \((\d+)\)",       # docstring: "Tool surface (23)"
+)
+
+
+def _documented_tool_counts(text: str) -> list[int]:
+    """Every number that documents the FULL tool SURFACE.
+
+    Deliberately narrow: it must not match unrelated "N tools" prose (e.g. "the
+    18 tools map 1:1 onto StorageBackend", a subset/architecture claim), only the
+    phrasings this repo uses for the whole surface — so this guard tracks the tool
+    count without policing every sentence that happens to mention tools.
+    """
+    nums: list[str] = []
+    for pat in _SURFACE_COUNT_PATTERNS:
+        nums += re.findall(pat, text, flags=re.IGNORECASE)
+    return [int(n) for n in nums]
+
+
+def test_derived_expected_tool_count_matches_registry():
+    """In a full-dependency env EXPECTED_TOOL_COUNT is derived from the live
+    registry — so the smoke probe's assertion tracks the real surface for free."""
+    assert EXPECTED_TOOL_COUNT == _registered_count()
+
+
+def test_documented_fallback_literal_matches_registry():
+    """The bare-probe fallback literal can't silently rot: if a tool is added or
+    dropped, bump DOCUMENTED_TOOL_COUNT (and the docs below) in the same commit."""
+    assert DOCUMENTED_TOOL_COUNT == _registered_count(), (
+        f"scripts.smoke_mcp.DOCUMENTED_TOOL_COUNT={DOCUMENTED_TOOL_COUNT} but the "
+        f"registry has {_registered_count()} tools — update the literal."
+    )
+
+
+def test_mcp_server_docstring_tool_count_consistent():
+    import server.mcp_server as mcp_server
+
+    expected = _registered_count()
+    found = _documented_tool_counts(mcp_server.__doc__ or "")
+    assert found, "expected a 'N tools' / 'surface (N)' count in mcp_server's docstring"
+    assert all(n == expected for n in found), (
+        f"server/mcp_server.py docstring documents {sorted(set(found))} tools but "
+        f"the registry has {expected} — a tool was added/dropped, update the docstring."
+    )
+
+
+def test_readme_tool_count_consistent():
+    from pathlib import Path
+
+    readme = Path(__file__).resolve().parent.parent / "README.md"
+    expected = _registered_count()
+    found = _documented_tool_counts(readme.read_text())
+    assert found, "expected a 'N tools' / 'N-tool' count in README.md"
+    assert all(n == expected for n in found), (
+        f"README.md documents {sorted(set(found))} tools but the registry has "
+        f"{expected} — a tool was added/dropped, update the README."
+    )
