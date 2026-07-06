@@ -6,7 +6,16 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
-    "fastmcp>=2.3",
+    # PINNED: fastmcp 3.4.3 added HostOriginGuardMiddleware which rejects any
+    # request whose Host is not in DEFAULT_HOSTS with a bare 421 "Misdirected
+    # Request" (and any browser Origin not allowed with 403 "Forbidden Origin").
+    # We now RUN that guard for defense-in-depth, configured with the deployment
+    # domain(s) in allowed_hosts and the claude.ai connector in allowed_origins
+    # (see app.py / config.mcp_allowed_hosts). Pin fastmcp+mcp to verified-good
+    # versions so the deploy build matches dev and the guard behavior is stable;
+    # an unpinned build would drift and could change the guard's defaults.
+    "fastmcp==3.4.3",
+    "mcp==1.28.1",
     "psycopg[binary]>=3.2",
     "psycopg-pool>=3.2",
     "pydantic-settings>=2.4",

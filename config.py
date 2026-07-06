@@ -118,5 +118,27 @@ class Settings(BaseSettings):
     port: int = 8000
     log_level: str = "info"
 
+    # --- MCP Host/Origin protection (fastmcp >=3.4.3 HostOriginGuardMiddleware) ---
+    # Defense-in-depth against DNS-rebinding / cross-origin browser abuse, layered
+    # ON TOP of our bearer-token gate. The guard rejects any request whose Host is
+    # not in DEFAULT_HOSTS (loopback) + allowed_hosts with 421 "Misdirected
+    # Request", and any browser Origin not in allowed_origins with 403 "Forbidden
+    # Origin". Behind the Replit edge the external deployment domain must be listed
+    # explicitly or every prod request 421s (see .agents/memory/mcp-sse-edge-421.md).
+    # Both are comma-separated; entries support fnmatch patterns (e.g. "*.replit.app").
+    # Set to "*" to disable that dimension. The claude.ai web connector sends
+    # Origin: https://claude.ai, so it must be allowed or the connector 403s.
+    mcp_allowed_hosts: str = "mcp-assist-memory.replit.app,*.replit.app,*.replit.dev"
+    mcp_allowed_origins: str = "https://claude.ai"
+    mcp_host_origin_protection: bool = True
+
+    @property
+    def mcp_allowed_hosts_list(self) -> list[str]:
+        return [h.strip() for h in self.mcp_allowed_hosts.split(",") if h.strip()]
+
+    @property
+    def mcp_allowed_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.mcp_allowed_origins.split(",") if o.strip()]
+
 
 settings = Settings()  # import this; never read the environment elsewhere

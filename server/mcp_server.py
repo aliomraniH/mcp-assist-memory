@@ -637,3 +637,19 @@ class NamespaceACLMiddleware(Middleware):
 
 
 mcp.add_middleware(NamespaceACLMiddleware())
+
+
+def registered_tool_names() -> tuple[str, ...]:
+    """The sorted names of every tool registered on ``mcp`` — the single source of
+    truth for the tool surface.
+
+    Derived from the live registry (never a hand-maintained list), so the smoke
+    probe's expected count and the ``N tools`` docs can be cross-checked against
+    what is *actually* served instead of a number someone has to remember to bump.
+    ``run_middleware=False`` returns the raw registration set without needing an
+    HTTP request context, so this is safe to call at import time / from tests.
+    """
+    import asyncio
+
+    tools = asyncio.run(mcp.list_tools(run_middleware=False))
+    return tuple(sorted(t.name for t in tools))

@@ -17,7 +17,17 @@ password session).
 
 Transport: the MCP app runs in stateless HTTP mode — every request is
 self-contained, so client sessions survive VM restarts/redeploys and there is no
-in-memory session affinity to lose across the three surfaces.
+in-memory session affinity to lose across the three surfaces. Responses use plain
+JSON (``json_response=True``) rather than SSE streams: the Reserved-VM edge
+rejects the streamed responses with 421 Misdirected Request, and stateless MCP has
+no server-initiated messages that need an open stream anyway.
+
+Host/Origin protection: fastmcp (>=3.4.3) wraps the MCP app in a
+HostOriginGuardMiddleware — defense-in-depth against DNS-rebinding / cross-origin
+browser abuse layered on top of the bearer gate. It is configured (not disabled)
+with the deployment domain(s) in ``allowed_hosts`` and the claude.ai web connector
+origin in ``allowed_origins`` (see config.mcp_allowed_hosts / mcp_allowed_origins),
+so prod requests are validated rather than 421'd wholesale.
 """
 from __future__ import annotations
 
@@ -91,7 +101,21 @@ def _build_pool() -> AsyncConnectionPool:
 # The MCP ASGI app (Streamable HTTP), stateless: each request is self-contained,
 # so the three surfaces share no in-memory session state and survive restarts.
 # Its lifespan still runs the session manager and must be entered while serving.
-mcp_app = mcp.http_app(path="/", stateless_http=True)
+#
+# Host/Origin protection (fastmcp >=3.4.3): defense-in-depth against DNS-rebinding
+# / cross-origin browser abuse, on top of MCPAuthMiddleware's bearer gate. Behind
+# the Replit edge the external deployment domain is NOT in fastmcp's DEFAULT_HOSTS,
+# so we MUST list it in allowed_hosts or every prod request 421s; the claude.ai web
+# connector sends Origin: https://claude.ai, so it must be in allowed_origins or the
+# connector 403s. See config.mcp_allowed_hosts / .agents/memory/mcp-sse-edge-421.md.
+mcp_app = mcp.http_app(
+    path="/",
+    stateless_http=True,
+    json_response=True,
+    host_origin_protection=settings.mcp_host_origin_protection,
+    allowed_hosts=settings.mcp_allowed_hosts_list,
+    allowed_origins=settings.mcp_allowed_origins_list,
+)
 
 
 @asynccontextmanager
@@ -142,6 +166,12 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path.startswith("/mcp"):
+            # The MCP app is mounted at /mcp with its inner route at "/", so a bare
+            # "/mcp" (no trailing slash) would otherwise get a 307 redirect to
+            # "/mcp/". Some clients mishandle a 307 on POST, so normalize the path
+            # in-place here — the mounted app then serves it directly (no redirect).
+            if request.scope["path"] == "/mcp":
+                request.scope["path"] = "/mcp/"
             active = admin.get_active_tokens()
             if not active or not _request_has_token(request, active):
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -171,6 +201,14 @@ for _route in build_routes(admin, _session_secret, _admin_password):
     app.router.routes.append(_route)
 
 app.mount("/mcp", mcp_app)
+
+
+@app.get("/")
+async def root() -> Response:
+    """Lightweight liveness for platform deploy healthchecks. Returns 200 as soon
+    as the process is serving — no DB dependency — so healthchecks pass cleanly
+    during the cold-boot window. Use /healthz for a DB-aware readiness probe."""
+    return JSONResponse({"status": "ok", "service": "mcp-assist-memory"})
 
 
 @app.get("/healthz")

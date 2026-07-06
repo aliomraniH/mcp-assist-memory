@@ -1,7 +1,11 @@
-.PHONY: install migrate run test backfill
+.PHONY: install lock migrate run test smoke backfill
 
 install:
-	pip install -e ".[test]"
+	pip install -c constraints.txt -e ".[test]"
+
+# Regenerate constraints.txt after an intentional, verified dependency upgrade.
+lock:
+	./scripts/lock-deps.sh
 
 migrate:
 	python scripts/migrate.py
@@ -11,6 +15,11 @@ run:
 
 test:
 	pytest -q
+
+# Post-deploy MCP handshake probe. Set SMOKE_BASE_URL + SMOKE_TOKEN (an active
+# token from /admin); exits non-zero if the connector handshake/guard rails break.
+smoke:
+	python scripts/smoke_mcp.py
 
 backfill:
 	python scripts/backfill_artifacts.py $(SRC)
