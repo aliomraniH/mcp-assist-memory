@@ -1,51 +1,61 @@
 ---
-name: Deployed /mcp 421 = fastmcp 3.4.3 HostOriginGuard (unpinned-dep drift)
-description: Why the deployed /mcp returned 421 Misdirected Request in prod but 200 locally, and the real fix
+name: Deployed /mcp 421 = fastmcp HostOriginGuard — now CONFIGURED (not disabled)
+description: Why the deployed /mcp returned 421 in prod but 200 locally, and how the Host/Origin guard is now run correctly
 ---
 
-# Deployed /mcp returns 421 "Misdirected Request" — it's a fastmcp version-drift bug, NOT the edge / NOT SSE
+# Deployed /mcp 421 "Misdirected Request" — it's the fastmcp HostOriginGuard, NOT the edge / NOT SSE
 
 On the Reserved VM deployment, EVERY request routed into the mounted FastMCP app
-(`app.mount("/mcp", mcp.http_app(...))`) returned `421 Misdirected Request`
-(text/plain, 19 bytes) — for ALL methods including `OPTIONS`/`PATCH`/`PUT`
-(which Starlette answers itself, never reaching the MCP transport). uvicorn's own
-access log recorded the 421, with NO accompanying warning/traceback. Plain FastAPI
-routes (`/`, `/healthz`, `/admin`, a 404) passed through fine. The identical
-request returned 200 locally.
+returned `421 Misdirected Request` (text/plain, 19 bytes) — for ALL methods,
+including `OPTIONS`/`PATCH`/`PUT` that Starlette answers itself. Plain FastAPI
+routes (`/`, `/healthz`, `/admin`, a 404) passed fine. The identical request was
+200 locally.
 
-**Root cause: unpinned dependency drift.** `pyproject.toml` had `fastmcp>=2.3`
-with NO lockfile. The dev workspace had fastmcp **3.4.2**; the deploy's fresh
-`pip install -e .` resolved the latest, fastmcp **3.4.3** (+ mcp 1.28.1). fastmcp
-**3.4.3 added `HostOriginGuardMiddleware`** (`fastmcp/server/http.py`) that, when
-`host_origin_protection=True` (the default), rejects any request whose `Host`
-header isn't in `DEFAULT_HOSTS` + configured `allowed_hosts` + the ASGI
-`server` host — returning literally `Response("Misdirected Request", 421)` with
-**no log line**. Behind the Replit edge the external deployment domain is not in
-that set, so prod 421s uniformly while 3.4.2 (which has no such middleware) is 200.
+**Root cause: fastmcp's `HostOriginGuardMiddleware` (added in 3.4.3).** When
+`host_origin_protection=True` (the default), it rejects any request whose `Host`
+isn't in `DEFAULT_HOSTS` (`127.0.0.1`, `localhost`, `::1`) + configured
+`allowed_hosts` + the ASGI `server` host — returning `Response("Misdirected
+Request", 421)` with **no log line**. It also 403s "Forbidden Origin" for a
+browser `Origin` not in `allowed_origins`. Behind the Replit edge the external
+deployment domain is not in that set, so prod 421s uniformly. The FIRST time this
+bit us it arrived via **unpinned dependency drift**: `fastmcp>=2.3` + no lockfile
+let a fresh deploy build pull 3.4.3 while dev had 3.4.2 (which has no guard).
 
 **Why the earlier SSE / json_response theory was WRONG:** the 421 fires for
-OPTIONS/PATCH that never reach the streamable transport, and for plain-JSON error
-responses too — it's request-side host validation, not response framing. Setting
-`json_response=True` did nothing (harmless to keep, but not the fix).
+OPTIONS/PATCH that never reach the streamable transport, and for plain-JSON errors
+too — it's request-side host validation, not response framing. `json_response=True`
+did nothing for it (harmless to keep, but not the fix).
 
-**Fix applied:** pin the verified-good versions so deploy == dev:
-`fastmcp==3.4.2` and `mcp==1.27.2` in pyproject.toml. 3.4.2 has no host guard, so
-/mcp is reachable; our own `MCPAuthMiddleware` bearer-token gate still enforces auth.
+**Current state (the guard is now RUN, correctly configured — not disabled):**
+- Pinned `fastmcp==3.4.3`, `mcp==1.28.1` so deploy == dev and guard behavior is stable.
+- `app.py` `mcp.http_app(...)` passes `host_origin_protection=settings.mcp_host_origin_protection`
+  (default True), `allowed_hosts=settings.mcp_allowed_hosts_list`,
+  `allowed_origins=settings.mcp_allowed_origins_list`.
+- Defaults live in `config.py`: hosts = `mcp-assist-memory.replit.app,*.replit.app,*.replit.dev`,
+  origins = `https://claude.ai`. Both comma-separated, overridable via
+  `MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS`; entries support fnmatch (`*.replit.app`);
+  `"*"` disables a dimension. The guard is defense-in-depth ON TOP of our bearer gate.
+- Regression coverage: `tests/test_host_origin_guard.py` asserts deploy host + `*.replit.*`
+  + `https://claude.ai` are 200, an unlisted host is 421, a bad origin is 403, and the
+  guard stays enabled/configured.
 
-**Alternative fix (if you WANT to move to fastmcp >=3.4.3):** pass
-`host_origin_protection=False` (or `allowed_hosts=["*"], allowed_origins=["*"]`)
-to `mcp.http_app(...)`. Do NOT add that kwarg while pinned to 3.4.2 — it doesn't
-accept it and the app won't boot. `_host_matches` supports `"*"` and fnmatch
-patterns; the claude.ai web connector sends `Origin: https://claude.ai`, so if you
-keep host protection you must also allow that origin or it 403s "Forbidden Origin".
+**Matching rules to remember (from fastmcp/server/http.py):**
+- Host: `fnmatchcase` against DEFAULT_HOSTS + allowed_hosts + the (non-unspecified)
+  ASGI server host. So `0.0.0.0` bind adds nothing; the external domain MUST be listed.
+- Origin: only checked when an `Origin` header is present; loopback-to-loopback and
+  Origin==request-origin are auto-allowed, otherwise it must match `allowed_origins`.
+  The claude.ai web connector sends `Origin: https://claude.ai`.
 
-**How to apply / general lesson:** if a deployed server 421s (or otherwise differs)
-in prod but works locally, SUSPECT DEPENDENCY DRIFT FIRST — compare installed
-versions (`pip index versions <pkg>` shows LATEST vs INSTALLED) and read the newer
-version's code in a temp `pip install --target` dir. Unpinned deps + a fresh deploy
-build = dev/prod skew. Verifying locally will NOT reproduce it.
+**If /mcp 421s in prod again:** the deployment domain isn't in `allowed_hosts`
+(new custom domain, or someone narrowed the default) — add it to `MCP_ALLOWED_HOSTS`.
+If a browser client 403s "Forbidden Origin", add its origin to `MCP_ALLOWED_ORIGINS`.
+Do NOT "fix" it by flipping `host_origin_protection` off — that discards the guard.
+
+**General lesson:** if a deployed server 421s (or otherwise differs) in prod but
+works locally, SUSPECT the host guard / dependency drift FIRST — compare installed
+versions and read the newer version's code. Unpinned deps + a fresh deploy build =
+dev/prod skew that local verification will NOT reproduce.
 
 **Debugging note:** the deployment DB is separate from the dev workspace DB, so dev
 tokens 401 on prod; get a valid prod token from the prod `/admin` dashboard (login
-with ADMIN_PASSWORD, scrape the token from the dashboard HTML) — never the dev
-`admin_auth_tokens` row.
+with ADMIN_PASSWORD) — never the dev `admin_auth_tokens` row.

@@ -3,7 +3,7 @@
 - [MCP auth token: seed vs live](mcp-auth-token-seed.md) — env MCP_AUTH_TOKEN only seeds the `web` token; live per-label tokens live in Postgres, owned by /admin; verify with list_tokens().
 - [Reconnect retry policy](reconnect-retry-policy.md) — disconnect-retry: reads + event_id-gated writes always; session_* writes retry too (accepted at-least-once tradeoff); saves w/o event_id never retry.
 - [MCP stateless transport](mcp-stateless-transport.md) — /mcp runs stateless_http=True so sessions survive VM restart/redeploy; never revert to stateful to "fix" a session bug.
-- [Deployed /mcp 421 = fastmcp version drift](mcp-sse-edge-421.md) — prod-only 421 = unpinned dep let deploy pull fastmcp 3.4.3's HostOriginGuard; fix = pin fastmcp==3.4.2 + mcp==1.27.2 (not SSE/edge).
+- [Deployed /mcp 421 = fastmcp HostOriginGuard](mcp-sse-edge-421.md) — prod-only 421 = fastmcp's Host guard (not SSE/edge); now RUN configured on fastmcp==3.4.3/mcp==1.28.1 via config.mcp_allowed_hosts/origins, don't disable it.
 - [Publish DB migration validation](publish-db-migration-validation.md) — "Failed to validate database migrations" on republish = legacy/shared Neon dev DB; fix = republish with "Create production database" + copy dev data (user action, can't be disabled).
 - [Dashboard e2e test vs real secrets](dashboard-e2e-test-secrets.md) — login e2e must POST ADMIN_PW read from os.environ (not a hardcoded literal), or it goes red under any non-default ADMIN_PASSWORD (workspace secret or the CI-set value).
 - [GitHub reconciler token sourcing](github-connector-token.md) — explicit GITHUB_TOKEN wins, else fetch per-window from the Replit connector proxy (OAuth refreshes, never snapshot); failure → unverifiable.

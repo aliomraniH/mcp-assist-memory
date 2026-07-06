@@ -8,12 +8,14 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     # PINNED: fastmcp 3.4.3 added HostOriginGuardMiddleware which rejects any
     # request whose Host is not in DEFAULT_HOSTS with a bare 421 "Misdirected
-    # Request". Behind the Replit edge the deployment domain is not in that set,
-    # so an unpinned build (fastmcp>=2.3 -> latest) makes /mcp return 421 in prod
-    # while working locally. Pin fastmcp+mcp to the verified-good versions so the
-    # deploy build matches dev. Auth is already enforced by MCPAuthMiddleware.
-    "fastmcp==3.4.2",
-    "mcp==1.27.2",
+    # Request" (and any browser Origin not allowed with 403 "Forbidden Origin").
+    # We now RUN that guard for defense-in-depth, configured with the deployment
+    # domain(s) in allowed_hosts and the claude.ai connector in allowed_origins
+    # (see app.py / config.mcp_allowed_hosts). Pin fastmcp+mcp to verified-good
+    # versions so the deploy build matches dev and the guard behavior is stable;
+    # an unpinned build would drift and could change the guard's defaults.
+    "fastmcp==3.4.3",
+    "mcp==1.28.1",
     "psycopg[binary]>=3.2",
     "psycopg-pool>=3.2",
     "pydantic-settings>=2.4",
