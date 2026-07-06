@@ -1,0 +1,65 @@
+name: smoke
+
+# Post-deploy MCP handshake probe. Runs scripts/smoke_mcp.py against a LIVE base
+# URL — the same initialize + tools/list a Claude connector performs — so a
+# transport/auth/host regression (like the fastmcp 3.4.3 421) is flagged instead
+# of being discovered by a user whose connector won't connect.
+#
+# Trigger it manually (Actions -> smoke -> Run workflow) right after a deploy, or
+# on the schedule below. The in-process half of this check runs on every push via
+# the `test` job (pytest picks up tests/test_smoke_mcp.py) — that gate BLOCKS a
+# broken build from shipping; this workflow FLAGS an unhealthy live deployment.
+#
+# Requires two repo secrets (Settings -> Secrets and variables -> Actions):
+#   SMOKE_BASE_URL   — the deployed base URL, e.g. https://your-vm.example
+#   SMOKE_TOKEN      — an active token from the /admin dashboard
+# If either is absent (e.g. on a fork), the job no-ops cleanly instead of failing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Base URL to probe (overrides the SMOKE_BASE_URL secret)"
+        required: false
+        type: string
+  schedule:
+    - cron: "0 */6 * * *"  # every 6 hours
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve target + gate on secrets
+        id: gate
+        env:
+          BASE_URL: ${{ inputs.base_url || secrets.SMOKE_BASE_URL }}
+          SMOKE_TOKEN: ${{ secrets.SMOKE_TOKEN }}
+        run: |
+          if [ -n "$BASE_URL" ] && [ -n "$SMOKE_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SMOKE_BASE_URL / SMOKE_TOKEN not set — skipping the live smoke probe."
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          python-version: "3.11"
+
+      - name: Install httpx
+        if: steps.gate.outputs.enabled == 'true'
+        run: pip install "httpx>=0.27"
+
+      - name: Probe the deployed MCP surface
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          SMOKE_BASE_URL: ${{ inputs.base_url || secrets.SMOKE_BASE_URL }}
+          SMOKE_TOKEN: ${{ secrets.SMOKE_TOKEN }}
+        run: python scripts/smoke_mcp.py

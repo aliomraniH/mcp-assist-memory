@@ -205,6 +205,28 @@ CI (`.github/workflows/test.yml`) spins an **ephemeral Neon branch** per run,
 migrates it, runs `pytest`, and deletes the branch. Set repo secrets
 `NEON_API_KEY` and `NEON_PROJECT_ID` to enable it.
 
+## Smoke test (the connector handshake)
+
+`scripts/smoke_mcp.py` performs the exact handshake a Claude connector does —
+`initialize` + `tools/list` over `/mcp` with a valid token — and asserts HTTP 200
+with the full **23-tool** surface, plus the guard rails (no/bad token ⇒ 401,
+`/healthz` db ok). It exists so a transport/auth/host regression (like the
+fastmcp 3.4.3 421) can never ship silently again.
+
+- **Blocks a bad build:** the in-process half runs in CI via `pytest`
+  (`tests/test_smoke_mcp.py`) against the ephemeral Neon branch — a broken
+  handshake, gate, or tool count fails the build before it can deploy.
+- **Flags an unhealthy live deploy:** run it against the deployed URL after a
+  deploy. It exits non-zero on any failed check:
+
+  ```bash
+  SMOKE_BASE_URL=https://<your-vm> SMOKE_TOKEN=<active token> make smoke
+  ```
+
+  `.github/workflows/smoke.yml` runs this against a live URL on manual dispatch
+  (or a 6-hour schedule); set repo secrets `SMOKE_BASE_URL` and `SMOKE_TOKEN` to
+  enable it (it no-ops cleanly when unset).
+
 ## Deploy on Replit (Reserved VM)
 
 1. In **Secrets**, set `DATABASE_URL` (pooled endpoint), `MCP_AUTH_TOKEN`, and
