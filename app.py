@@ -17,7 +17,10 @@ password session).
 
 Transport: the MCP app runs in stateless HTTP mode — every request is
 self-contained, so client sessions survive VM restarts/redeploys and there is no
-in-memory session affinity to lose across the three surfaces.
+in-memory session affinity to lose across the three surfaces. Responses use plain
+JSON (``json_response=True``) rather than SSE streams: the Reserved-VM edge
+rejects the streamed responses with 421 Misdirected Request, and stateless MCP has
+no server-initiated messages that need an open stream anyway.
 """
 from __future__ import annotations
 
@@ -91,7 +94,7 @@ def _build_pool() -> AsyncConnectionPool:
 # The MCP ASGI app (Streamable HTTP), stateless: each request is self-contained,
 # so the three surfaces share no in-memory session state and survive restarts.
 # Its lifespan still runs the session manager and must be entered while serving.
-mcp_app = mcp.http_app(path="/", stateless_http=True)
+mcp_app = mcp.http_app(path="/", stateless_http=True, json_response=True)
 
 
 @asynccontextmanager

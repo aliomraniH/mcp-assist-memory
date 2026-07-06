@@ -3,6 +3,7 @@
 - [MCP auth token: seed vs live](mcp-auth-token-seed.md) — env MCP_AUTH_TOKEN only seeds the `web` token; live per-label tokens live in Postgres, owned by /admin; verify with list_tokens().
 - [Reconnect retry policy](reconnect-retry-policy.md) — disconnect-retry: reads + event_id-gated writes always; session_* writes retry too (accepted at-least-once tradeoff); saves w/o event_id never retry.
 - [MCP stateless transport](mcp-stateless-transport.md) — /mcp runs stateless_http=True so sessions survive VM restart/redeploy; never revert to stateful to "fix" a session bug.
+- [MCP SSE 421 on Reserved VM edge](mcp-sse-edge-421.md) — deployed /mcp SSE responses get 421 Misdirected Request at the edge; fix is json_response=True; not reproducible locally.
 - [Publish DB migration validation](publish-db-migration-validation.md) — "Failed to validate database migrations" on republish = legacy/shared Neon dev DB; fix = republish with "Create production database" + copy dev data (user action, can't be disabled).
 - [Dashboard e2e test vs real secrets](dashboard-e2e-test-secrets.md) — login e2e must POST ADMIN_PW read from os.environ (not a hardcoded literal), or it goes red under any non-default ADMIN_PASSWORD (workspace secret or the CI-set value).
 - [GitHub reconciler token sourcing](github-connector-token.md) — explicit GITHUB_TOKEN wins, else fetch per-window from the Replit connector proxy (OAuth refreshes, never snapshot); failure → unverifiable.
