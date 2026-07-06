@@ -142,6 +142,12 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path.startswith("/mcp"):
+            # The MCP app is mounted at /mcp with its inner route at "/", so a bare
+            # "/mcp" (no trailing slash) would otherwise get a 307 redirect to
+            # "/mcp/". Some clients mishandle a 307 on POST, so normalize the path
+            # in-place here — the mounted app then serves it directly (no redirect).
+            if request.scope["path"] == "/mcp":
+                request.scope["path"] = "/mcp/"
             active = admin.get_active_tokens()
             if not active or not _request_has_token(request, active):
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -171,6 +177,14 @@ for _route in build_routes(admin, _session_secret, _admin_password):
     app.router.routes.append(_route)
 
 app.mount("/mcp", mcp_app)
+
+
+@app.get("/")
+async def root() -> Response:
+    """Lightweight liveness for platform deploy healthchecks. Returns 200 as soon
+    as the process is serving — no DB dependency — so healthchecks pass cleanly
+    during the cold-boot window. Use /healthz for a DB-aware readiness probe."""
+    return JSONResponse({"status": "ok", "service": "mcp-assist-memory"})
 
 
 @app.get("/healthz")
