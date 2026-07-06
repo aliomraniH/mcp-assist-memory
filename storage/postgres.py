@@ -605,7 +605,7 @@ class PostgresBackend(StorageBackend):
         return entry
 
     @_retry_on_disconnect
-    async def memory_get(self, namespace, key) -> dict | None:
+    async def memory_get(self, namespace, key, *, include_quarantined=False) -> dict | None:
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
             cur = await conn.execute(
@@ -614,6 +614,12 @@ class PostgresBackend(StorageBackend):
             )
             row = await cur.fetchone()
         if row is None or not _is_live(row):
+            return None
+        # T3.2: quarantined entries are excluded from default reads on EVERY read
+        # path — the exact-key get included, to stay consistent with memory_list /
+        # memory_search / handoff_load. Opt back in with include_quarantined=True
+        # (the verdict stays visible on the returned entry).
+        if row.get("quarantined") and not include_quarantined:
             return None
         return _row_to_entry(row)
 
@@ -1250,7 +1256,9 @@ class PostgresBackend(StorageBackend):
         candidates = [target_key, op.get("supersedes"),
                       *(op.get("merge_from") or op.get("supersedes_keys") or [])]
         for cand in filter(None, candidates):
-            existing = await self.memory_get(namespace, cand)
+            # see quarantined targets too: a same-family conflict must still be
+            # caught even when the target is held in quarantine.
+            existing = await self.memory_get(namespace, cand, include_quarantined=True)
             if existing and (existing.get("origin_model_family") or "").lower() == curator_family.lower():
                 return AppError(
                     "curator_family_conflict",
@@ -1365,10 +1373,9 @@ class PostgresBackend(StorageBackend):
         )
 
     async def handoff_load(self, namespace, key, *, include_quarantined=False) -> dict | None:
-        entry = await self.memory_get(namespace, key)
-        if entry is not None and entry.get("quarantined") and not include_quarantined:
-            return None  # T3.2: quarantined handoffs are excluded by default
-        return entry
+        # T3.2: quarantine exclusion now lives in memory_get; delegate so the two
+        # exact-key read paths cannot drift apart.
+        return await self.memory_get(namespace, key, include_quarantined=include_quarantined)
 
     async def handoff_list(self, namespace, *, limit=100, include_quarantined=False) -> list[dict]:
         return await self.memory_list(

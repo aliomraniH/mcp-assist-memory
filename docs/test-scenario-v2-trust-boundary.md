@@ -240,16 +240,19 @@ surface.
 
 ## Findings
 
-1. **`memory_get` bypasses quarantine filtering (inconsistency).**
-   `memory_list`, `memory_search`, and `handoff_load` all exclude quarantined
-   entries unless `include_quarantined: true`; `memory_get` has no such
-   parameter and returns quarantined revisions directly
-   (verdict visible). `memory_save`'s own contract says quarantined writes "are
-   excluded from reads by default — pass include_quarantined:true on reads to
-   see them", and `handoff_load` — the equivalent exact-key read — returns
-   `null`. Either add `include_quarantined` (default false) to `memory_get`, or
-   document exact-key memory reads as intentionally exempt. *Logged live via
+1. **`memory_get` bypassed quarantine filtering (inconsistency).** — **FIXED.**
+   `memory_list`, `memory_search`, and `handoff_load` all excluded quarantined
+   entries unless `include_quarantined: true`; `memory_get` had no such
+   parameter and returned quarantined revisions directly (verdict visible),
+   contradicting `memory_save`'s own contract ("excluded from reads by default")
+   and the parallel `handoff_load` exact-key read. *Logged live via
    `observation_log` (revision_id 2782).*
+   Fix: `memory_get` now takes `include_quarantined` (default `false`) and
+   returns `null` for a quarantined latest revision unless opted in; the two
+   exact-key reads no longer duplicate the rule — `handoff_load` delegates to
+   `memory_get`. Covered by `tests/test_get_quarantine.py` (backend contract,
+   all-read-paths-agree, override-clears-it, MCP tool surface, and a rule-4
+   docstring guard).
 2. **A fresh `unverifiable` verdict clears `needs_reverification` for the full
    window.** After reconcile, claims whose verdict was `unverifiable` (no
    resolvable provenance — they can *never* verify) dropped off the
