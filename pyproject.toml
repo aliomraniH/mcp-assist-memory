@@ -6,7 +6,14 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
-    "fastmcp>=2.3",
+    # PINNED: fastmcp 3.4.3 added HostOriginGuardMiddleware which rejects any
+    # request whose Host is not in DEFAULT_HOSTS with a bare 421 "Misdirected
+    # Request". Behind the Replit edge the deployment domain is not in that set,
+    # so an unpinned build (fastmcp>=2.3 -> latest) makes /mcp return 421 in prod
+    # while working locally. Pin fastmcp+mcp to the verified-good versions so the
+    # deploy build matches dev. Auth is already enforced by MCPAuthMiddleware.
+    "fastmcp==3.4.2",
+    "mcp==1.27.2",
     "psycopg[binary]>=3.2",
     "psycopg-pool>=3.2",
     "pydantic-settings>=2.4",

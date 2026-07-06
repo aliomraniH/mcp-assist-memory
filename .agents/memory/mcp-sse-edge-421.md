@@ -1,40 +1,51 @@
 ---
-name: MCP SSE responses 421 on Reserved VM edge
-description: Why the deployed /mcp endpoint returned 421 and the json_response fix
+name: Deployed /mcp 421 = fastmcp 3.4.3 HostOriginGuard (unpinned-dep drift)
+description: Why the deployed /mcp returned 421 Misdirected Request in prod but 200 locally, and the real fix
 ---
 
-# Streamed MCP (SSE) responses get 421 Misdirected Request behind the Reserved VM edge
+# Deployed /mcp returns 421 "Misdirected Request" — it's a fastmcp version-drift bug, NOT the edge / NOT SSE
 
-On the Reserved VM deployment, every *authenticated* request that reached the
-mounted FastMCP app (`app.mount("/mcp", mcp.http_app(...))`) returned
-`421 Misdirected Request` — `initialize`, `tools/list`, `DELETE`, even an
-`Accept: application/json`-only request. Unauthenticated `/mcp` (short JSON 401
-from our own middleware) and all plain FastAPI routes (`/`, `/healthz`, `/admin`)
-worked fine. The identical authenticated request returned 200 locally.
+On the Reserved VM deployment, EVERY request routed into the mounted FastMCP app
+(`app.mount("/mcp", mcp.http_app(...))`) returned `421 Misdirected Request`
+(text/plain, 19 bytes) — for ALL methods including `OPTIONS`/`PATCH`/`PUT`
+(which Starlette answers itself, never reaching the MCP transport). uvicorn's own
+access log recorded the 421, with NO accompanying warning/traceback. Plain FastAPI
+routes (`/`, `/healthz`, `/admin`, a 404) passed through fine. The identical
+request returned 200 locally.
 
-**Root cause:** default FastMCP StreamableHTTP replies as **SSE**
-(`text/event-stream`, streamed/chunked). The Replit/Google edge (GFE) rejects
-those streamed responses with its own `421` page (body literally
-`"Misdirected Request"` — note our app code has *no* 421 path; the mcp SDK's only
-421 is DNS-rebinding host validation, which is disabled by default and emits
-`"Invalid Host header"`, so it's not us). It is NOT a v2 regression — the transport
-config was byte-identical to the prior version.
+**Root cause: unpinned dependency drift.** `pyproject.toml` had `fastmcp>=2.3`
+with NO lockfile. The dev workspace had fastmcp **3.4.2**; the deploy's fresh
+`pip install -e .` resolved the latest, fastmcp **3.4.3** (+ mcp 1.28.1). fastmcp
+**3.4.3 added `HostOriginGuardMiddleware`** (`fastmcp/server/http.py`) that, when
+`host_origin_protection=True` (the default), rejects any request whose `Host`
+header isn't in `DEFAULT_HOSTS` + configured `allowed_hosts` + the ASGI
+`server` host — returning literally `Response("Misdirected Request", 421)` with
+**no log line**. Behind the Replit edge the external deployment domain is not in
+that set, so prod 421s uniformly while 3.4.2 (which has no such middleware) is 200.
 
-**Fix:** build the app with plain JSON responses:
-`mcp.http_app(path="/", stateless_http=True, json_response=True)`.
-Stateless MCP has no server-initiated messages, so nothing needs an open SSE
-stream. Both framings are MCP-spec compliant and Claude clients accept
-`application/json`.
+**Why the earlier SSE / json_response theory was WRONG:** the 421 fires for
+OPTIONS/PATCH that never reach the streamable transport, and for plain-JSON error
+responses too — it's request-side host validation, not response framing. Setting
+`json_response=True` did nothing (harmless to keep, but not the fix).
 
-**Why:** the edge does not proxy the streamed SSE response for POST /mcp;
-json_response makes it a normal Content-Length JSON body the edge passes through.
+**Fix applied:** pin the verified-good versions so deploy == dev:
+`fastmcp==3.4.2` and `mcp==1.27.2` in pyproject.toml. 3.4.2 has no host guard, so
+/mcp is reachable; our own `MCPAuthMiddleware` bearer-token gate still enforces auth.
 
-**How to apply:** if a deployed FastMCP/StreamableHTTP endpoint 421s only on the
-authenticated/streaming path while health routes are fine, switch to
-`json_response=True` before suspecting host/auth/DB. Verifying locally will NOT
-reproduce the 421 (no edge in front) — confirm the fix by redeploying.
+**Alternative fix (if you WANT to move to fastmcp >=3.4.3):** pass
+`host_origin_protection=False` (or `allowed_hosts=["*"], allowed_origins=["*"]`)
+to `mcp.http_app(...)`. Do NOT add that kwarg while pinned to 3.4.2 — it doesn't
+accept it and the app won't boot. `_host_matches` supports `"*"` and fnmatch
+patterns; the claude.ai web connector sends `Origin: https://claude.ai`, so if you
+keep host protection you must also allow that origin or it 403s "Forbidden Origin".
 
-**Debugging note:** the deployment DB is separate from the dev workspace DB, so
-dev tokens 401 on prod; get a valid prod token from the prod `/admin` dashboard
-(login with ADMIN_PASSWORD, scrape the token from the dashboard HTML) — never the
-dev `admin_auth_tokens` row.
+**How to apply / general lesson:** if a deployed server 421s (or otherwise differs)
+in prod but works locally, SUSPECT DEPENDENCY DRIFT FIRST — compare installed
+versions (`pip index versions <pkg>` shows LATEST vs INSTALLED) and read the newer
+version's code in a temp `pip install --target` dir. Unpinned deps + a fresh deploy
+build = dev/prod skew. Verifying locally will NOT reproduce it.
+
+**Debugging note:** the deployment DB is separate from the dev workspace DB, so dev
+tokens 401 on prod; get a valid prod token from the prod `/admin` dashboard (login
+with ADMIN_PASSWORD, scrape the token from the dashboard HTML) — never the dev
+`admin_auth_tokens` row.
