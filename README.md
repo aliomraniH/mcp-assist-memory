@@ -51,6 +51,143 @@ namespace *values*, never in tool names, tables, columns, or code.
 `/healthz` (liveness) and the `/admin` token dashboard are served separately (not
 MCP tools).
 
+## Using the tools — worked examples
+
+How the tools help a real project, grouped by the problem each one solves. Every
+request/response below is trimmed real output from the live server (`server_version
+0.2.0`); pick a `namespace` for your project (here `acme-billing`) and pass it on
+every call.
+
+### 1. Remember a decision, and know it actually persisted
+
+The problem an agent hits with a naive store: "I wrote it, but did it land?"
+`memory_save` **reads its own write back** before acking, so the response proves
+persistence (`verified_persisted`, `revision_id`, `content_hash`) instead of
+hoping.
+
+```jsonc
+// memory_save
+{ "namespace": "acme-billing", "key": "decision/currency-rounding",
+  "kind": "decision", "actor": "backend-agent", "origin": "human",
+  "value": "Round half-to-even at 2dp; store minor units as integers." }
+// ack →
+{ "revision": 1, "revision_id": 2754, "verified_persisted": true,
+  "content_hash": "57e29c0f…", "deduplicated": false }
+```
+
+Read it back later with `memory_get(namespace, "decision/currency-rounding")`,
+list a whole area with `memory_list(namespace, prefix="decision/")`, or see how a
+value changed over time with `memory_history` (append-only, tombstones included).
+
+### 2. Hand work between surfaces (web ↔ CLI ↔ desktop)
+
+A plan produced in the claude.ai web connector, picked up by the Claude Code CLI.
+`handoff_save` / `handoff_load` share one key across surfaces:
+
+```jsonc
+// handoff_save (web)  →  handoff_load (cli)
+{ "namespace": "acme-billing", "key": "baton/next-step",
+  "value": { "next_step": "run migrations", "owner": "cli" } }
+```
+
+### 3. Exactly-once writes during an offline replay
+
+An agent that batches writes and replays them after a disconnect must not
+double-write. Pass a stable `event_id` (a uuid) and dedup is scoped to
+`(namespace, actor)` — a replay comes back **visibly** deduplicated, never
+silently dropped, and never as a second row:
+
+```jsonc
+// same event_id, replayed →
+{ "revision": 1, "deduplicated": true, "original_created_at": "2026-07-07T16:33:56Z" }
+```
+
+A *different* writer (`actor`) with the same id is treated as a genuinely separate
+write — so "the subject under measurement" and "the instrument recording it" never
+collide.
+
+### 4. Track a claim about the repo, and re-verify it against GitHub
+
+The most dangerous memory is a `claim` about mutable external state ("PR #42 is
+merged", "main is at abc123") — true when written, stale an hour later. Save it
+with provenance in `meta`, then `coord_reconcile` resolves each claim against
+**live GitHub** and stamps an append-only verdict — it never rewrites your entry:
+
+```jsonc
+// memory_save kind=claim, meta={repo, branch, repo_sha}
+// coord_reconcile(namespace) →
+{ "resolver_enabled": true, "verdicts": [
+  { "key": "claim/main-head", "state": "current",  "resolved": { "head": "858156e…" } },
+  { "key": "claim/old-head",  "state": "stale",     "claim_repo_sha": "9c4316d" },
+  { "key": "claim/no-meta",   "state": "unverifiable",
+    "reason": "claim has no resolvable subject (need meta.repo + meta.pr or meta.branch)" } ] }
+```
+
+Run `coord_health(namespace)` at **session start** for a one-shot triage report:
+`stale` entries, `duplicate_content`, `claim_collisions`, `quarantined_count`,
+`tainted_lineage` (descendants of a quarantined source), and `needs_reverification`
+(claims whose verdict has aged out — or can *never* verify). It tells you what to
+distrust before you build on the store.
+
+### 5. Store untrusted text without getting prompt-injected
+
+Memory often holds retrieved web content, tool output, user text — the classic
+lethal-trifecta risk. Two independent layers handle it, visibly:
+
+- **Screening + quarantine.** An instruction-shaped write persists but is held
+  back: `quarantined: true, screening: ["instruction_override"]` in the ack, and
+  it's **excluded from default reads** (`memory_get`/`list`/`search`,
+  `handoff_load` all return `null`/skip it). Opt in with `include_quarantined:
+  true`; clear it deliberately with a new revision carrying
+  `meta.screening_override` + a real actor (the quarantined revision stays in
+  history as an audit trail).
+- **Read-time wrapping.** Every string value comes back inside
+  `<<<UNTRUSTED_DATA>>>…<<<END>>>` so a downstream model treats it as data, not
+  instructions. Forged markers inside stored text are escaped one-way to
+  `[[UNTRUSTED_DATA]]` and never reconstructed. Need the raw value (e.g. to
+  `json.loads`)? `storage.sanitize.unwrap_value` strips the markers.
+
+> Honest framing: these are layers, not proofs — a deterministic screen is
+> bypassable by paraphrase, so the read-time wrapper is the boundary you actually
+> rely on. See `DECISION-PROTOCOL.md`.
+
+### 6. Find a memory by meaning, not exact key
+
+`memory_search(namespace, query)` ranks live entries semantically (pgvector cosine
+over embeddings, with a HyDE leg for curated rows) and backfills keyword matches;
+with no embedding key set it degrades to substring search. Internal bookkeeping
+(`coord/_reconcile/*`, `_meta/*`) is excluded so it never outranks your own notes.
+
+### 7. Big blobs: content-addressed artifacts
+
+`artifact_put(base64)` returns a sha256 and dedups globally — re-putting identical
+bytes returns the same hash with `deduped: true`, so shared build outputs or
+fixtures are stored once. 50 MB write cap; blobs under the inline limit come back
+in `artifact_get`, larger ones stream from `GET /artifact/{sha256}`.
+
+### 8. Record an episodic session (and consolidate it)
+
+`session_create` → ordered `session_append_event` (same visible `event_id` dedup)
+→ `session_events` gives you a replayable trace of what an agent did. At session
+end, `coord_curate(namespace, session_id)` (when an Anthropic key is configured)
+reads that trace plus similar memories and proposes durable
+`ADD`/`UPDATE`/`MERGE`/`SUPERSEDE` operations — `dry_run: true` to preview. Every
+response carries `curator_status ∈ ok|error|disabled` so an empty result is never
+ambiguous.
+
+### 9. Tell the server when it surprised you
+
+`observation_log(namespace, category, …)` is the feedback channel the server's
+ergonomics are tuned from — append-only under `_meta/observations`, auto-tagged
+with the namespace's recent friction (last error code, last quarantine verdict,
+variant profile). Never put patient data or secrets in it (it's disabled entirely
+in clinical namespaces).
+
+> A full 23-tool / 16-challenge live run — with the exact payloads these examples
+> are trimmed from — is in
+> [`docs/test-scenario-tools-j586va.md`](./docs/test-scenario-tools-j586va.md) and
+> [`docs/test-scenario-v2-trust-boundary.md`](./docs/test-scenario-v2-trust-boundary.md).
+
 ## Tenancy — namespace is the project boundary
 
 **`namespace` == project == tenant.** One namespace per project (e.g.
