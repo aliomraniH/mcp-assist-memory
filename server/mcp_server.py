@@ -469,8 +469,12 @@ async def coord_curate(namespace: str, session_id: str, dry_run: bool = False) -
     deterministically: ADD/UPDATE/MERGE/SUPERSEDE/NOOP. Every op passes a fail-closed
     PHI gate first, claims without provenance (meta.repo + meta.pr/branch) are
     downgraded to notes, supersession sets a validity boundary (history is kept, never
-    deleted), and writes are idempotent so re-running the same session never
-    double-writes. When the curator is disabled (no Anthropic key) it returns
+    deleted), and writes are idempotent at BOTH levels: re-applying the same
+    session never double-writes (deterministic event_id), and an UPDATE whose
+    content hashes identically to the live revision is recorded as a NOOP
+    ("unchanged_content") instead of churning a byte-identical revision — so
+    repeated end-of-session triggers (Stop hooks, re-runs) are true no-ops on
+    replay. When the curator is disabled (no Anthropic key) it returns
     {curator_enabled: false, curator_status: "disabled", operations: []} — a clear
     no-op, never a guess. Every response carries curator_status ∈ ok|error|disabled
     so an empty operations list is unambiguous: `ok` = a deliberate NOOP (the model

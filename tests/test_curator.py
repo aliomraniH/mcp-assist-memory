@@ -135,6 +135,52 @@ async def test_idempotent_double_curate(curate_backend, ns):
     assert len(hist) == 1
 
 
+async def test_unchanged_update_is_revision_stable_noop(curate_backend, ns):
+    # Revision-level idempotency: an UPDATE whose content hashes identically to
+    # the live revision (a "confirmation") must NOT churn a new revision — even
+    # from a DIFFERENT session, where the deterministic event_id gate can't help.
+    sid1 = await _seed_session(curate_backend, ns)
+    curate_backend.curator.result = {"operations": [{
+        "op": "ADD", "key": "knowledge/stable", "kind": "knowledge",
+        "value": {"lesson": "prefer X over Y"},
+    }]}
+    await curate_backend.coord_curate(ns, sid1)
+
+    sid2 = await _seed_session(curate_backend, ns)
+    curate_backend.curator.result = {"operations": [{
+        "op": "UPDATE", "key": "knowledge/stable", "kind": "knowledge",
+        "value": {"lesson": "prefer X over Y"},
+        "reason": "matches exactly, confirming with same evidence",
+    }]}
+    out = await curate_backend.coord_curate(ns, sid2)
+    assert out["counts"]["updated"] == 0
+    assert out["counts"]["noop"] == 1
+    assert any("unchanged_content" in (n.get("reason") or "") for n in out["noops"])
+    hist = await curate_backend.memory_history(ns, "knowledge/stable")
+    assert len(hist) == 1  # still revision 1 — no churn on replay
+
+
+async def test_changed_update_still_writes_new_revision(curate_backend, ns):
+    # The guard only skips byte-identical confirmations: real changes still land.
+    sid1 = await _seed_session(curate_backend, ns)
+    curate_backend.curator.result = {"operations": [{
+        "op": "ADD", "key": "knowledge/evolving", "kind": "knowledge",
+        "value": {"lesson": "prefer X over Y"},
+    }]}
+    await curate_backend.coord_curate(ns, sid1)
+
+    sid2 = await _seed_session(curate_backend, ns)
+    curate_backend.curator.result = {"operations": [{
+        "op": "UPDATE", "key": "knowledge/evolving", "kind": "knowledge",
+        "value": {"lesson": "prefer X over Y, except when Z"},
+    }]}
+    out = await curate_backend.coord_curate(ns, sid2)
+    assert out["counts"]["updated"] == 1
+    assert out["counts"]["noop"] == 0
+    hist = await curate_backend.memory_history(ns, "knowledge/evolving")
+    assert len(hist) == 2
+
+
 async def test_dry_run_writes_nothing(curate_backend, ns):
     sid = await _seed_session(curate_backend, ns)
     curate_backend.curator.result = {"operations": [{

@@ -1342,6 +1342,27 @@ class PostgresBackend(StorageBackend):
                 op = {**op, "kind": "note", "_downgraded": True,
                       "tags": list(op.get("tags") or []) + ["claim-downgraded"]}
                 counts["downgraded"] += 1
+            # Replay guard (revision-level idempotency): an UPDATE whose sanitized
+            # value hashes identically to the current live revision (same kind) is
+            # a pure confirmation, not new information — record it as a NOOP
+            # instead of churning a byte-identical revision. This makes repeated
+            # end-of-session curation (Stop hooks, re-runs) truly no-op on replay;
+            # the key-level dedup via deterministic event_id already covers exact
+            # same-session re-application.
+            if action == "UPDATE":
+                existing = await self.memory_get(namespace, op["key"])
+                if existing is not None:
+                    new_value = op.get("value") if op.get("value") is not None else {}
+                    new_hash = _content_hash(sanitize(new_value))
+                    old_hash = existing.get("content_hash") or _content_hash(existing.get("value"))
+                    if new_hash == old_hash and (op.get("kind") or "note") == existing.get("kind"):
+                        counts["noop"] += 1
+                        noops.append({
+                            "subjects": [op["key"]],
+                            "reason": "unchanged_content: content_hash matches the live "
+                                      "revision — confirmation recorded, revision not churned",
+                        })
+                        continue
             written = await self._write_curation_op(
                 namespace, op, session_id=session_id, action=action)
             applied.append(written)
