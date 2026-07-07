@@ -116,3 +116,40 @@ async def test_search_falls_back_to_keyword_without_embedder(backend, ns):
     assert any(r["key"] == "k" for r in results)
     # A query with no substring match returns nothing (no semantic recall).
     assert await backend.memory_search(ns, "completely-unrelated-qqq") == []
+
+
+# ---- house-band exclusion (Finding 4): reconcile verdicts / _meta out of search
+async def test_search_excludes_reconcile_house_band(semantic_backend, ns):
+    """coord/_reconcile/* verdict records are machine bookkeeping, not user
+    memories — they must not surface in ranked search (they'd outrank the user's
+    own knowledge entry that shares vocabulary). Covers both the embedding legs
+    and the keyword leg."""
+    b = semantic_backend
+    shared = "short sha prefix reconcile lesson vocabulary sentinel"
+    await b.memory_save(ns, "knowledge/lesson", {"note": shared}, kind="knowledge")
+    # a verdict record carrying the SAME vocabulary
+    await b.memory_save(ns, "coord/_reconcile/claim/x",
+                        {"state": "current", "note": shared}, kind="config")
+
+    results = await b.memory_search(ns, shared, limit=10)
+    keys = [r["key"] for r in results]
+    assert "knowledge/lesson" in keys
+    assert all(not k.startswith("coord/_reconcile/") for k in keys)
+
+
+async def test_search_excludes_meta_house_band(backend, ns):
+    """_meta/* bookkeeping is likewise excluded from search (keyword path)."""
+    await backend.memory_save(ns, "note/real", {"note": "needle-xyz sentinel"})
+    await backend.memory_save(ns, "_meta/custom", {"note": "needle-xyz sentinel"})
+
+    keys = [r["key"] for r in await backend.memory_search(ns, "needle-xyz")]
+    assert "note/real" in keys
+    assert all(not k.startswith("_meta/") for k in keys)
+
+
+async def test_search_exclusion_is_narrow_not_all_coord(backend, ns):
+    """Only the coord/_reconcile/ house-band is filtered — an ordinary coord/*
+    key is still searchable (guards against over-broadening the exclusion)."""
+    await backend.memory_save(ns, "coord/plan", {"note": "roadmap-token alpha"})
+    results = await backend.memory_search(ns, "roadmap-token")
+    assert any(r["key"] == "coord/plan" for r in results)

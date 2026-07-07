@@ -253,22 +253,27 @@ surface.
    `memory_get`. Covered by `tests/test_get_quarantine.py` (backend contract,
    all-read-paths-agree, override-clears-it, MCP tool surface, and a rule-4
    docstring guard).
-2. **A fresh `unverifiable` verdict clears `needs_reverification` for the full
-   window.** After reconcile, claims whose verdict was `unverifiable` (no
-   resolvable provenance — they can *never* verify) dropped off the
-   reverification list just like `current` ones, and stay off for
-   `claim_staleness_hours` (72 h). Symmetric-skepticism nuance: a permanently
-   unverifiable claim looks "handled" for 3 days at a time. Consider keeping
-   `unverifiable` claims in `needs_reverification` (or a dedicated block) so
-   they stay visible.
+2. **A fresh `unverifiable` verdict cleared `needs_reverification` for the full
+   window.** — **FIXED.** After reconcile, claims whose verdict was
+   `unverifiable` (no resolvable provenance — they can *never* verify) dropped
+   off the reverification list just like `current` ones and stayed off for
+   `claim_staleness_hours` (72 h), so a permanently-unverifiable claim read as
+   "handled" for 3 days at a time. Fix: `coord_health` now keeps an
+   `unverifiable`-verdict claim in `needs_reverification` regardless of age, with
+   a distinct `reason: "unverifiable"` so a caller can tell it apart from
+   `verdict_expired` decay; a fresh `current` verdict is still not flagged.
+   Covered by `tests/test_trust_decay.py::test_unverifiable_verdict_stays_flagged_but_current_does_not`.
 3. **`coord_curate` empty-vs-error ambiguity persists** (carried over from the
    spine scenario, Finding 3 there). The suggested `curator_status: ok|error`
-   field has not landed.
-4. **Reconciler verdict records surface in `memory_search`.** A semantic query
-   about SHA matching ranked two `coord/_reconcile/*` records above the user's
-   own knowledge entry. They are legitimate entries, but consider whether
-   `coord/_reconcile/` (like `_meta/`) should be excluded from search unless
-   asked for — verdict records can crowd out user memories.
+   field has not landed. *(Still open.)*
+4. **Reconciler verdict records surfaced in `memory_search`.** — **FIXED.** A
+   semantic query about SHA matching ranked two `coord/_reconcile/*` records
+   above the user's own knowledge entry. Fix: `memory_search` now excludes the
+   internal house-band (`coord/_reconcile/*` verdicts and `_meta/*` bookkeeping)
+   from ranked results across all legs (semantic, HyDE, keyword); they stay
+   readable via `memory_list` (coord/_reconcile prefix) / `memory_get` /
+   `memory_history`. The exclusion is narrow — ordinary `coord/*` keys still
+   search. Covered by three tests in `tests/test_semantic_search.py`.
 5. **Marker forgery trips two independent layers** (escape + `untrusted_marker`
    quarantine). Good defense-in-depth; worth stating in the README so callers
    aren't surprised that a benign-intent value containing marker text lands in

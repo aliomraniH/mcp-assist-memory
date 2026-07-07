@@ -63,6 +63,37 @@ async def test_staleness_window_is_per_namespace(reconcile_backend, ns):
     assert health["needs_reverification"] == []
 
 
+async def test_unverifiable_verdict_stays_flagged_but_current_does_not(reconcile_backend, ns):
+    """An `unverifiable` verdict is not a clean bill of health — the claim was
+    never actually confirmed. It must stay in needs_reverification even while the
+    verdict is fresh, so a permanently-unverifiable claim doesn't read as
+    'handled' for the whole staleness window. A fresh `current` verdict in the
+    same namespace is still NOT flagged (the fix doesn't over-broaden). Finding 2.
+    """
+    b = reconcile_backend
+    # (1) resolves CURRENT — provenance is present and matches upstream.
+    await b.memory_save(ns, "claim/ok", {"c": "merged"}, kind="claim",
+                        meta={"repo": "o/r", "pr": 1, "merge_sha": "abc1234"})
+    b.resolver.pulls[("o/r", 1)] = {"merged": True, "merge_sha": "abc1234" + "0" * 33}
+    # (2) no resolvable provenance (subject only, no repo) -> UNVERIFIABLE.
+    await b.memory_save(ns, "claim/vague", {"c": "ci is green"}, kind="claim",
+                        meta={"subject": "ci"})
+
+    out = await b.coord_reconcile(ns)
+    states = {v["key"]: v["state"] for v in out["verdicts"]}
+    assert states["claim/vague"] == "unverifiable"  # sanity on the fixture
+    assert states["claim/ok"] == "current"
+
+    health = await b.coord_health(ns)
+    flags = {f["key"]: f for f in health["needs_reverification"]}
+    # unverifiable surfaces immediately, on a brand-new (in-window) verdict...
+    assert flags["claim/vague"]["reason"] == "unverifiable"
+    assert flags["claim/vague"]["last_verdict_state"] == "unverifiable"
+    assert flags["claim/vague"]["verdict_age_hours"] < 72
+    # ...while the fresh `current` verdict is left alone.
+    assert "claim/ok" not in flags
+
+
 async def test_skepticism_all_current_verdicts(reconcile_backend, ns):
     b = reconcile_backend
     for i in range(21):

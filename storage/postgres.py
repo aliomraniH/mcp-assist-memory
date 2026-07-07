@@ -35,7 +35,14 @@ from storage.curator import Curator, DisabledCurator
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
 from storage.phi import assert_no_phi
 from storage.profiles import resolve_profile
-from storage.reconcile import STALE, DisabledResolver, Resolver, reconcile_claim, sha_match
+from storage.reconcile import (
+    STALE,
+    UNVERIFIABLE,
+    DisabledResolver,
+    Resolver,
+    reconcile_claim,
+    sha_match,
+)
 from storage.sanitize import sanitize, wrap_value
 from storage.screening import screen_value
 from storage.telemetry import build_event_row
@@ -101,6 +108,15 @@ def _retry_if_idempotent(fn):
 # Coordination-envelope keys projected out of `meta` into indexed columns. The
 # full envelope is still stored in the `meta` jsonb column, losslessly.
 _META_COLS = ("repo_sha", "base_sha", "branch", "dirty", "session_id")
+
+# LIKE patterns (backslash-escaped underscores, so `_` is literal) for the
+# internal house-band that ranked search must NOT surface: reconcile verdict
+# records and `_meta/` bookkeeping (observations …). They are machine-written
+# coordination records, not user memories — leaving them in memory_search lets a
+# verdict record outrank the user's own knowledge entry. They stay fully
+# readable via memory_list (with the coord/_reconcile prefix), memory_get, and
+# memory_history — the paths you'd actually audit a verdict from.
+_SEARCH_EXCLUDE_LIKE = (r"coord/\_reconcile/%", r"\_meta/%")
 
 # Phase 5 (T5.1): provenance tiers, aligned with the four-tier source-provenance
 # model. Backfill default is 'unknown' — historical rows annotate forward only.
@@ -765,10 +781,12 @@ class PostgresBackend(StorageBackend):
                     ) latest
                     WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
                           AND (%s OR NOT quarantined)
+                          AND key NOT LIKE %s AND key NOT LIKE %s
                           AND value::text ILIKE %s
                     LIMIT %s
                     """,
-                    (namespace, include_quarantined, f"%{query}%", limit),
+                    (namespace, include_quarantined, *_SEARCH_EXCLUDE_LIKE,
+                     f"%{query}%", limit),
                 )
                 rows = await cur.fetchall()
                 return [_row_to_entry(r) for r in rows[:limit]]
@@ -800,11 +818,12 @@ class PostgresBackend(StorageBackend):
                     ) latest
                     WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
                           AND (%s OR NOT quarantined)
+                          AND key NOT LIKE %s AND key NOT LIKE %s
                           AND embedding IS NOT NULL
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    (namespace, include_quarantined, qvec, limit),
+                    (namespace, include_quarantined, *_SEARCH_EXCLUDE_LIKE, qvec, limit),
                 )
                 semantic_rows = await cur.fetchall()
 
@@ -823,11 +842,12 @@ class PostgresBackend(StorageBackend):
                     ) latest
                     WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
                           AND (%s OR NOT quarantined)
+                          AND key NOT LIKE %s AND key NOT LIKE %s
                           AND hyde_embedding IS NOT NULL
                     ORDER BY hyde_embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    (namespace, include_quarantined, qvec, limit),
+                    (namespace, include_quarantined, *_SEARCH_EXCLUDE_LIKE, qvec, limit),
                 )
                 hyde_rows = await cur.fetchall()
 
@@ -843,10 +863,12 @@ class PostgresBackend(StorageBackend):
                 ) latest
                 WHERE NOT tombstone AND (valid_until IS NULL OR valid_until > now())
                       AND (%s OR NOT quarantined)
+                      AND key NOT LIKE %s AND key NOT LIKE %s
                       AND value::text ILIKE %s
                 LIMIT %s
                 """,
-                (namespace, include_quarantined, f"%{query}%", limit),
+                (namespace, include_quarantined, *_SEARCH_EXCLUDE_LIKE,
+                 f"%{query}%", limit),
             )
             keyword_rows = await cur.fetchall()
 
@@ -983,7 +1005,19 @@ class PostgresBackend(StorageBackend):
                 continue
             age_hours = (now - verdict["created_at"]).total_seconds() / 3600.0
             state = (verdict["value"] or {}).get("state") if isinstance(verdict["value"], dict) else None
-            if age_hours > staleness_hours:
+            if state == UNVERIFIABLE:
+                # T6.1 corollary: an `unverifiable` verdict is not a clean bill of
+                # health — the claim was never actually confirmed (no resolvable
+                # provenance, or a blind resolver). Age doesn't cure that, so keep
+                # it flagged regardless of the staleness window; otherwise a
+                # permanently-unverifiable claim reads as "handled" for 72h at a
+                # time. Distinct reason so a caller can tell it apart from decay.
+                needs_reverification.append({
+                    "key": c["key"], "reason": "unverifiable",
+                    "last_verdict_state": state,
+                    "verdict_age_hours": round(age_hours, 1),
+                })
+            elif age_hours > staleness_hours:
                 needs_reverification.append({
                     "key": c["key"], "reason": "verdict_expired",
                     "last_verdict_state": state,
