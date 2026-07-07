@@ -21,6 +21,10 @@ dependencies = [
     "pydantic-settings>=2.4",
     "structlog>=24.1",
     "httpx>=0.27",          # VoyageEmbedder (Phase 3) calls the embeddings REST API
+    # Memory Curator (write-side consolidation). Optional at runtime — the server
+    # runs a DisabledCurator with no key — but the SDK must be installed so that,
+    # when a key IS configured, curate() doesn't fail closed with sdk_unavailable.
+    "anthropic>=0.116.0",
 ]
 
 [project.optional-dependencies]
