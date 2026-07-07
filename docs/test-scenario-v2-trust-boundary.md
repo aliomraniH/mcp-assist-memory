@@ -263,9 +263,17 @@ surface.
    a distinct `reason: "unverifiable"` so a caller can tell it apart from
    `verdict_expired` decay; a fresh `current` verdict is still not flagged.
    Covered by `tests/test_trust_decay.py::test_unverifiable_verdict_stays_flagged_but_current_does_not`.
-3. **`coord_curate` empty-vs-error ambiguity persists** (carried over from the
-   spine scenario, Finding 3 there). The suggested `curator_status: ok|error`
-   field has not landed. *(Still open.)*
+3. **`coord_curate` empty-vs-error ambiguity** (carried over from the spine
+   scenario, Finding 3 there). — **FIXED.** An enabled curator returning
+   `operations: []` could not be told apart from a fail-closed model error. Every
+   `coord_curate` result now carries `curator_status ∈ ok|error|disabled`: `ok`
+   with no operations is a deliberate NOOP, `error` is a fail-closed failure
+   (with a structural `curator_error` naming the cause — SDK missing, the
+   exception class, or `unparseable_response`; never model prose or secrets), and
+   the write path stays fail-closed either way. Covered by
+   `tests/test_curator_status.py` (parse classification + real SDK-failure/success
+   mapping via a stubbed client) and a `coord_curate` integration test in
+   `tests/test_curator.py`.
 4. **Reconciler verdict records surfaced in `memory_search`.** — **FIXED.** A
    semantic query about SHA matching ranked two `coord/_reconcile/*` records
    above the user's own knowledge entry. Fix: `memory_search` now excludes the

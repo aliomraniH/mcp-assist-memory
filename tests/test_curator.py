@@ -186,7 +186,32 @@ async def test_disabled_curator_is_clean_noop(curate_backend, ns):
     }]}
     out = await curate_backend.coord_curate(ns, sid)
     assert out["curator_enabled"] is False
+    assert out["curator_status"] == "disabled"
     assert out["operations"] == []
     assert await curate_backend.memory_get(ns, "knowledge/never") is None
     # The curator is never even consulted when disabled.
     assert curate_backend.curator.calls == []
+
+
+async def test_curator_status_distinguishes_noop_from_error(curate_backend, ns):
+    """Finding 3: an empty operations list is no longer ambiguous. A deliberate
+    NOOP (model ran, chose to persist nothing) surfaces curator_status='ok'; a
+    fail-closed model failure surfaces 'error' + a structural curator_error.
+    Both write nothing (fail-closed either way)."""
+    sid = await _seed_session(curate_backend, ns)
+
+    # deliberate NOOP — the model succeeded and returned zero operations.
+    curate_backend.curator.result = {"operations": [], "curator_status": "ok"}
+    noop = await curate_backend.coord_curate(ns, sid)
+    assert noop["curator_status"] == "ok"
+    assert noop["operations"] == []
+    assert "curator_error" not in noop
+
+    # swallowed model failure — also zero operations, but NOT a deliberate NOOP.
+    curate_backend.curator.result = {
+        "operations": [], "curator_status": "error", "curator_error": "RateLimitError"}
+    err = await curate_backend.coord_curate(ns, sid)
+    assert err["curator_status"] == "error"
+    assert err["curator_error"] == "RateLimitError"
+    assert err["operations"] == []  # fail-closed: still writes nothing
+    assert await curate_backend.memory_list(ns) == []

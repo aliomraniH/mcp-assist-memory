@@ -28,6 +28,25 @@ _PROMPT_PATH = pathlib.Path(__file__).resolve().parent.parent / "docs" / "memory
 
 _EMPTY: dict[str, Any] = {"operations": []}
 
+# Curator outcome status — lets a caller tell a *deliberate* empty result (the
+# model ran and chose to persist nothing: a valid, good NOOP) apart from a
+# *fail-closed* empty result (SDK missing, API/auth/rate-limit failure, or an
+# unparseable/wrong-shape response). The write behavior is identical either way —
+# zero operations means zero writes — but the two are no longer observationally
+# identical at the surface.
+STATUS_OK = "ok"
+STATUS_ERROR = "error"
+STATUS_DISABLED = "disabled"
+
+
+def _empty(status: str, *, error: str | None = None) -> dict:
+    """A zero-operations result carrying its outcome status (and, for errors, a
+    short structural reason — never model prose or secrets)."""
+    out: dict[str, Any] = {"operations": [], "curator_status": status}
+    if error:
+        out["curator_error"] = error
+    return out
+
 
 @runtime_checkable
 class Curator(Protocol):
@@ -45,29 +64,33 @@ class DisabledCurator:
     enabled = False
 
     async def curate(self, envelope: dict) -> dict:
-        return dict(_EMPTY)
+        return _empty(STATUS_DISABLED)
 
 
-def _extract_json(text: str) -> dict:
+def _extract_json(text: str) -> tuple[dict, bool]:
     """Parse the single JSON object the curator must return — fail closed.
 
     Tolerates stray prose or markdown fences by extracting the outermost
-    ``{...}`` span. Anything that does not parse to a dict yields zero operations
-    rather than raising, so a bad model response can never break a write path."""
-    if not text:
-        return dict(_EMPTY)
-    try:
-        return _coerce(json.loads(text))
-    except (ValueError, TypeError):
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
-        try:
-            return _coerce(json.loads(text[start : end + 1]))
-        except (ValueError, TypeError):
-            pass
-    return dict(_EMPTY)
+    ``{...}`` span. Returns ``(result, parsed_ok)``: ``parsed_ok`` is False when
+    the model produced nothing usable (blank, unparseable, or a non-object shape),
+    so the caller can tell a genuine empty-operations NOOP apart from a malformed
+    response. Either way the result is a safe ``{"operations": [...]}`` — a bad
+    model response can never break a write path."""
+    if text:
+        spans = [text]
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            spans.append(text[start : end + 1])
+        for span in spans:
+            try:
+                obj = json.loads(span)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(obj, dict):
+                return _coerce(obj), True
+            # parsed, but not the required object shape → malformed, not a NOOP
+            break
+    return dict(_EMPTY), False
 
 
 def _coerce(obj: Any) -> dict:
@@ -110,8 +133,8 @@ class AnthropicCurator:
     async def curate(self, envelope: dict) -> dict:
         try:
             import anthropic
-        except Exception:  # noqa: BLE001 - SDK missing ⇒ behave as disabled for this call
-            return dict(_EMPTY)
+        except Exception:  # noqa: BLE001 - SDK missing ⇒ fail closed for this call
+            return _empty(STATUS_ERROR, error="sdk_unavailable")
         try:
             client = anthropic.AsyncAnthropic(api_key=self._api_key)
             resp = await client.messages.create(
@@ -125,9 +148,15 @@ class AnthropicCurator:
                 for block in (resp.content or [])
                 if getattr(block, "type", None) == "text"
             )
-            return _extract_json(text)
-        except Exception:  # noqa: BLE001 - best-effort: any failure ⇒ zero operations
-            return dict(_EMPTY)
+        except Exception as exc:  # noqa: BLE001 - best-effort: any failure ⇒ zero ops
+            # Structural reason only (the exception class name) — never model prose
+            # or a message that could carry a key/PHI.
+            return _empty(STATUS_ERROR, error=type(exc).__name__)
+        result, parsed_ok = _extract_json(text)
+        if not parsed_ok:
+            return _empty(STATUS_ERROR, error="unparseable_response")
+        result["curator_status"] = STATUS_OK
+        return result
 
 
 def build_curator(settings: Any) -> Curator:

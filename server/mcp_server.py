@@ -471,7 +471,11 @@ async def coord_curate(namespace: str, session_id: str, dry_run: bool = False) -
     downgraded to notes, supersession sets a validity boundary (history is kept, never
     deleted), and writes are idempotent so re-running the same session never
     double-writes. When the curator is disabled (no Anthropic key) it returns
-    {curator_enabled: false, operations: []} — a clear no-op, never a guess. Run it at
+    {curator_enabled: false, curator_status: "disabled", operations: []} — a clear
+    no-op, never a guess. Every response carries curator_status ∈ ok|error|disabled
+    so an empty operations list is unambiguous: `ok` = a deliberate NOOP (the model
+    ran and chose to persist nothing), `error` = a fail-closed model failure (a
+    short curator_error names the cause structurally); both write nothing. Run it at
     session end to consolidate durable lessons. dry_run=True returns the proposed
     operations without writing."""
     return await _backend().coord_curate(namespace, session_id, dry_run=dry_run)

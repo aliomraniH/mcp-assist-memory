@@ -1368,10 +1368,14 @@ class PostgresBackend(StorageBackend):
 
     async def coord_curate(self, namespace, session_id, *, dry_run=False, similar_limit=10) -> dict:
         """Pull-triggered, best-effort write-side curation (mirrors coord_reconcile).
-        Disabled curator ⇒ a clear no-op, never a guess."""
+        Disabled curator ⇒ a clear no-op, never a guess. Every result carries
+        curator_status ∈ ok|error|disabled so an empty operations list is not
+        ambiguous (ok = deliberate NOOP, error = fail-closed model failure with a
+        structural curator_error); the write behavior is fail-closed regardless."""
         if not self.curator.enabled:
             return {"namespace": namespace, "session_id": session_id,
-                    "curator_enabled": False, "dry_run": dry_run, "operations": []}
+                    "curator_enabled": False, "curator_status": "disabled",
+                    "dry_run": dry_run, "operations": []}
         events = await self.session_events(namespace, session_id)
         trace = [
             {"span_id": str(e.get("seq")), "type": e.get("kind"),
@@ -1384,8 +1388,16 @@ class PostgresBackend(StorageBackend):
                     "trace": trace, "similar_memories": similar}
         result = await self.curator.curate(envelope)
         operations = (result or {}).get("operations") or []
+        # T3-followup: surface the curator's outcome status so an empty result is
+        # not ambiguous — `ok` with no operations is a deliberate NOOP, `error` is
+        # a fail-closed model failure (both write nothing). Default to `ok` for a
+        # curator that predates the status field.
+        curator_status = (result or {}).get("curator_status", "ok")
         out = {"namespace": namespace, "session_id": session_id,
-               "curator_enabled": True, "dry_run": dry_run, "operations": operations}
+               "curator_enabled": True, "curator_status": curator_status,
+               "dry_run": dry_run, "operations": operations}
+        if (result or {}).get("curator_error"):
+            out["curator_error"] = result["curator_error"]
         if dry_run:
             return out
         out.update(await self.apply_curation(namespace, result, session_id=session_id))
