@@ -26,7 +26,7 @@ SESSION_TTL = 12 * 60 * 60  # 12 hours
 # One MCP token per surface. Each surface gets its own card on the dashboard with
 # a ready-to-use URL/token and the right setup snippet, and rotates independently.
 # (Claude Desktop and the Claude Code CLI share one token — both send a Bearer
-# header — so there are two surfaces, not three.)
+# header — while Cursor gets its own so projects using both stay independent.)
 SURFACES = [
     {
         "label": "web",
@@ -40,6 +40,13 @@ SURFACES = [
         "blurb": "Both send an Authorization: Bearer header. Use the CLI command, "
                  "or paste the JSON into claude_desktop_config.json.",
     },
+    {
+        "label": "cursor",
+        "title": "Cursor",
+        "blurb": "Paste the JSON into ~/.cursor/mcp.json (global) or "
+                 ".cursor/mcp.json (per-project). Rotates independently of the "
+                 "Claude surfaces, so projects using both keep working.",
+    },
 ]
 SURFACE_LABELS = [s["label"] for s in SURFACES]
 
@@ -48,6 +55,14 @@ def _snippets_for(label: str, mcp_url: str, token: str) -> list[tuple[str, str]]
     """(heading, copyable-content) blocks shown for a surface."""
     if label == "web":
         return [("Connector URL (paste into claude.ai)", f"{mcp_url}?token={token}")]
+    if label == "cursor":
+        cursor_json = (
+            '{\n  "mcpServers": {\n    "assist-memory": {\n'
+            f'      "url": "{mcp_url}",\n'
+            f'      "headers": {{ "Authorization": "Bearer {token}" }}\n'
+            '    }\n  }\n}'
+        )
+        return [("Cursor (~/.cursor/mcp.json or .cursor/mcp.json)", cursor_json)]
     # desktop-cli
     cli = (
         f'claude mcp add -s user --transport http assist-memory {mcp_url} '

@@ -88,12 +88,13 @@ def test_admin_login_rotate_and_mcp_auth():
         page = client.get("/admin").text
         web = re.search(r'id="tok-web">([^<]+)<', page).group(1)
         desktop = re.search(r'id="tok-desktop-cli">([^<]+)<', page).group(1)
+        cursor = re.search(r'id="tok-cursor">([^<]+)<', page).group(1)
         csrf = re.search(r'name="csrf" value="([^"]+)"', page).group(1)
-        assert web and desktop and web != desktop  # one distinct token per surface
+        assert len({web, desktop, cursor}) == 3  # one distinct token per surface
 
-        # bearer gate on /mcp: no token rejected, EITHER active token accepted
+        # bearer gate on /mcp: no token rejected, ANY active token accepted
         assert client.post("/mcp/", json=INIT, headers=MCP_HEADERS).status_code == 401
-        for tok in (web, desktop):
+        for tok in (web, desktop, cursor):
             ok = client.post("/mcp/", json=INIT, headers={**MCP_HEADERS, "Authorization": f"Bearer {tok}"})
             assert ok.status_code != 401
         # web surface can't send headers -> ?token= must also be accepted
@@ -106,12 +107,14 @@ def test_admin_login_rotate_and_mcp_auth():
         page2 = client.get("/admin").text
         new_web = re.search(r'id="tok-web">([^<]+)<', page2).group(1)
         same_desktop = re.search(r'id="tok-desktop-cli">([^<]+)<', page2).group(1)
+        same_cursor = re.search(r'id="tok-cursor">([^<]+)<', page2).group(1)
         assert new_web != web
-        assert same_desktop == desktop  # rotating one surface leaves the other intact
+        assert same_desktop == desktop  # rotating one surface leaves the others intact
+        assert same_cursor == cursor
         assert client.post(
             "/mcp/", json=INIT, headers={**MCP_HEADERS, "Authorization": f"Bearer {web}"}
         ).status_code == 401
-        for tok in (new_web, same_desktop):
+        for tok in (new_web, same_desktop, same_cursor):
             assert client.post(
                 "/mcp/", json=INIT, headers={**MCP_HEADERS, "Authorization": f"Bearer {tok}"}
             ).status_code != 401
