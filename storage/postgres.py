@@ -661,6 +661,35 @@ class PostgresBackend(StorageBackend):
                     entry["advisories"] = list(entry.get("advisories") or []) + [advisory]
         return entry
 
+    async def _annotate_verdict_freshness(self, namespace, entries: list[dict]) -> None:
+        """v3 item 2: every reconcile-verdict READ carries its own freshness
+        inline — checked_at (when the resolver last looked), age_hours, and
+        freshness: "fresh" | "expired" once the verdict is older than the
+        namespace's claim_staleness_hours window. A verdict is a snapshot, not a
+        subscription; before this, a reader had to call coord_health to learn a
+        verdict had decayed (the S6 stale-snapshot misread: a 07-14 context pack
+        trusted a superseded coord/_reconcile record). Annotation only — the
+        stored record is never rewritten."""
+        verdicts = [e for e in entries
+                    if e and str(e.get("key", "")).startswith(self._RECONCILE_PREFIX)
+                    and e.get("created_at")]
+        if not verdicts:
+            return
+        profile = await self._namespace_profile(namespace)
+        staleness_hours = float(
+            profile.get("claim_staleness_hours")
+            or settings.default_claim_staleness_hours)
+        now = datetime.now(timezone.utc)
+        for e in verdicts:
+            try:
+                checked = datetime.fromisoformat(e["created_at"])
+            except (TypeError, ValueError):
+                continue
+            age_hours = (now - checked).total_seconds() / 3600.0
+            e["checked_at"] = e["created_at"]
+            e["age_hours"] = round(age_hours, 1)
+            e["freshness"] = "expired" if age_hours > staleness_hours else "fresh"
+
     @_retry_on_disconnect
     async def memory_get(self, namespace, key, *, include_quarantined=False) -> dict | None:
         async with self.pool.connection() as conn:
@@ -678,7 +707,9 @@ class PostgresBackend(StorageBackend):
         # (the verdict stays visible on the returned entry).
         if row.get("quarantined") and not include_quarantined:
             return None
-        return _row_to_entry(row)
+        entry = _row_to_entry(row)
+        await self._annotate_verdict_freshness(namespace, [entry])
+        return entry
 
     @_retry_on_disconnect
     async def memory_list_page(
@@ -747,6 +778,7 @@ class PostgresBackend(StorageBackend):
             base64.urlsafe_b64encode(page[-1]["key"].encode("utf-8")).decode("ascii")
             if truncated and page else None
         )
+        await self._annotate_verdict_freshness(namespace, page)
         return {"entries": page, "truncated": truncated, "next_cursor": next_cursor}
 
     async def memory_list(
@@ -768,7 +800,9 @@ class PostgresBackend(StorageBackend):
                 (namespace, key, limit),
             )
             rows = await cur.fetchall()
-        return [_row_to_entry(r) for r in rows]
+        entries = [_row_to_entry(r) for r in rows]
+        await self._annotate_verdict_freshness(namespace, entries)
+        return entries
 
     @_retry_if_idempotent
     async def memory_delete(
@@ -1170,6 +1204,10 @@ class PostgresBackend(StorageBackend):
         for r in rows:
             entry = _row_to_entry(r, wrap=False)
             verdict = await reconcile_claim(entry, self.resolver)
+            # v3 item 2: the verdict value itself records WHEN the resolver
+            # looked, so a stored snapshot is self-dating even before the
+            # read-time freshness annotation.
+            verdict["checked_at"] = datetime.now(timezone.utc).isoformat()
             # Distinct actor (T2.1): the instrument recording a verdict must
             # never share an actor with the subject under measurement.
             await self.memory_save(

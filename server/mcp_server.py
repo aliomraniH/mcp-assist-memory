@@ -464,7 +464,13 @@ async def coord_reconcile(namespace: str, limit: int = 100) -> dict:
     derived from each claim's provenance (meta.repo + meta.pr / meta.branch), not
     its prose. When the backend has no GitHub token the resolver is disabled and
     every verdict is `unverifiable` (never silently `current`). Run it at session
-    start to learn which claims need re-verifying."""
+    start to learn which claims need re-verifying.
+    Verdict freshness: every verdict READ (memory_get/list/history of a
+    coord/_reconcile/* key) carries checked_at + age_hours inline, and
+    freshness:"expired" once the verdict is older than the namespace's
+    claim_staleness_hours window — a verdict is a snapshot, not a subscription;
+    treat an expired verdict as unknown and re-run coord_reconcile, never as
+    still-true."""
     return await _backend().coord_reconcile(namespace, limit=limit)
 
 
