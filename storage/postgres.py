@@ -119,6 +119,16 @@ _TEMPORAL_MODES = ("head_tracking", "historical_snapshot", "interval", "timeless
 # head-comparison (health's stale projection, the R5 stale-pin advisory).
 _NON_HEAD_MODES = ("historical_snapshot", "interval", "timeless")
 
+# v3 item 6: local-evidence ladder. HARD RULE (schema + tool description):
+# local_attested is EVIDENCE, never verification — it can never satisfy a
+# verification gate; promotion to remote_confirmed happens ONLY via the
+# resolver observing the sha remotely (coord_reconcile), so a writer may
+# declare the first two states but never the third.
+_DECLARABLE_EVIDENCE_STATES = ("local_attested", "pending_remote")
+# Attestation payloads carry hashes, never raw command/output text — in
+# clinical namespaces these keys are rejected outright (PHI hard gate 0.5).
+_ATTESTATION_RAW_KEYS = ("command", "cmd", "output", "stdout", "stderr", "logs")
+
 # LIKE patterns (backslash-escaped underscores, so `_` is literal) for the
 # internal house-band that ranked search must NOT surface: reconcile verdict
 # records and `_meta/` bookkeeping (observations …). They are machine-written
@@ -448,7 +458,7 @@ class PostgresBackend(StorageBackend):
         dict response and snapshotted into tool_events."""
         return resolve_profile(await self._namespace_profile(namespace))
 
-    async def _boundary_meta(self, meta: dict | None) -> dict | None:
+    async def _boundary_meta(self, namespace: str, meta: dict | None) -> dict | None:
         """v3 item 1 (S1a): the write boundary is where sha refs get validated and
         canonicalized — EVERY write path flows through here (memory_save, handoff,
         delete tombstones, and curate ops via ``_write_curation_op`` → ``_append``),
@@ -474,6 +484,37 @@ class PostgresBackend(StorageBackend):
                 "invalid_temporal_mode",
                 f"invalid temporal_mode {mode!r}",
             )
+        # v3 item 6: evidence_state is declarable only up the ladder —
+        # remote_confirmed is DERIVED by coord_reconcile observing the sha
+        # remotely, never self-declared (that would be forged verification).
+        evidence_state = meta.get("evidence_state")
+        if evidence_state is not None and evidence_state not in _DECLARABLE_EVIDENCE_STATES:
+            raise AppError(
+                "invalid_evidence_state",
+                f"invalid evidence_state {evidence_state!r} — declare "
+                "local_attested or pending_remote; remote_confirmed is assigned "
+                "only by coord_reconcile observing the sha remotely",
+            )
+        attestation = meta.get("attestation")
+        if attestation is not None:
+            if not isinstance(attestation, dict) or not attestation.get("sha"):
+                raise AppError(
+                    "invalid_attestation",
+                    "meta.attestation must be an object carrying at least the "
+                    "attested sha (plus hashes: method, attested_at, "
+                    "command_hash, evidence_hash)",
+                )
+            validate_sha_ref(attestation["sha"], field="attestation.sha")
+            profile = await self._namespace_profile(namespace)
+            if profile.get("clinical"):
+                raw = sorted(set(attestation) & set(_ATTESTATION_RAW_KEYS))
+                if raw:
+                    raise AppError(
+                        "invalid_attestation",
+                        f"attestation carries raw fields {raw} — in clinical "
+                        "namespaces attestation payloads carry hashes, never "
+                        "raw commands or output (PHI hard gate)",
+                    )
         ref = meta.get("repo_sha")
         base = meta.get("base_sha")
         if ref is None and base is None:
@@ -515,7 +556,7 @@ class PostgresBackend(StorageBackend):
         else:
             embedding = await self._maybe_embed(key, value, tombstone)
             hyde_embedding = None
-        meta = await self._boundary_meta(meta)
+        meta = await self._boundary_meta(namespace, meta)
         (repo_sha, base_sha, branch, dirty, session_id, temporal_mode,
          meta_json) = _split_meta(meta)
         sanitized = sanitize(value)

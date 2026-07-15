@@ -81,6 +81,14 @@ CATALOG: dict[str, tuple[str, bool]] = {
         "RFC 8785 (JCS) cannot canonicalize NaN/Infinity (hard error, never "
         "skipped) or integers beyond 2^53 — encode such numbers as JSON "
         "strings in fingerprinted payloads", False),
+    "invalid_evidence_state": (
+        "declare evidence_state local_attested or pending_remote; "
+        "remote_confirmed is assigned only by coord_reconcile observing the "
+        "sha remotely — it can never be self-declared", False),
+    "invalid_attestation": (
+        "meta.attestation must be an object with at least the attested sha; "
+        "carry hashes (command_hash, evidence_hash), never raw commands or "
+        "output — raw fields are rejected in clinical namespaces", False),
     "invalid_temporal_mode": (
         "temporal_mode must be one of head_tracking|historical_snapshot|"
         "interval|timeless (or omitted for advisory inference)", False),

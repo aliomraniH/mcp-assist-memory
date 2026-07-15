@@ -210,6 +210,14 @@ async def memory_save(
     no external mutable subject. Omitted mode = the reconciler infers
     head-comparison semantics and marks its verdict temporal_mode_origin:
     "inferred" (advisory only) — record the mode explicitly when you know it.
+    Local evidence: meta.evidence_state ∈ local_attested|pending_remote records
+    that a sha is only provable locally so far (schema: meta.attestation with
+    the attested sha + hashes — method, attested_at, command_hash,
+    evidence_hash; never raw commands/output, which are rejected in clinical
+    namespaces). HARD RULE: local_attested is evidence, never verification — it
+    can never satisfy a verification gate, and promotion to remote_confirmed
+    happens ONLY via coord_reconcile observing the sha remotely
+    (self-declaring remote_confirmed is rejected).
     SHA convention: meta.repo_sha/base_sha must be hex, 7..40 chars (invalid_sha
     otherwise). An abbreviated repo_sha is best-effort resolved to the canonical
     40-char sha when GitHub is reachable — the stored entry then carries the full
@@ -482,6 +490,11 @@ async def coord_reconcile(namespace: str, limit: int = 100) -> dict:
     its prose. When the backend has no GitHub token the resolver is disabled and
     every verdict is `unverifiable` (never silently `current`). Run it at session
     start to learn which claims need re-verifying.
+    Local evidence gate: a claim carrying evidence_state local_attested/
+    pending_remote can NEVER read current while its sha is unobserved remotely
+    (local_attested is evidence, never verification); when the resolver does
+    observe the sha, the verdict records the promotion
+    (evidence.promoted_to:"remote_confirmed") — the only path to that state.
     Temporal forks: a claim recorded with meta.temporal_mode=historical_snapshot
     verifies its pinned sha EXISTS upstream and is never compared to the live
     head (terminal non-stale once verified); timeless claims have no external

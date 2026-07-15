@@ -191,6 +191,40 @@ async def reconcile_claim(entry: dict, resolver: Resolver) -> dict:
     if not resolver.enabled:
         return {**base, "state": UNVERIFIABLE, "reason": "resolver disabled (no GitHub access)"}
 
+    # v3 item 6 — the local-evidence gate runs BEFORE any subject verdict.
+    # local_attested / pending_remote are EVIDENCE, never verification: the
+    # only path to remote_confirmed is this resolver observing the sha
+    # remotely, and an unobserved locally-attested sha can never read current.
+    evidence: dict | None = None
+    evidence_state = meta.get("evidence_state")
+    if evidence_state in ("local_attested", "pending_remote"):
+        attestation = meta.get("attestation") or {}
+        ev_sha = attestation.get("sha") or repo_sha
+        observed = None
+        if repo and ev_sha:
+            try:
+                observed = await resolver.commit_sha(repo, ev_sha)
+            except AmbiguousShaRef:
+                observed = None
+        if observed and sha_match(ev_sha, observed):
+            evidence = {"recorded_state": evidence_state, "observed_remotely": True,
+                        "promoted_to": "remote_confirmed", "observed_sha": observed}
+        else:
+            return {**base, "state": UNVERIFIABLE,
+                    "evidence": {"recorded_state": evidence_state,
+                                 "observed_remotely": False, "sha": ev_sha},
+                    "reason": "locally-attested sha not observed remotely — "
+                              "local_attested is evidence, never verification"}
+    verdict = await _subject_verdict(
+        base, meta, repo, pr, branch, repo_sha, mode, mode_origin, resolver)
+    if evidence is not None:
+        verdict["evidence"] = evidence
+    return verdict
+
+
+async def _subject_verdict(
+    base, meta, repo, pr, branch, repo_sha, mode, mode_origin, resolver: Resolver,
+) -> dict:
     if mode == "timeless":
         return {**base, "state": CURRENT, "temporal_mode": mode,
                 "temporal_mode_origin": mode_origin, "terminal": True,
