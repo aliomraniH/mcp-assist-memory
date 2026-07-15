@@ -388,6 +388,12 @@ class PostgresBackend(StorageBackend):
         entry["original_created_at"] = entry["created_at"]
         # The dedup check itself just read the row back from the store.
         entry["verified_persisted"] = True
+        # v3 item 3 (interim, measured against the skill-transfer T02 collision):
+        # a replay is NOT a plain success — nothing new was persisted. Escalate
+        # to a top-level non-"ok" status so a caller checking one field can't
+        # mistake the echo of an old record for a fresh write (the phantom-ack
+        # class). The buried deduplicated:true stays for compatibility.
+        entry["status"] = "deduplicated_replay"
         return entry
 
     _PROFILE_TTL_S = 60.0
@@ -1569,7 +1575,10 @@ class PostgresBackend(StorageBackend):
                         )
                         existing = await cur.fetchone()
                         if existing is not None:
-                            return {**_event_to_dict(existing), "deduplicated": True}
+                            # v3 item 3: replays escalate to a top-level non-"ok"
+                            # status here too — same phantom-ack class as memory.
+                            return {**_event_to_dict(existing), "deduplicated": True,
+                                    "status": "deduplicated_replay"}
                     async with conn.transaction():
                         # Tenant guard: the session must exist under this namespace.
                         cur = await conn.execute(
