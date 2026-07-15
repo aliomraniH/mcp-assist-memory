@@ -72,6 +72,37 @@ CATALOG: dict[str, tuple[str, bool]] = {
         "category must be one of ergonomics|error_recovery|advisory|screening|"
         "docs_gap|surprise|suggestion and severity one of blocker|friction|note",
         False),
+    "idempotency_conflict": (
+        "this event_id was already used with a DIFFERENT payload (the draft's "
+        "422 case) — reusing a key across payloads is MUST NOT; mint a fresh "
+        "event_id for new content, or resend the original payload byte-"
+        "identically to receive the original ack", False),
+    "unrepresentable_number": (
+        "RFC 8785 (JCS) cannot canonicalize NaN/Infinity (hard error, never "
+        "skipped) or integers beyond 2^53 — encode such numbers as JSON "
+        "strings in fingerprinted payloads", False),
+    "invalid_role": (
+        "role must be one of author|observer|verifier|curator|approver (or "
+        "omitted) — it records the capacity you wrote in; nothing is gated on "
+        "it in this phase", False),
+    "invalid_evidence_state": (
+        "declare evidence_state local_attested or pending_remote; "
+        "remote_confirmed is assigned only by coord_reconcile observing the "
+        "sha remotely — it can never be self-declared", False),
+    "invalid_attestation": (
+        "meta.attestation must be an object with at least the attested sha; "
+        "carry hashes (command_hash, evidence_hash), never raw commands or "
+        "output — raw fields are rejected in clinical namespaces", False),
+    "invalid_temporal_mode": (
+        "temporal_mode must be one of head_tracking|historical_snapshot|"
+        "interval|timeless (or omitted for advisory inference)", False),
+    "invalid_sha": (
+        "meta.repo_sha/base_sha must be a hex commit sha, 7..40 chars (git's "
+        "default abbreviation up to the full sha) — fix the ref and retry; "
+        "prefer recording the full 40-char sha", False),
+    "ambiguous_sha": (
+        "the abbreviated sha matches more than one commit upstream — record "
+        "more characters (ideally the full 40-char sha) and retry", False),
     "curator_family_conflict": (
         "CURATOR_FAMILY_MUST_DIFFER_FROM forbids same-family curation of "
         "these entries — configure a curator from a different model family", False),

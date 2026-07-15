@@ -108,6 +108,10 @@ CREATE INDEX IF NOT EXISTS memory_entry_ns_quarantined
     ON memory_entry (namespace) WHERE quarantined;
 CREATE INDEX IF NOT EXISTS memory_entry_ns_key_pattern
     ON memory_entry (namespace, key text_pattern_ops);
+-- 0007_v3_phase1.sql columns (mirrored inline so the suite is self-contained).
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS idem_fingerprint text;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS temporal_mode text;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS role text;
 """
 
 def _load_migration_views() -> str:
@@ -177,20 +181,30 @@ async def semantic_backend():
 
 
 class FakeResolver:
-    """Offline GitHub resolver for tests. Tests populate ``pulls`` / ``heads`` to
-    stand in for live PR/branch state without any network call."""
+    """Offline GitHub resolver for tests. Tests populate ``pulls`` / ``heads`` /
+    ``commits`` to stand in for live PR/branch/commit state without any network
+    call; abbreviations listed in ``ambiguous`` raise like GitHub's 422."""
 
     enabled = True
 
     def __init__(self) -> None:
-        self.pulls: dict = {}   # (repo, pr) -> {"merged": bool, "merge_sha": str}
-        self.heads: dict = {}   # (repo, branch) -> sha
+        self.pulls: dict = {}     # (repo, pr) -> {"merged": bool, "merge_sha": str}
+        self.heads: dict = {}     # (repo, branch) -> sha
+        self.commits: dict = {}   # (repo, ref-or-prefix) -> full 40-char sha
+        self.ambiguous: set = set()  # refs that match >1 commit upstream
 
     async def merged_state(self, repo, pr):
         return self.pulls.get((repo, int(pr)))
 
     async def branch_head(self, repo, branch):
         return self.heads.get((repo, branch))
+
+    async def commit_sha(self, repo, ref):
+        from storage.sha_equiv import AmbiguousShaRef
+
+        if ref in self.ambiguous:
+            raise AmbiguousShaRef(ref)
+        return self.commits.get((repo, ref))
 
 
 @pytest_asyncio.fixture
