@@ -167,22 +167,68 @@ def build_resolver(settings: Any) -> Resolver:
 async def reconcile_claim(entry: dict, resolver: Resolver) -> dict:
     """Derive a freshness verdict for one claim from its provenance + the resolver.
 
-    Mechanical, prose-free: it looks only at meta.repo + meta.pr / meta.branch and
-    the entry's repo_sha. Returns ``{key, subject, state, ...evidence}``."""
+    Mechanical, prose-free: it looks only at meta.repo + meta.pr / meta.branch,
+    the entry's repo_sha, and its temporal_mode. Returns
+    ``{key, subject, state, temporal_mode, ...evidence}``.
+
+    Temporal forks (v3 item 5): ``historical_snapshot`` asserts about a specific
+    commit as of a moment — it verifies the pinned sha EXISTS upstream and NEVER
+    compares it to the live head, so a verified snapshot is terminally non-stale.
+    ``timeless`` has no external mutable subject at all. ``interval``
+    reconciliation is not mechanized in this phase (verdicts stay unverifiable,
+    never guessed). Claims without a recorded mode get head-comparison semantics
+    as before, and the verdict says so ADVISORILY:
+    ``temporal_mode: "head_tracking", temporal_mode_origin: "inferred"``."""
     meta = entry.get("meta") or {}
     repo = meta.get("repo")
     pr = meta.get("pr")
     branch = meta.get("branch") or entry.get("branch")
-    repo_sha = entry.get("repo_sha")
+    repo_sha = entry.get("repo_sha") or meta.get("repo_sha")
+    mode = entry.get("temporal_mode") or meta.get("temporal_mode")
+    mode_origin = "recorded" if mode else "inferred"
     base = {"key": entry.get("key"), "repo": repo}
 
     if not resolver.enabled:
         return {**base, "state": UNVERIFIABLE, "reason": "resolver disabled (no GitHub access)"}
 
+    if mode == "timeless":
+        return {**base, "state": CURRENT, "temporal_mode": mode,
+                "temporal_mode_origin": mode_origin, "terminal": True,
+                "reason": "timeless: no external mutable subject to compare"}
+
+    if mode == "interval":
+        return {**base, "state": UNVERIFIABLE, "temporal_mode": mode,
+                "temporal_mode_origin": mode_origin,
+                "reason": "interval reconciliation is not mechanized in this phase"}
+
+    if mode == "historical_snapshot":
+        if not (repo and repo_sha):
+            return {**base, "state": UNVERIFIABLE, "temporal_mode": mode,
+                    "temporal_mode_origin": mode_origin,
+                    "reason": "historical_snapshot needs meta.repo + a pinned repo_sha"}
+        try:
+            full = await resolver.commit_sha(repo, repo_sha)
+        except AmbiguousShaRef:
+            full = None
+        if full and sha_match(repo_sha, full):
+            # Terminal non-stale: the snapshot's subject is the commit itself,
+            # never the moving head.
+            return {**base, "subject": f"commit:{repo_sha}", "state": CURRENT,
+                    "temporal_mode": mode, "temporal_mode_origin": mode_origin,
+                    "terminal": True, "resolved": {"commit_sha": full},
+                    "reason": "pinned sha exists upstream; snapshots never compare to head"}
+        return {**base, "subject": f"commit:{repo_sha}", "state": UNVERIFIABLE,
+                "temporal_mode": mode, "temporal_mode_origin": mode_origin,
+                "reason": "pinned sha not observable upstream"}
+
+    # head_tracking (recorded or inferred): the pre-item-5 comparison semantics.
+    head_mode = {"temporal_mode": "head_tracking", "temporal_mode_origin": mode_origin}
+
     if repo and pr is not None:
         resolved = await resolver.merged_state(repo, int(pr))
         if resolved is None:
-            return {**base, "subject": f"pr:{pr}", "state": UNVERIFIABLE, "reason": "could not resolve PR"}
+            return {**base, **head_mode, "subject": f"pr:{pr}", "state": UNVERIFIABLE,
+                    "reason": "could not resolve PR"}
         recorded = meta.get("merge_sha")
         if resolved["merged"]:
             # Merged upstream: current only if the claim already recorded that merge.
@@ -190,16 +236,16 @@ async def reconcile_claim(entry: dict, resolver: Resolver) -> dict:
         else:
             # Not merged upstream: current only if the claim didn't assert a merge.
             state = STALE if recorded else CURRENT
-        return {**base, "subject": f"pr:{pr}", "state": state,
+        return {**base, **head_mode, "subject": f"pr:{pr}", "state": state,
                 "resolved": resolved, "recorded_merge_sha": recorded}
 
     if repo and branch:
         head = await resolver.branch_head(repo, branch)
         if head is None:
-            return {**base, "subject": f"branch:{branch}", "state": UNVERIFIABLE,
+            return {**base, **head_mode, "subject": f"branch:{branch}", "state": UNVERIFIABLE,
                     "reason": "could not resolve branch head"}
         state = CURRENT if sha_match(repo_sha, head) else STALE
-        return {**base, "subject": f"branch:{branch}", "state": state,
+        return {**base, **head_mode, "subject": f"branch:{branch}", "state": state,
                 "resolved": {"head": head}, "claim_repo_sha": repo_sha}
 
     return {**base, "state": UNVERIFIABLE,

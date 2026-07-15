@@ -201,6 +201,15 @@ async def memory_save(
     session_id keys are projected into indexed columns (the rest kept as-is) so a
     reader can mechanically ask "is this still current?" instead of parsing prose.
     Best-effort — omit it and the entry stores exactly as before.
+    Temporal mode: meta.temporal_mode ∈ head_tracking|historical_snapshot|
+    interval|timeless declares a claim's time-binding. head_tracking asserts
+    about the CURRENT state of a moving ref and goes stale when the head moves;
+    historical_snapshot asserts about a specific commit as of a moment — it is
+    verified by sha-existence and NEVER compared to the live head (terminal
+    non-stale once verified; use it for run records / milestones); timeless has
+    no external mutable subject. Omitted mode = the reconciler infers
+    head-comparison semantics and marks its verdict temporal_mode_origin:
+    "inferred" (advisory only) — record the mode explicitly when you know it.
     SHA convention: meta.repo_sha/base_sha must be hex, 7..40 chars (invalid_sha
     otherwise). An abbreviated repo_sha is best-effort resolved to the canonical
     40-char sha when GitHub is reachable — the stored entry then carries the full
@@ -473,6 +482,12 @@ async def coord_reconcile(namespace: str, limit: int = 100) -> dict:
     its prose. When the backend has no GitHub token the resolver is disabled and
     every verdict is `unverifiable` (never silently `current`). Run it at session
     start to learn which claims need re-verifying.
+    Temporal forks: a claim recorded with meta.temporal_mode=historical_snapshot
+    verifies its pinned sha EXISTS upstream and is never compared to the live
+    head (terminal non-stale once verified); timeless claims have no external
+    subject; interval reconciliation is not mechanized yet (stays unverifiable).
+    Claims without a recorded mode get head-comparison semantics and the verdict
+    carries temporal_mode_origin:"inferred" — advisory, never authoritative.
     Verdict freshness: every verdict READ (memory_get/list/history of a
     coord/_reconcile/* key) carries checked_at + age_hours inline, and
     freshness:"expired" once the verdict is older than the namespace's

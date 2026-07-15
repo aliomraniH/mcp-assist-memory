@@ -81,6 +81,9 @@ CATALOG: dict[str, tuple[str, bool]] = {
         "RFC 8785 (JCS) cannot canonicalize NaN/Infinity (hard error, never "
         "skipped) or integers beyond 2^53 — encode such numbers as JSON "
         "strings in fingerprinted payloads", False),
+    "invalid_temporal_mode": (
+        "temporal_mode must be one of head_tracking|historical_snapshot|"
+        "interval|timeless (or omitted for advisory inference)", False),
     "invalid_sha": (
         "meta.repo_sha/base_sha must be a hex commit sha, 7..40 chars (git's "
         "default abbreviation up to the full sha) — fix the ref and retry; "

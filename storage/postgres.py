@@ -111,7 +111,13 @@ def _retry_if_idempotent(fn):
 
 # Coordination-envelope keys projected out of `meta` into indexed columns. The
 # full envelope is still stored in the `meta` jsonb column, losslessly.
-_META_COLS = ("repo_sha", "base_sha", "branch", "dirty", "session_id")
+_META_COLS = ("repo_sha", "base_sha", "branch", "dirty", "session_id", "temporal_mode")
+
+# v3 item 5: the closed enum for meta.temporal_mode (nullable column 0007).
+_TEMPORAL_MODES = ("head_tracking", "historical_snapshot", "interval", "timeless")
+# Modes whose subject is NOT the live head — they never participate in
+# head-comparison (health's stale projection, the R5 stale-pin advisory).
+_NON_HEAD_MODES = ("historical_snapshot", "interval", "timeless")
 
 # LIKE patterns (backslash-escaped underscores, so `_` is literal) for the
 # internal house-band that ranked search must NOT surface: reconcile verdict
@@ -137,16 +143,18 @@ def _content_hash(value: Any) -> str:
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
-def _split_meta(meta: dict | None) -> tuple[Any, Any, Any, Any, Any, Any]:
-    """Return ``(repo_sha, base_sha, branch, dirty, session_id, meta_jsonb)``.
+def _split_meta(meta: dict | None) -> tuple[Any, Any, Any, Any, Any, Any, Any]:
+    """Return ``(repo_sha, base_sha, branch, dirty, session_id, temporal_mode,
+    meta_jsonb)``.
 
-    The five well-known keys become indexed columns; the whole envelope is kept
+    The well-known keys become indexed columns; the whole envelope is kept
     as jsonb (None when empty) so nothing the caller sent is dropped. A non-dict
     ``meta`` is ignored (treated as absent) rather than failing the write."""
     if not isinstance(meta, dict) or not meta:
-        return (None, None, None, None, None, None)
-    repo_sha, base_sha, branch, dirty, session_id = (meta.get(c) for c in _META_COLS)
-    return repo_sha, base_sha, branch, dirty, session_id, Jsonb(meta)
+        return (None, None, None, None, None, None, None)
+    repo_sha, base_sha, branch, dirty, session_id, temporal_mode = (
+        meta.get(c) for c in _META_COLS)
+    return repo_sha, base_sha, branch, dirty, session_id, temporal_mode, Jsonb(meta)
 
 
 # Deterministic event_id namespace for curator writes, so re-running coord_curate
@@ -244,6 +252,8 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         # v3 item 4: boundary-computed JCS fingerprint of event_id writes (null
         # for writes without an idempotency key, and rows predating 0007).
         "idem_fingerprint": row.get("idem_fingerprint"),
+        # v3 item 5: the claim's time-binding (nullable; see migrations/0007).
+        "temporal_mode": row.get("temporal_mode"),
     }
 
 
@@ -456,6 +466,14 @@ class PostgresBackend(StorageBackend):
         validated abbreviation, never blocks the write."""
         if not isinstance(meta, dict) or not meta:
             return meta
+        # v3 item 5: temporal_mode is a closed enum (nullable — absent means the
+        # reconciler infers, advisorily).
+        mode = meta.get("temporal_mode")
+        if mode is not None and mode not in _TEMPORAL_MODES:
+            raise AppError(
+                "invalid_temporal_mode",
+                f"invalid temporal_mode {mode!r}",
+            )
         ref = meta.get("repo_sha")
         base = meta.get("base_sha")
         if ref is None and base is None:
@@ -498,7 +516,8 @@ class PostgresBackend(StorageBackend):
             embedding = await self._maybe_embed(key, value, tombstone)
             hyde_embedding = None
         meta = await self._boundary_meta(meta)
-        repo_sha, base_sha, branch, dirty, session_id, meta_json = _split_meta(meta)
+        (repo_sha, base_sha, branch, dirty, session_id, temporal_mode,
+         meta_json) = _split_meta(meta)
         sanitized = sanitize(value)
         # v3 item 4: fingerprint event_id writes at the boundary (sanitized
         # incoming value + the caller's own meta — NEVER a jsonb round-trip).
@@ -561,14 +580,14 @@ class PostgresBackend(StorageBackend):
                                  salience, confidence, valid_until, hyde_embedding,
                                  server_version, schema_version, actor, quarantined, screening,
                                  origin, origin_detail, origin_model_id, origin_model_family,
-                                 derived_from, idem_fingerprint)
+                                 derived_from, idem_fingerprint, temporal_mode)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
                                    %s, %s, %s, %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s, %s, %s,
                                    %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s,
-                                   %s, %s, %s, %s, %s, %s
+                                   %s, %s, %s, %s, %s, %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
@@ -578,7 +597,7 @@ class PostgresBackend(StorageBackend):
                              salience, confidence, valid_until, hyde_embedding,
                              SERVER_VERSION, SCHEMA_VERSION, actor, quarantined, hits or None,
                              origin, origin_detail, origin_model_id, origin_model_family,
-                             derived_from, fingerprint,
+                             derived_from, fingerprint, temporal_mode,
                              namespace, key),
                         )
                         row = await cur.fetchone()
@@ -688,7 +707,10 @@ class PostgresBackend(StorageBackend):
         # R5 advisory arm (per-namespace): claims that pin external mutable
         # state get a write-time freshness check. Control arm ('off') skips
         # the lookup entirely.
-        if kind == "claim" and isinstance(meta, dict) and not entry.get("deduplicated"):
+        if (kind == "claim" and isinstance(meta, dict) and not entry.get("deduplicated")
+                # v3 item 5: non-head modes pin an old sha deliberately — a
+                # stale-pin advisory would be noise, not signal.
+                and meta.get("temporal_mode") not in _NON_HEAD_MODES):
             profile = resolve_profile(await self._namespace_profile(namespace))
             mode = profile["advisory_mode"]
             if mode in ("full", "minimal"):
@@ -1010,7 +1032,7 @@ class PostgresBackend(StorageBackend):
                 """
                 SELECT DISTINCT ON (key) id, key, revision, kind, repo_sha,
                        content_hash, value, meta, tombstone, valid_until, created_at,
-                       quarantined, screening, derived_from, actor
+                       quarantined, screening, derived_from, actor, temporal_mode
                 FROM memory_entry WHERE namespace = %s
                 ORDER BY key, revision DESC
                 """,
@@ -1021,7 +1043,11 @@ class PostgresBackend(StorageBackend):
                     if _is_live(r) and not r["key"].startswith("_meta/")]
         quarantined_count = sum(1 for r in rows if r.get("quarantined"))
 
-        with_sha = [r for r in rows if r["repo_sha"]]
+        # v3 item 5: only head-bound entries participate in the stale-vs-latest
+        # projection — a historical_snapshot/interval/timeless entry pins an old
+        # sha DELIBERATELY and must never be compared to the moving head.
+        with_sha = [r for r in rows
+                    if r["repo_sha"] and r.get("temporal_mode") not in _NON_HEAD_MODES]
         latest_repo_sha = (
             max(with_sha, key=lambda r: r["created_at"])["repo_sha"] if with_sha else None
         )
