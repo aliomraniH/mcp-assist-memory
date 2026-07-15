@@ -17,6 +17,11 @@ decision protocol is committed and experiment namespaces are flipped):
   strips it when off, so the effect is measurable).
 * ``claim_staleness_hours`` — Phase 6 trust-decay window (not an experiment).
 * ``clinical``         — PHI hard gate: free-text channels disabled/warned.
+* ``compact_acks``     — v3 item 8 arm: on (save acks return the compact layered
+  envelope by default; the full block stays available behind verbose:true) |
+  off (control: the full pre-v3 ack shape, unchanged, plus the additive
+  status/summary fields). Additive-schema constraint: old acks unchanged under
+  the default profile, so compaction is opt-in per namespace.
 
 Every dict-shaped tool response echoes the resolved profile
 (self-describing transcripts); tool_events snapshots it per call.
@@ -28,6 +33,7 @@ DEFAULT_PROFILE: dict = {
     "advisory_mode": "off",
     "arg_strictness": "control",
     "remedy_errors": "on",
+    "compact_acks": "off",
 }
 
 _VALID = {
@@ -35,6 +41,7 @@ _VALID = {
     "advisory_mode": {"full", "minimal", "off"},
     "arg_strictness": {"hint", "plain", "control"},
     "remedy_errors": {"on", "off"},
+    "compact_acks": {"on", "off"},
 }
 
 

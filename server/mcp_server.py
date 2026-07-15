@@ -146,6 +146,38 @@ mcp: FastMCP = FastMCP(
 )
 
 
+# v3 item 8: the compact layered ack. The composite status/summary pair is on
+# EVERY save ack (additive); namespaces with profile compact_acks:"on" get this
+# reduced envelope by default — the full ~34-field block stays available behind
+# verbose:true. Core identity always kept; trust layers kept ONLY when they
+# escalate (a non-success layer must never be compacted away).
+_COMPACT_ACK_CORE = (
+    "status", "summary", "namespace", "key", "revision", "revision_id", "kind",
+    "content_hash", "verified_persisted", "deduplicated", "created_at",
+)
+_COMPACT_ACK_ESCALATIONS = (
+    "quarantined", "screening", "feedback", "advisories", "advisory_status",
+    "original_created_at", "screening_override", "tombstone",
+)
+
+
+def _compact_save_ack(entry: dict) -> dict:
+    out = {k: entry[k] for k in _COMPACT_ACK_CORE if k in entry}
+    for k in _COMPACT_ACK_ESCALATIONS:
+        if entry.get(k):
+            out[k] = entry[k]
+    return out
+
+
+async def _maybe_compact(namespace: str, entry: dict, verbose: bool) -> dict:
+    if verbose or not isinstance(entry, dict):
+        return entry
+    profile = await _profile_for(namespace)
+    if (profile or {}).get("compact_acks") == "on":
+        return _compact_save_ack(entry)
+    return entry
+
+
 # ------------------------------------------------------------------ memory
 @mcp.tool
 @instrument
@@ -165,6 +197,7 @@ async def memory_save(
     origin_model_family: str | None = None,
     derived_from: list[str] | None = None,
     role: str | None = None,
+    verbose: bool = False,
 ) -> dict:
     """Append a new revision of a memory entry in a project namespace.
     kind ∈ note|decision|todo|handoff|config|claim|knowledge (claim = a verifiable
@@ -211,6 +244,12 @@ async def memory_save(
     no external mutable subject. Omitted mode = the reconciler infers
     head-comparison semantics and marks its verdict temporal_mode_origin:
     "inferred" (advisory only) — record the mode explicitly when you know it.
+    Layered status: every ack carries a composite top-level status
+    ("ok" | "quarantined" | "deduplicated_replay" — any non-success layer
+    escalates here) plus a one-line summary. Namespaces with profile
+    compact_acks:"on" receive the compact envelope by default (core identity +
+    escalated layers only); pass verbose:true for the full block. Check status
+    first; only "ok" is a plain fresh persist.
     Role: role ∈ author|observer|verifier|curator|approver records the CAPACITY
     you wrote in (author = producing the fact, observer = recording someone
     else's, verifier = attesting a check, curator = consolidating, approver =
@@ -232,12 +271,13 @@ async def memory_save(
     (coord_reconcile, coord_health, the stale-pin advisory) uses one shared
     prefix-aware equivalence rule, so a 7-char abbreviation and the full sha of
     the same commit always agree."""
-    return await _backend().memory_save(
+    entry = await _backend().memory_save(
         namespace, key, value, kind=kind, tags=tags,
         source_surface=source_surface, event_id=event_id, meta=meta, actor=actor,
         origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
         origin_model_family=origin_model_family, derived_from=derived_from, role=role,
     )
+    return await _maybe_compact(namespace, entry, verbose)
 
 
 @mcp.tool
@@ -289,16 +329,19 @@ async def memory_history(namespace: str, key: str, limit: int = 50) -> list[dict
 async def memory_delete(
     namespace: str, key: str, source_surface: str | None = None, event_id: str | None = None,
     meta: dict | None = None, actor: str = "unattributed", role: str | None = None,
+    verbose: bool = False,
 ) -> dict:
     """Soft-delete a key by appending a tombstone revision (history preserved).
     event_id dedup is scoped to (namespace, actor); pass a distinct actor per
     independent writer. Replays return deduplicated:true with the original record.
     meta optionally records the provenance of the deletion (repo_sha/session_id…);
-    role records the capacity you deleted in (see memory_save — recording only)."""
-    return await _backend().memory_delete(
+    role records the capacity you deleted in (see memory_save — recording only).
+    Layered status + compact acks work as on memory_save."""
+    entry = await _backend().memory_delete(
         namespace, key, source_surface=source_surface, event_id=event_id, meta=meta, actor=actor,
         role=role,
     )
+    return await _maybe_compact(namespace, entry, verbose)
 
 
 @mcp.tool
@@ -331,6 +374,7 @@ async def handoff_save(
     origin: str = "unknown", origin_detail: str | None = None,
     origin_model_id: str | None = None, origin_model_family: str | None = None,
     derived_from: list[str] | None = None, role: str | None = None,
+    verbose: bool = False,
 ) -> dict:
     """Save a cross-surface handoff under a shared key within a project namespace
     (read it back with handoff_load). event_id dedup is scoped to (namespace, actor);
@@ -342,13 +386,16 @@ async def handoff_save(
     see memory_save for the override convention. Provenance fields (origin,
     origin_model_id/family, derived_from) and role (author|observer|verifier|
     curator|approver, recording only) work as on memory_save. meta is the
-    optional coordination envelope (see memory_save)."""
-    return await _backend().handoff_save(
+    optional coordination envelope (see memory_save). Layered status + compact
+    acks (compact_acks:"on" profile, verbose:true for the full block) work as on
+    memory_save."""
+    entry = await _backend().handoff_save(
         namespace, key, value, source_surface=source_surface, event_id=event_id, meta=meta,
         actor=actor, origin=origin, origin_detail=origin_detail,
         origin_model_id=origin_model_id, origin_model_family=origin_model_family,
         derived_from=derived_from, role=role,
     )
+    return await _maybe_compact(namespace, entry, verbose)
 
 
 @mcp.tool

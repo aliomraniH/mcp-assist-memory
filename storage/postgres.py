@@ -412,6 +412,36 @@ class PostgresBackend(StorageBackend):
         return await cur.fetchone()
 
     @staticmethod
+    def _finalize_ack(entry: dict) -> dict:
+        """v3 items 3+8: the composite layered status. ONE top-level field says
+        whether this ack is a plain success, and ONE line says what happened —
+        instead of trust signals scattered across ≥7 of ~34 fields (the measured
+        baseline: 1,506 bytes for a 320-byte value). Layers, most severe wins:
+        deduplicated_replay (nothing new persisted) > quarantined (persisted but
+        hidden from default reads) > ok. Advisories don't change the status but
+        are named in the summary. Additive: every other field stays."""
+        if entry.get("status") != "deduplicated_replay":
+            entry["status"] = "quarantined" if entry.get("quarantined") else "ok"
+        key, rev, kind = entry.get("key"), entry.get("revision"), entry.get("kind")
+        if entry["status"] == "deduplicated_replay":
+            summary = (f"replay: {key} rev {rev} was already persisted at "
+                       f"{entry.get('original_created_at')} — nothing new written")
+        elif entry["status"] == "quarantined":
+            patterns = ", ".join(entry.get("screening") or [])
+            summary = (f"QUARANTINED: {key} rev {rev} persisted but hidden from "
+                       f"default reads (screening: {patterns}) — not a plain success")
+        elif entry.get("tombstone"):
+            summary = f"deleted: {key} rev {rev} (tombstone appended; history kept)"
+        else:
+            summary = f"saved: {key} rev {rev} ({kind}); read-back verified"
+        names = [a.get("name") if isinstance(a, dict) else str(a)
+                 for a in (entry.get("advisories") or [])]
+        if names:
+            summary += f"; advisories: {', '.join(n for n in names if n)}"
+        entry["summary"] = summary
+        return entry
+
+    @staticmethod
     def _check_idem_conflict(existing: dict, fingerprint: str | None, event_id: str) -> None:
         """v3 item 4 (S2, draft rev -07): the same idempotency key with a
         DIFFERENT payload is MUST-NOT reuse — answered with the draft's 422
@@ -440,7 +470,7 @@ class PostgresBackend(StorageBackend):
         # mistake the echo of an old record for a fresh write (the phantom-ack
         # class). The buried deduplicated:true stays for compatibility.
         entry["status"] = "deduplicated_replay"
-        return entry
+        return PostgresBackend._finalize_ack(entry)
 
     _PROFILE_TTL_S = 60.0
 
@@ -707,7 +737,7 @@ class PostgresBackend(StorageBackend):
         if origin_detail_suppressed:
             entry["advisories"] = (list(entry.get("advisories") or [])
                                    + ["origin_detail_suppressed_clinical"])
-        return entry
+        return self._finalize_ack(entry)
 
     async def _stale_pin_advisory(self, meta: dict, mode: str) -> tuple[dict | None, str | None]:
         """R5 (T7.2): at claim-write time, check whether the pinned sha is already
@@ -770,6 +800,7 @@ class PostgresBackend(StorageBackend):
                     entry["advisory_status"] = status
                 if advisory is not None:
                     entry["advisories"] = list(entry.get("advisories") or []) + [advisory]
+                    self._finalize_ack(entry)  # re-summarize with the advisory named
         return entry
 
     async def _annotate_verdict_freshness(self, namespace, entries: list[dict]) -> None:
