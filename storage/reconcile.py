@@ -22,27 +22,16 @@ import hashlib
 import hmac
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
+# The equivalence rule now lives in ONE shared module (v3 P0/1 item 1) so
+# reconcile, coord_health, the write boundary, and the R5 advisory can never
+# diverge again. Re-exported here behavior-unchanged for existing importers.
+from storage.sha_equiv import MIN_ABBREV_LEN as _MIN_SHA_LEN  # noqa: F401
+from storage.sha_equiv import AmbiguousShaRef, sha_match  # noqa: F401
+
 # Verdict states.
 CURRENT = "current"
 STALE = "stale"
 UNVERIFIABLE = "unverifiable"
-
-# Shortest abbreviation we treat as a real SHA reference (git's default is 7).
-_MIN_SHA_LEN = 7
-
-
-def sha_match(a: str | None, b: str | None) -> bool:
-    """True if two commit SHAs refer to the same commit, tolerating abbreviation.
-
-    Claims/humans record SHORT shas (e.g. ``6e942ca``); the GitHub API returns the
-    FULL 40-char sha. Exact equality would mark almost every real merged claim
-    stale, so — like git itself — we treat one as a match when it is a
-    case-insensitive prefix of the other (min length 7 to avoid coincidences)."""
-    if not a or not b:
-        return False
-    a, b = a.lower(), b.lower()
-    short, full = (a, b) if len(a) <= len(b) else (b, a)
-    return len(short) >= _MIN_SHA_LEN and full.startswith(short)
 
 
 @runtime_checkable
@@ -54,6 +43,7 @@ class Resolver(Protocol):
 
     async def merged_state(self, repo: str, pr: int) -> dict | None: ...
     async def branch_head(self, repo: str, branch: str) -> str | None: ...
+    async def commit_sha(self, repo: str, ref: str) -> str | None: ...
 
 
 class DisabledResolver:
@@ -65,6 +55,9 @@ class DisabledResolver:
         return None
 
     async def branch_head(self, repo: str, branch: str) -> str | None:
+        return None
+
+    async def commit_sha(self, repo: str, ref: str) -> str | None:
         return None
 
 
@@ -124,6 +117,31 @@ class GitHubResolver:
         if data is None:
             return None
         return (data.get("commit") or {}).get("sha")
+
+    async def commit_sha(self, repo: str, ref: str) -> str | None:
+        """Resolve a (possibly abbreviated) commit ref to its full 40-char sha.
+
+        Best-effort like every other call — any failure returns None — with ONE
+        exception: GitHub answers an ambiguous abbreviation with 422, and that is
+        a real defect in the recorded ref, so it raises ``AmbiguousShaRef`` for
+        the write boundary to reject instead of silently storing."""
+        import httpx
+
+        try:
+            token = await self._token_provider()
+            if not token:
+                return None
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(f"{self.api_url}/repos/{repo}/commits/{ref}", headers=headers)
+                if resp.status_code == 422:
+                    raise AmbiguousShaRef(ref)
+                resp.raise_for_status()
+                return resp.json().get("sha")
+        except AmbiguousShaRef:
+            raise
+        except Exception:  # noqa: BLE001 - best-effort: any failure -> unresolved
+            return None
 
 
 def build_resolver(settings: Any) -> Resolver:

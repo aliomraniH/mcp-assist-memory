@@ -43,6 +43,9 @@ from storage.reconcile import (
     reconcile_claim,
     sha_match,
 )
+from storage.sha_equiv import canonicalize as canonicalize_sha
+from storage.sha_equiv import equivalent as sha_equivalent
+from storage.sha_equiv import validate_ref as validate_sha_ref
 from storage.sanitize import sanitize, wrap_value
 from storage.screening import screen_value
 from storage.telemetry import build_event_row
@@ -410,6 +413,43 @@ class PostgresBackend(StorageBackend):
         dict response and snapshotted into tool_events."""
         return resolve_profile(await self._namespace_profile(namespace))
 
+    async def _boundary_meta(self, meta: dict | None) -> dict | None:
+        """v3 item 1 (S1a): the write boundary is where sha refs get validated and
+        canonicalized — EVERY write path flows through here (memory_save, handoff,
+        delete tombstones, and curate ops via ``_write_curation_op`` → ``_append``),
+        so the projected ``repo_sha`` column can no longer receive a non-hex or
+        unresolvably-abbreviated ref verbatim (the rev-1 defect shape).
+
+        * ``meta.repo_sha`` — validated (hex, 7..40) then best-effort resolved to
+          the canonical 40-char sha when the resolver can reach GitHub. The
+          caller's original ref is preserved as ``meta.repo_sha_input`` whenever
+          resolution or normalization changed it; an ambiguous abbreviation is
+          rejected with ``ambiguous_sha``.
+        * ``meta.base_sha`` — validated the same way (no resolution; it is never
+          compared against live state).
+        Resolution is best-effort with a hard 2s budget — a miss stores the
+        validated abbreviation, never blocks the write."""
+        if not isinstance(meta, dict) or not meta:
+            return meta
+        ref = meta.get("repo_sha")
+        base = meta.get("base_sha")
+        if ref is None and base is None:
+            return meta
+        out = dict(meta)
+        if ref is not None:
+            normal = validate_sha_ref(ref, field="repo_sha")
+            canonical, _resolved = await canonicalize_sha(
+                normal, repo=meta.get("repo"), resolver=self.resolver)
+            out["repo_sha"] = canonical
+            if canonical != ref:
+                out["repo_sha_input"] = ref
+        if base is not None:
+            normal_base = validate_sha_ref(base, field="base_sha")
+            out["base_sha"] = normal_base
+            if normal_base != base:
+                out["base_sha_input"] = base
+        return out
+
     async def _append(
         self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None,
         *, actor="unattributed", salience=None, confidence=None, valid_until=None, embeddings=None,
@@ -428,6 +468,7 @@ class PostgresBackend(StorageBackend):
         else:
             embedding = await self._maybe_embed(key, value, tombstone)
             hyde_embedding = None
+        meta = await self._boundary_meta(meta)
         repo_sha, base_sha, branch, dirty, session_id, meta_json = _split_meta(meta)
         sanitized = sanitize(value)
         # Tombstones carry no content hash (the value is a delete marker, not a fact).
@@ -912,10 +953,14 @@ class PostgresBackend(StorageBackend):
         latest_repo_sha = (
             max(with_sha, key=lambda r: r["created_at"])["repo_sha"] if with_sha else None
         )
+        # v3 item 1 (S1a): the stale projection uses the SHARED equivalence rule
+        # (prefix-aware, like reconcile) instead of strict string equality, so a
+        # 7-char abbreviation of the namespace's latest sha no longer reads
+        # `current` from reconcile and `stale` from health at the same time.
         stale = [
             {"key": r["key"], "repo_sha": r["repo_sha"], "revision": r["revision"]}
             for r in with_sha
-            if r["repo_sha"] != latest_repo_sha
+            if not sha_equivalent(r["repo_sha"], latest_repo_sha)
         ]
 
         by_hash: dict[str, list[str]] = defaultdict(list)

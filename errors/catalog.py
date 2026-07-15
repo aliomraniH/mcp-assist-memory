@@ -72,6 +72,13 @@ CATALOG: dict[str, tuple[str, bool]] = {
         "category must be one of ergonomics|error_recovery|advisory|screening|"
         "docs_gap|surprise|suggestion and severity one of blocker|friction|note",
         False),
+    "invalid_sha": (
+        "meta.repo_sha/base_sha must be a hex commit sha, 7..40 chars (git's "
+        "default abbreviation up to the full sha) — fix the ref and retry; "
+        "prefer recording the full 40-char sha", False),
+    "ambiguous_sha": (
+        "the abbreviated sha matches more than one commit upstream — record "
+        "more characters (ideally the full 40-char sha) and retry", False),
     "curator_family_conflict": (
         "CURATOR_FAMILY_MUST_DIFFER_FROM forbids same-family curation of "
         "these entries — configure a curator from a different model family", False),

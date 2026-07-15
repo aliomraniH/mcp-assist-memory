@@ -192,7 +192,15 @@ async def memory_save(
     meta is an optional coordination envelope: its repo_sha/base_sha/branch/dirty/
     session_id keys are projected into indexed columns (the rest kept as-is) so a
     reader can mechanically ask "is this still current?" instead of parsing prose.
-    Best-effort — omit it and the entry stores exactly as before."""
+    Best-effort — omit it and the entry stores exactly as before.
+    SHA convention: meta.repo_sha/base_sha must be hex, 7..40 chars (invalid_sha
+    otherwise). An abbreviated repo_sha is best-effort resolved to the canonical
+    40-char sha when GitHub is reachable — the stored entry then carries the full
+    sha with your original ref preserved as meta.repo_sha_input; an ambiguous
+    abbreviation is rejected (ambiguous_sha). Every comparison downstream
+    (coord_reconcile, coord_health, the stale-pin advisory) uses one shared
+    prefix-aware equivalence rule, so a 7-char abbreviation and the full sha of
+    the same commit always agree."""
     return await _backend().memory_save(
         namespace, key, value, kind=kind, tags=tags,
         source_surface=source_surface, event_id=event_id, meta=meta, actor=actor,
