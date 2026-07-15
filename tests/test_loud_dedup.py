@@ -11,20 +11,23 @@ from __future__ import annotations
 import uuid
 
 
-async def test_t02_collision_replay_is_visibly_non_success(backend, ns):
-    """The T02 shape: same (namespace, actor, event_id), different payload."""
+async def test_identical_replay_is_visibly_non_success(backend, ns):
+    """Same (namespace, actor, event_id), byte-identical payload: a legitimate
+    retry — echoed, but escalated so it can't be mistaken for a fresh write.
+    (The different-payload T02 shape is item 4's idempotency_conflict — see
+    test_idempotency_fingerprint.py.)"""
     eid = str(uuid.uuid4())
     first = await backend.memory_save(ns, "run/T02/step", {"result": "pass"},
                                       event_id=eid, actor="skill-runner")
     assert first["deduplicated"] is False
     assert first.get("status") != "deduplicated_replay"
 
-    replay = await backend.memory_save(ns, "run/T02/step", {"result": "FAIL"},
+    replay = await backend.memory_save(ns, "run/T02/step", {"result": "pass"},
                                        event_id=eid, actor="skill-runner")
     # Top-level, single-field check — the escalation this item is about.
     assert replay["status"] == "deduplicated_replay"
     assert replay["deduplicated"] is True
-    # And the echo is the ORIGINAL record, not the colliding payload.
+    # And the echo is the ORIGINAL record.
     assert replay["content_hash"] == first["content_hash"]
     assert replay["original_created_at"] == first["created_at"]
 

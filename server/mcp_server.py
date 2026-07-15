@@ -171,10 +171,16 @@ async def memory_save(
     Pass a stable event_id (uuid) for exactly-once writes during offline reconcile.
     event_id dedup is scoped to (namespace, actor); pass a distinct actor for each
     independent writer — a subject under measurement and the instrument recording it
-    must never share an actor. A replayed event_id returns the ORIGINAL record —
-    nothing new is persisted — escalated as top-level status:"deduplicated_replay"
-    (plus deduplicated:true + original_created_at); a fresh write returns
-    deduplicated:false. Never treat a deduplicated_replay ack as a fresh write.
+    must never share an actor. Idempotency semantics (fingerprinted per RFC 8785):
+    replaying an event_id with the byte-identical payload returns the ORIGINAL
+    record — nothing new is persisted — escalated as top-level
+    status:"deduplicated_replay" (plus deduplicated:true + original_created_at);
+    replaying an event_id with a DIFFERENT payload is an idempotency_conflict
+    error (reusing a key across payloads is MUST NOT — mint a fresh event_id);
+    a fresh write returns deduplicated:false. Never treat a deduplicated_replay
+    ack as a fresh write. NaN/Infinity in a fingerprinted payload is a hard
+    validation error, and integers beyond 2^53 must be sent as JSON strings
+    (unrepresentable_number otherwise).
     Every ack is read-back verified (verified_persisted, revision_id, content_hash) —
     a failed verification is an error, never a success ack.
     Writes matching instruction-shaped patterns persist QUARANTINED (the ack shows

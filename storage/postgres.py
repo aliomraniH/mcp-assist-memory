@@ -33,6 +33,7 @@ from errors.catalog import FEEDBACK_NUDGE
 from storage.base import StorageBackend
 from storage.curator import Curator, DisabledCurator
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
+from storage.idempotency import idem_fingerprint
 from storage.phi import assert_no_phi
 from storage.profiles import resolve_profile
 from storage.reconcile import (
@@ -240,6 +241,9 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         # rows written before the trust-spine migration — annotate forward only.
         "server_version": row.get("server_version"),
         "schema_version": row.get("schema_version"),
+        # v3 item 4: boundary-computed JCS fingerprint of event_id writes (null
+        # for writes without an idempotency key, and rows predating 0007).
+        "idem_fingerprint": row.get("idem_fingerprint"),
     }
 
 
@@ -381,6 +385,21 @@ class PostgresBackend(StorageBackend):
         return await cur.fetchone()
 
     @staticmethod
+    def _check_idem_conflict(existing: dict, fingerprint: str | None, event_id: str) -> None:
+        """v3 item 4 (S2, draft rev -07): the same idempotency key with a
+        DIFFERENT payload is MUST-NOT reuse — answered with the draft's 422
+        analog ``idempotency_conflict``, never a phantom ack echoing the
+        original write. Rows that predate the fingerprint column (or writes
+        without one) fall back to the plain visible dedup."""
+        stored = existing.get("idem_fingerprint")
+        if stored and fingerprint and stored != fingerprint:
+            raise AppError(
+                "idempotency_conflict",
+                f"event_id {event_id} was already used for a DIFFERENT payload "
+                f"(stored fingerprint {stored[:12]}…, this request {fingerprint[:12]}…)",
+            )
+
+    @staticmethod
     def _dedup_entry(row: dict) -> dict:
         """T2.2: a replay returns the canonical original record, visibly marked."""
         entry = _row_to_entry(row)
@@ -460,8 +479,12 @@ class PostgresBackend(StorageBackend):
         self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None,
         *, actor="unattributed", salience=None, confidence=None, valid_until=None, embeddings=None,
         origin="unknown", origin_detail=None, origin_model_id=None, origin_model_family=None,
-        derived_from=None,
+        derived_from=None, tool="memory_save",
     ) -> dict:
+        # v3 item 4: capture the INCOMING envelope for fingerprinting before any
+        # boundary canonicalization touches it — a replay must fingerprint
+        # identically whether or not the resolver was reachable either time.
+        raw_meta = meta if isinstance(meta, dict) and meta else None
         # Embed BEFORE taking a pooled connection so the (network) embedding call
         # never holds a connection, and compute it once so retries don't re-embed.
         # The curator supplies its own (summary, hyde) strings via `embeddings`:
@@ -477,6 +500,13 @@ class PostgresBackend(StorageBackend):
         meta = await self._boundary_meta(meta)
         repo_sha, base_sha, branch, dirty, session_id, meta_json = _split_meta(meta)
         sanitized = sanitize(value)
+        # v3 item 4: fingerprint event_id writes at the boundary (sanitized
+        # incoming value + the caller's own meta — NEVER a jsonb round-trip).
+        fingerprint = (
+            idem_fingerprint(tool=tool, namespace=namespace, key=key, kind=kind,
+                             payload=sanitized, meta=raw_meta)
+            if event_id else None
+        )
         # Tombstones carry no content hash (the value is a delete marker, not a fact).
         content_hash = None if tombstone else _content_hash(sanitized)
         actor = actor or "unattributed"
@@ -514,6 +544,7 @@ class PostgresBackend(StorageBackend):
             if event_id:
                 existing = await self._seen_event(conn, namespace, actor, event_id)
                 if existing is not None:
+                    self._check_idem_conflict(existing, fingerprint, event_id)
                     return self._dedup_entry(existing)
 
             payload = Jsonb(sanitized)
@@ -530,14 +561,14 @@ class PostgresBackend(StorageBackend):
                                  salience, confidence, valid_until, hyde_embedding,
                                  server_version, schema_version, actor, quarantined, screening,
                                  origin, origin_detail, origin_model_id, origin_model_family,
-                                 derived_from)
+                                 derived_from, idem_fingerprint)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
                                    %s, %s, %s, %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s, %s, %s,
                                    %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s,
-                                   %s, %s, %s, %s, %s
+                                   %s, %s, %s, %s, %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
@@ -547,7 +578,7 @@ class PostgresBackend(StorageBackend):
                              salience, confidence, valid_until, hyde_embedding,
                              SERVER_VERSION, SCHEMA_VERSION, actor, quarantined, hits or None,
                              origin, origin_detail, origin_model_id, origin_model_family,
-                             derived_from,
+                             derived_from, fingerprint,
                              namespace, key),
                         )
                         row = await cur.fetchone()
@@ -563,6 +594,7 @@ class PostgresBackend(StorageBackend):
                             c2.row_factory = dict_row
                             existing = await self._seen_event(c2, namespace, actor, event_id)
                             if existing is not None:
+                                self._check_idem_conflict(existing, fingerprint, event_id)
                                 return self._dedup_entry(existing)
                     continue
             if row is None:
@@ -827,7 +859,7 @@ class PostgresBackend(StorageBackend):
         kind = latest["kind"] if latest else "note"
         return await self._append(
             namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True,
-            meta=meta, actor=actor,
+            meta=meta, actor=actor, tool="memory_delete",
         )
 
     @_retry_on_disconnect
@@ -1315,7 +1347,7 @@ class PostgresBackend(StorageBackend):
             latest.get("source_surface"),
             _curate_event_id(namespace, session_id, key, "supersede-boundary"),
             False, meta=meta, valid_until=datetime.now(timezone.utc),
-            embeddings=(None, None), actor="curator",
+            embeddings=(None, None), actor="curator", tool="coord_curate",
         )
 
     def _curator_identity(self) -> tuple[str | None, str | None]:
@@ -1352,7 +1384,7 @@ class PostgresBackend(StorageBackend):
             namespace, key, value, kind, tags, op.get("source_surface"),
             _curate_event_id(namespace, session_id, key, action), False, meta=meta,
             salience=_as_int(op.get("salience")), confidence=_as_float(op.get("confidence")),
-            embeddings=embeddings, actor="curator",
+            embeddings=embeddings, actor="curator", tool="coord_curate",
             origin="synthesized", origin_model_id=curator_model_id,
             origin_model_family=curator_family,
             derived_from=op.get("derived_from"),
@@ -1400,10 +1432,11 @@ class PostgresBackend(StorageBackend):
         operations = (result or {}).get("operations") or []
         counts = {"added": 0, "updated": 0, "merged": 0, "superseded": 0,
                   "noop": 0, "phi_dropped": 0, "downgraded": 0, "invalid": 0,
-                  "family_conflict": 0}
+                  "family_conflict": 0, "idempotency_conflict": 0}
         applied: list[dict] = []
         noops: list[dict] = []
         family_conflicts: list[dict] = []
+        idempotency_conflicts: list[dict] = []
         for op in operations:
             if not isinstance(op, dict):
                 counts["invalid"] += 1
@@ -1452,14 +1485,27 @@ class PostgresBackend(StorageBackend):
                                       "revision — confirmation recorded, revision not churned",
                         })
                         continue
-            written = await self._write_curation_op(
-                namespace, op, session_id=session_id, action=action)
+            # v3 item 4: a re-applied session op whose deterministic event_id
+            # landed with DIFFERENT content is a payload-mismatch replay — the
+            # T02 class. Surface it per-op (visible, counted) instead of failing
+            # the whole curation pass or phantom-acking the old record.
+            try:
+                written = await self._write_curation_op(
+                    namespace, op, session_id=session_id, action=action)
+            except AppError as exc:
+                if exc.code != "idempotency_conflict":
+                    raise
+                counts["idempotency_conflict"] += 1
+                idempotency_conflicts.append({"key": op.get("key"), **exc.payload})
+                continue
             applied.append(written)
             counts[{"ADD": "added", "UPDATE": "updated",
                     "MERGE": "merged", "SUPERSEDE": "superseded"}[action]] += 1
         out = {"applied": applied, "noops": noops, "counts": counts}
         if family_conflicts:
             out["family_conflicts"] = family_conflicts
+        if idempotency_conflicts:
+            out["idempotency_conflicts"] = idempotency_conflicts
         return out
 
     def _trace_query_text(self, events: list[dict]) -> str:
@@ -1524,6 +1570,7 @@ class PostgresBackend(StorageBackend):
     ) -> dict:
         return await self._append(
             namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta, actor=actor,
+            tool="handoff_save",
             origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
             origin_model_family=origin_model_family, derived_from=derived_from,
         )

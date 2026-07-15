@@ -29,9 +29,12 @@ async def test_distinct_actors_same_event_id_both_persist(backend, ns):
 
 
 async def test_same_actor_retry_is_exactly_once_and_visible(backend, ns):
+    # FLIPPED by v3 item 4: an identical retry dedups visibly; a retry with a
+    # DIFFERENT payload is now idempotency_conflict (see
+    # test_idempotency_fingerprint), never a silent echo of the original.
     eid = str(uuid.uuid4())
     first = await backend.memory_save(ns, "k", {"v": 1}, event_id=eid, actor="agent-a")
-    replay = await backend.memory_save(ns, "k", {"v": "DIFFERENT"}, event_id=eid, actor="agent-a")
+    replay = await backend.memory_save(ns, "k", {"v": 1}, event_id=eid, actor="agent-a")
     assert replay["deduplicated"] is True
     assert replay["revision"] == first["revision"]
     hist = await backend.memory_history(ns, "k")
@@ -48,7 +51,7 @@ async def test_same_event_id_different_namespace_both_persist(backend, ns):
 async def test_legacy_callers_still_dedup_in_unattributed_bucket(backend, ns):
     eid = str(uuid.uuid4())
     await backend.memory_save(ns, "k", {"v": 1}, event_id=eid)          # no actor
-    replay = await backend.memory_save(ns, "k", {"v": 2}, event_id=eid)  # no actor
+    replay = await backend.memory_save(ns, "k", {"v": 1}, event_id=eid)  # no actor
     assert replay["deduplicated"] is True and replay["actor"] == "unattributed"
 
 

@@ -32,15 +32,22 @@ from storage.sanitize import sanitize
 async def test_baseline_silent_dedup(backend, ns):
     """FLIPPED in Phase 2 (T2.2): a replayed event_id returns the canonical
     original record, visibly marked deduplicated:true + original_created_at;
-    a fresh write says deduplicated:false."""
+    a fresh write says deduplicated:false.
+    FLIPPED AGAIN by v3 item 4: only a byte-identical replay dedups; the same
+    event_id with a DIFFERENT payload is idempotency_conflict (the draft's 422
+    case), never an echo that looks like a success ack for the new content."""
     eid = str(uuid.uuid4())
     first = await backend.memory_save(ns, "k", {"v": 1}, event_id=eid)
     assert first["deduplicated"] is False
-    replay = await backend.memory_save(ns, "k", {"v": 2}, event_id=eid)
+    replay = await backend.memory_save(ns, "k", {"v": 1}, event_id=eid)
     assert replay["revision"] == first["revision"]
-    assert replay["content_hash"] == first["content_hash"]  # canonical original, not {"v": 2}
+    assert replay["content_hash"] == first["content_hash"]  # canonical original
     assert replay["deduplicated"] is True
     assert replay["original_created_at"] == first["created_at"]
+
+    with pytest.raises(AppError) as err:
+        await backend.memory_save(ns, "k", {"v": 2}, event_id=eid)
+    assert err.value.code == "idempotency_conflict"
 
 
 async def test_baseline_global_dedup_scope(backend, ns):

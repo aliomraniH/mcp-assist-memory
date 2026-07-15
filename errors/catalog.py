@@ -72,6 +72,15 @@ CATALOG: dict[str, tuple[str, bool]] = {
         "category must be one of ergonomics|error_recovery|advisory|screening|"
         "docs_gap|surprise|suggestion and severity one of blocker|friction|note",
         False),
+    "idempotency_conflict": (
+        "this event_id was already used with a DIFFERENT payload (the draft's "
+        "422 case) — reusing a key across payloads is MUST NOT; mint a fresh "
+        "event_id for new content, or resend the original payload byte-"
+        "identically to receive the original ack", False),
+    "unrepresentable_number": (
+        "RFC 8785 (JCS) cannot canonicalize NaN/Infinity (hard error, never "
+        "skipped) or integers beyond 2^53 — encode such numbers as JSON "
+        "strings in fingerprinted payloads", False),
     "invalid_sha": (
         "meta.repo_sha/base_sha must be a hex commit sha, 7..40 chars (git's "
         "default abbreviation up to the full sha) — fix the ref and retry; "
