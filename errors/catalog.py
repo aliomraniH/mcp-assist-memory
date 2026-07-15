@@ -81,6 +81,10 @@ CATALOG: dict[str, tuple[str, bool]] = {
         "RFC 8785 (JCS) cannot canonicalize NaN/Infinity (hard error, never "
         "skipped) or integers beyond 2^53 — encode such numbers as JSON "
         "strings in fingerprinted payloads", False),
+    "invalid_role": (
+        "role must be one of author|observer|verifier|curator|approver (or "
+        "omitted) — it records the capacity you wrote in; nothing is gated on "
+        "it in this phase", False),
     "invalid_evidence_state": (
         "declare evidence_state local_attested or pending_remote; "
         "remote_confirmed is assigned only by coord_reconcile observing the "

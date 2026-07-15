@@ -111,6 +111,7 @@ CREATE INDEX IF NOT EXISTS memory_entry_ns_key_pattern
 -- 0007_v3_phase1.sql columns (mirrored inline so the suite is self-contained).
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS idem_fingerprint text;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS temporal_mode text;
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS role text;
 """
 
 def _load_migration_views() -> str:

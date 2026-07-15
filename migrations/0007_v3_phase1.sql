@@ -22,3 +22,9 @@ ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS idem_fingerprint text;
 -- Nullable: absent means the reconciler INFERS a mode and marks the verdict
 -- temporal_mode_origin:"inferred" (advisory, never authoritative).
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS temporal_mode text;
+
+-- Item 7: role recording (RECORDING ONLY — no enforcement in this phase).
+-- role ∈ author|observer|verifier|curator|approver: in what capacity the actor
+-- wrote this revision. Nullable; the server stamps its own machine writers
+-- (curator ops -> 'curator', reconcile verdicts -> 'verifier').
+ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS role text;

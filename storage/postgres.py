@@ -142,6 +142,10 @@ _SEARCH_EXCLUDE_LIKE = (r"coord/\_reconcile/%", r"\_meta/%")
 # model. Backfill default is 'unknown' — historical rows annotate forward only.
 _ORIGINS = ("tool", "retrieval", "synthesized", "human", "unknown")
 
+# v3 item 7: the capacity an actor wrote in. RECORDING ONLY this phase — the
+# closed enum is validated, stored, and returned, but nothing is gated on it.
+_ROLES = ("author", "observer", "verifier", "curator", "approver")
+
 
 def _content_hash(value: Any) -> str:
     """sha256 over a canonical JSON encoding of the (already-sanitized) value.
@@ -264,6 +268,9 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         "idem_fingerprint": row.get("idem_fingerprint"),
         # v3 item 5: the claim's time-binding (nullable; see migrations/0007).
         "temporal_mode": row.get("temporal_mode"),
+        # v3 item 7: the capacity the actor wrote in (recording only, no
+        # enforcement this phase).
+        "role": row.get("role"),
     }
 
 
@@ -538,12 +545,15 @@ class PostgresBackend(StorageBackend):
         self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None,
         *, actor="unattributed", salience=None, confidence=None, valid_until=None, embeddings=None,
         origin="unknown", origin_detail=None, origin_model_id=None, origin_model_family=None,
-        derived_from=None, tool="memory_save",
+        derived_from=None, tool="memory_save", role=None,
     ) -> dict:
         # v3 item 4: capture the INCOMING envelope for fingerprinting before any
         # boundary canonicalization touches it — a replay must fingerprint
         # identically whether or not the resolver was reachable either time.
         raw_meta = meta if isinstance(meta, dict) and meta else None
+        # v3 item 7: role is recorded (validated enum), never enforced this phase.
+        if role is not None and role not in _ROLES:
+            raise AppError("invalid_role", f"invalid role {role!r}")
         # Embed BEFORE taking a pooled connection so the (network) embedding call
         # never holds a connection, and compute it once so retries don't re-embed.
         # The curator supplies its own (summary, hyde) strings via `embeddings`:
@@ -621,14 +631,14 @@ class PostgresBackend(StorageBackend):
                                  salience, confidence, valid_until, hyde_embedding,
                                  server_version, schema_version, actor, quarantined, screening,
                                  origin, origin_detail, origin_model_id, origin_model_family,
-                                 derived_from, idem_fingerprint, temporal_mode)
+                                 derived_from, idem_fingerprint, temporal_mode, role)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
                                    %s, %s, %s, %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s, %s, %s,
                                    %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s,
-                                   %s, %s, %s, %s, %s, %s, %s
+                                   %s, %s, %s, %s, %s, %s, %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
@@ -638,7 +648,7 @@ class PostgresBackend(StorageBackend):
                              salience, confidence, valid_until, hyde_embedding,
                              SERVER_VERSION, SCHEMA_VERSION, actor, quarantined, hits or None,
                              origin, origin_detail, origin_model_id, origin_model_family,
-                             derived_from, fingerprint, temporal_mode,
+                             derived_from, fingerprint, temporal_mode, role,
                              namespace, key),
                         )
                         row = await cur.fetchone()
@@ -738,12 +748,12 @@ class PostgresBackend(StorageBackend):
     async def memory_save(
         self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None, meta=None,
         actor="unattributed", origin="unknown", origin_detail=None,
-        origin_model_id=None, origin_model_family=None, derived_from=None,
+        origin_model_id=None, origin_model_family=None, derived_from=None, role=None,
     ) -> dict:
         entry = await self._append(
             namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta, actor=actor,
             origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
-            origin_model_family=origin_model_family, derived_from=derived_from,
+            origin_model_family=origin_model_family, derived_from=derived_from, role=role,
         )
         # R5 advisory arm (per-namespace): claims that pin external mutable
         # state get a write-time freshness check. Control arm ('off') skips
@@ -908,6 +918,7 @@ class PostgresBackend(StorageBackend):
     @_retry_if_idempotent
     async def memory_delete(
         self, namespace, key, *, source_surface=None, event_id=None, meta=None, actor="unattributed",
+        role=None,
     ) -> dict:
         # Tombstone = append a deleting revision (history is preserved). `meta`
         # lets a delete record the provenance of the deletion (who/at-what-sha).
@@ -922,7 +933,7 @@ class PostgresBackend(StorageBackend):
         kind = latest["kind"] if latest else "note"
         return await self._append(
             namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True,
-            meta=meta, actor=actor, tool="memory_delete",
+            meta=meta, actor=actor, tool="memory_delete", role=role,
         )
 
     @_retry_on_disconnect
@@ -1318,6 +1329,7 @@ class PostgresBackend(StorageBackend):
             await self.memory_save(
                 r["namespace"], f"{self._RECONCILE_PREFIX}{r['key']}", verdict,
                 kind="config", tags=["reconcile", verdict["state"]], actor="reconciler",
+                role="verifier",  # v3 item 7: the instrument writes as verifier
             )
             verdicts.append(verdict)
         return verdicts
@@ -1415,6 +1427,7 @@ class PostgresBackend(StorageBackend):
             _curate_event_id(namespace, session_id, key, "supersede-boundary"),
             False, meta=meta, valid_until=datetime.now(timezone.utc),
             embeddings=(None, None), actor="curator", tool="coord_curate",
+            role="curator",
         )
 
     def _curator_identity(self) -> tuple[str | None, str | None]:
@@ -1451,7 +1464,7 @@ class PostgresBackend(StorageBackend):
             namespace, key, value, kind, tags, op.get("source_surface"),
             _curate_event_id(namespace, session_id, key, action), False, meta=meta,
             salience=_as_int(op.get("salience")), confidence=_as_float(op.get("confidence")),
-            embeddings=embeddings, actor="curator", tool="coord_curate",
+            embeddings=embeddings, actor="curator", tool="coord_curate", role="curator",
             origin="synthesized", origin_model_id=curator_model_id,
             origin_model_family=curator_family,
             derived_from=op.get("derived_from"),
@@ -1633,11 +1646,11 @@ class PostgresBackend(StorageBackend):
     async def handoff_save(
         self, namespace, key, value, *, source_surface=None, event_id=None, meta=None, actor="unattributed",
         origin="unknown", origin_detail=None, origin_model_id=None, origin_model_family=None,
-        derived_from=None,
+        derived_from=None, role=None,
     ) -> dict:
         return await self._append(
             namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta, actor=actor,
-            tool="handoff_save",
+            tool="handoff_save", role=role,
             origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
             origin_model_family=origin_model_family, derived_from=derived_from,
         )

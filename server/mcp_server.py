@@ -164,6 +164,7 @@ async def memory_save(
     origin_model_id: str | None = None,
     origin_model_family: str | None = None,
     derived_from: list[str] | None = None,
+    role: str | None = None,
 ) -> dict:
     """Append a new revision of a memory entry in a project namespace.
     kind ∈ note|decision|todo|handoff|config|claim|knowledge (claim = a verifiable
@@ -210,6 +211,11 @@ async def memory_save(
     no external mutable subject. Omitted mode = the reconciler infers
     head-comparison semantics and marks its verdict temporal_mode_origin:
     "inferred" (advisory only) — record the mode explicitly when you know it.
+    Role: role ∈ author|observer|verifier|curator|approver records the CAPACITY
+    you wrote in (author = producing the fact, observer = recording someone
+    else's, verifier = attesting a check, curator = consolidating, approver =
+    signing off). Recording only in this phase — validated and stored, nothing
+    gated on it — record it anyway so later enforcement has history to learn from.
     Local evidence: meta.evidence_state ∈ local_attested|pending_remote records
     that a sha is only provable locally so far (schema: meta.attestation with
     the attested sha + hashes — method, attested_at, command_hash,
@@ -230,7 +236,7 @@ async def memory_save(
         namespace, key, value, kind=kind, tags=tags,
         source_surface=source_surface, event_id=event_id, meta=meta, actor=actor,
         origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
-        origin_model_family=origin_model_family, derived_from=derived_from,
+        origin_model_family=origin_model_family, derived_from=derived_from, role=role,
     )
 
 
@@ -282,14 +288,16 @@ async def memory_history(namespace: str, key: str, limit: int = 50) -> list[dict
 @instrument
 async def memory_delete(
     namespace: str, key: str, source_surface: str | None = None, event_id: str | None = None,
-    meta: dict | None = None, actor: str = "unattributed",
+    meta: dict | None = None, actor: str = "unattributed", role: str | None = None,
 ) -> dict:
     """Soft-delete a key by appending a tombstone revision (history preserved).
     event_id dedup is scoped to (namespace, actor); pass a distinct actor per
     independent writer. Replays return deduplicated:true with the original record.
-    meta optionally records the provenance of the deletion (repo_sha/session_id…)."""
+    meta optionally records the provenance of the deletion (repo_sha/session_id…);
+    role records the capacity you deleted in (see memory_save — recording only)."""
     return await _backend().memory_delete(
         namespace, key, source_surface=source_surface, event_id=event_id, meta=meta, actor=actor,
+        role=role,
     )
 
 
@@ -322,21 +330,24 @@ async def handoff_save(
     meta: dict | None = None, actor: str = "unattributed",
     origin: str = "unknown", origin_detail: str | None = None,
     origin_model_id: str | None = None, origin_model_family: str | None = None,
-    derived_from: list[str] | None = None,
+    derived_from: list[str] | None = None, role: str | None = None,
 ) -> dict:
     """Save a cross-surface handoff under a shared key within a project namespace
     (read it back with handoff_load). event_id dedup is scoped to (namespace, actor);
-    pass a distinct actor per independent writer. Replays return deduplicated:true;
+    pass a distinct actor per independent writer. A byte-identical replay returns
+    the original ack escalated as status:"deduplicated_replay"; the same event_id
+    with a different payload is an idempotency_conflict error (see memory_save);
     every ack is read-back verified (verified_persisted). Instruction-shaped values
     persist quarantined (visible in the ack) and are hidden from default reads —
     see memory_save for the override convention. Provenance fields (origin,
-    origin_model_id/family, derived_from) work as on memory_save. meta is the
+    origin_model_id/family, derived_from) and role (author|observer|verifier|
+    curator|approver, recording only) work as on memory_save. meta is the
     optional coordination envelope (see memory_save)."""
     return await _backend().handoff_save(
         namespace, key, value, source_surface=source_surface, event_id=event_id, meta=meta,
         actor=actor, origin=origin, origin_detail=origin_detail,
         origin_model_id=origin_model_id, origin_model_family=origin_model_family,
-        derived_from=derived_from,
+        derived_from=derived_from, role=role,
     )
 
 
