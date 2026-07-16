@@ -25,6 +25,10 @@ dependencies = [
     # runs a DisabledCurator with no key — but the SDK must be installed so that,
     # when a key IS configured, curate() doesn't fail closed with sdk_unavailable.
     "anthropic>=0.116.0",
+    # Idempotency fingerprint (v3 item 4): RFC 8785 / JCS canonicalization.
+    # Python's json.dumps is NOT JCS-compliant (ECMA-262 shortest-round-trip
+    # numbers, UTF-16 code-unit key sort) — never hand-roll this.
+    "rfc8785>=0.1.4",
 ]
 
 [project.optional-dependencies]

@@ -146,6 +146,38 @@ mcp: FastMCP = FastMCP(
 )
 
 
+# v3 item 8: the compact layered ack. The composite status/summary pair is on
+# EVERY save ack (additive); namespaces with profile compact_acks:"on" get this
+# reduced envelope by default — the full ~34-field block stays available behind
+# verbose:true. Core identity always kept; trust layers kept ONLY when they
+# escalate (a non-success layer must never be compacted away).
+_COMPACT_ACK_CORE = (
+    "status", "summary", "namespace", "key", "revision", "revision_id", "kind",
+    "content_hash", "verified_persisted", "deduplicated", "created_at",
+)
+_COMPACT_ACK_ESCALATIONS = (
+    "quarantined", "screening", "feedback", "advisories", "advisory_status",
+    "original_created_at", "screening_override", "tombstone",
+)
+
+
+def _compact_save_ack(entry: dict) -> dict:
+    out = {k: entry[k] for k in _COMPACT_ACK_CORE if k in entry}
+    for k in _COMPACT_ACK_ESCALATIONS:
+        if entry.get(k):
+            out[k] = entry[k]
+    return out
+
+
+async def _maybe_compact(namespace: str, entry: dict, verbose: bool) -> dict:
+    if verbose or not isinstance(entry, dict):
+        return entry
+    profile = await _profile_for(namespace)
+    if (profile or {}).get("compact_acks") == "on":
+        return _compact_save_ack(entry)
+    return entry
+
+
 # ------------------------------------------------------------------ memory
 @mcp.tool
 @instrument
@@ -164,6 +196,8 @@ async def memory_save(
     origin_model_id: str | None = None,
     origin_model_family: str | None = None,
     derived_from: list[str] | None = None,
+    role: str | None = None,
+    verbose: bool = False,
 ) -> dict:
     """Append a new revision of a memory entry in a project namespace.
     kind ∈ note|decision|todo|handoff|config|claim|knowledge (claim = a verifiable
@@ -171,8 +205,16 @@ async def memory_save(
     Pass a stable event_id (uuid) for exactly-once writes during offline reconcile.
     event_id dedup is scoped to (namespace, actor); pass a distinct actor for each
     independent writer — a subject under measurement and the instrument recording it
-    must never share an actor. A replayed event_id returns the original record with
-    deduplicated:true + original_created_at; a fresh write returns deduplicated:false.
+    must never share an actor. Idempotency semantics (fingerprinted per RFC 8785):
+    replaying an event_id with the byte-identical payload returns the ORIGINAL
+    record — nothing new is persisted — escalated as top-level
+    status:"deduplicated_replay" (plus deduplicated:true + original_created_at);
+    replaying an event_id with a DIFFERENT payload is an idempotency_conflict
+    error (reusing a key across payloads is MUST NOT — mint a fresh event_id);
+    a fresh write returns deduplicated:false. Never treat a deduplicated_replay
+    ack as a fresh write. NaN/Infinity in a fingerprinted payload is a hard
+    validation error, and integers beyond 2^53 must be sent as JSON strings
+    (unrepresentable_number otherwise).
     Every ack is read-back verified (verified_persisted, revision_id, content_hash) —
     a failed verification is an error, never a success ack.
     Writes matching instruction-shaped patterns persist QUARANTINED (the ack shows
@@ -192,13 +234,50 @@ async def memory_save(
     meta is an optional coordination envelope: its repo_sha/base_sha/branch/dirty/
     session_id keys are projected into indexed columns (the rest kept as-is) so a
     reader can mechanically ask "is this still current?" instead of parsing prose.
-    Best-effort — omit it and the entry stores exactly as before."""
-    return await _backend().memory_save(
+    Best-effort — omit it and the entry stores exactly as before.
+    Temporal mode: meta.temporal_mode ∈ head_tracking|historical_snapshot|
+    interval|timeless declares a claim's time-binding. head_tracking asserts
+    about the CURRENT state of a moving ref and goes stale when the head moves;
+    historical_snapshot asserts about a specific commit as of a moment — it is
+    verified by sha-existence and NEVER compared to the live head (terminal
+    non-stale once verified; use it for run records / milestones); timeless has
+    no external mutable subject. Omitted mode = the reconciler infers
+    head-comparison semantics and marks its verdict temporal_mode_origin:
+    "inferred" (advisory only) — record the mode explicitly when you know it.
+    Layered status: every ack carries a composite top-level status
+    ("ok" | "quarantined" | "deduplicated_replay" — any non-success layer
+    escalates here) plus a one-line summary. Namespaces with profile
+    compact_acks:"on" receive the compact envelope by default (core identity +
+    escalated layers only); pass verbose:true for the full block. Check status
+    first; only "ok" is a plain fresh persist.
+    Role: role ∈ author|observer|verifier|curator|approver records the CAPACITY
+    you wrote in (author = producing the fact, observer = recording someone
+    else's, verifier = attesting a check, curator = consolidating, approver =
+    signing off). Recording only in this phase — validated and stored, nothing
+    gated on it — record it anyway so later enforcement has history to learn from.
+    Local evidence: meta.evidence_state ∈ local_attested|pending_remote records
+    that a sha is only provable locally so far (schema: meta.attestation with
+    the attested sha + hashes — method, attested_at, command_hash,
+    evidence_hash; never raw commands/output, which are rejected in clinical
+    namespaces). HARD RULE: local_attested is evidence, never verification — it
+    can never satisfy a verification gate, and promotion to remote_confirmed
+    happens ONLY via coord_reconcile observing the sha remotely
+    (self-declaring remote_confirmed is rejected).
+    SHA convention: meta.repo_sha/base_sha must be hex, 7..40 chars (invalid_sha
+    otherwise). An abbreviated repo_sha is best-effort resolved to the canonical
+    40-char sha when GitHub is reachable — the stored entry then carries the full
+    sha with your original ref preserved as meta.repo_sha_input; an ambiguous
+    abbreviation is rejected (ambiguous_sha). Every comparison downstream
+    (coord_reconcile, coord_health, the stale-pin advisory) uses one shared
+    prefix-aware equivalence rule, so a 7-char abbreviation and the full sha of
+    the same commit always agree."""
+    entry = await _backend().memory_save(
         namespace, key, value, kind=kind, tags=tags,
         source_surface=source_surface, event_id=event_id, meta=meta, actor=actor,
         origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
-        origin_model_family=origin_model_family, derived_from=derived_from,
+        origin_model_family=origin_model_family, derived_from=derived_from, role=role,
     )
+    return await _maybe_compact(namespace, entry, verbose)
 
 
 @mcp.tool
@@ -249,15 +328,20 @@ async def memory_history(namespace: str, key: str, limit: int = 50) -> list[dict
 @instrument
 async def memory_delete(
     namespace: str, key: str, source_surface: str | None = None, event_id: str | None = None,
-    meta: dict | None = None, actor: str = "unattributed",
+    meta: dict | None = None, actor: str = "unattributed", role: str | None = None,
+    verbose: bool = False,
 ) -> dict:
     """Soft-delete a key by appending a tombstone revision (history preserved).
     event_id dedup is scoped to (namespace, actor); pass a distinct actor per
     independent writer. Replays return deduplicated:true with the original record.
-    meta optionally records the provenance of the deletion (repo_sha/session_id…)."""
-    return await _backend().memory_delete(
+    meta optionally records the provenance of the deletion (repo_sha/session_id…);
+    role records the capacity you deleted in (see memory_save — recording only).
+    Layered status + compact acks work as on memory_save."""
+    entry = await _backend().memory_delete(
         namespace, key, source_surface=source_surface, event_id=event_id, meta=meta, actor=actor,
+        role=role,
     )
+    return await _maybe_compact(namespace, entry, verbose)
 
 
 @mcp.tool
@@ -289,22 +373,29 @@ async def handoff_save(
     meta: dict | None = None, actor: str = "unattributed",
     origin: str = "unknown", origin_detail: str | None = None,
     origin_model_id: str | None = None, origin_model_family: str | None = None,
-    derived_from: list[str] | None = None,
+    derived_from: list[str] | None = None, role: str | None = None,
+    verbose: bool = False,
 ) -> dict:
     """Save a cross-surface handoff under a shared key within a project namespace
     (read it back with handoff_load). event_id dedup is scoped to (namespace, actor);
-    pass a distinct actor per independent writer. Replays return deduplicated:true;
+    pass a distinct actor per independent writer. A byte-identical replay returns
+    the original ack escalated as status:"deduplicated_replay"; the same event_id
+    with a different payload is an idempotency_conflict error (see memory_save);
     every ack is read-back verified (verified_persisted). Instruction-shaped values
     persist quarantined (visible in the ack) and are hidden from default reads —
     see memory_save for the override convention. Provenance fields (origin,
-    origin_model_id/family, derived_from) work as on memory_save. meta is the
-    optional coordination envelope (see memory_save)."""
-    return await _backend().handoff_save(
+    origin_model_id/family, derived_from) and role (author|observer|verifier|
+    curator|approver, recording only) work as on memory_save. meta is the
+    optional coordination envelope (see memory_save). Layered status + compact
+    acks (compact_acks:"on" profile, verbose:true for the full block) work as on
+    memory_save."""
+    entry = await _backend().handoff_save(
         namespace, key, value, source_surface=source_surface, event_id=event_id, meta=meta,
         actor=actor, origin=origin, origin_detail=origin_detail,
         origin_model_id=origin_model_id, origin_model_family=origin_model_family,
-        derived_from=derived_from,
+        derived_from=derived_from, role=role,
     )
+    return await _maybe_compact(namespace, entry, verbose)
 
 
 @mcp.tool
@@ -456,7 +547,24 @@ async def coord_reconcile(namespace: str, limit: int = 100) -> dict:
     derived from each claim's provenance (meta.repo + meta.pr / meta.branch), not
     its prose. When the backend has no GitHub token the resolver is disabled and
     every verdict is `unverifiable` (never silently `current`). Run it at session
-    start to learn which claims need re-verifying."""
+    start to learn which claims need re-verifying.
+    Local evidence gate: a claim carrying evidence_state local_attested/
+    pending_remote can NEVER read current while its sha is unobserved remotely
+    (local_attested is evidence, never verification); when the resolver does
+    observe the sha, the verdict records the promotion
+    (evidence.promoted_to:"remote_confirmed") — the only path to that state.
+    Temporal forks: a claim recorded with meta.temporal_mode=historical_snapshot
+    verifies its pinned sha EXISTS upstream and is never compared to the live
+    head (terminal non-stale once verified); timeless claims have no external
+    subject; interval reconciliation is not mechanized yet (stays unverifiable).
+    Claims without a recorded mode get head-comparison semantics and the verdict
+    carries temporal_mode_origin:"inferred" — advisory, never authoritative.
+    Verdict freshness: every verdict READ (memory_get/list/history of a
+    coord/_reconcile/* key) carries checked_at + age_hours inline, and
+    freshness:"expired" once the verdict is older than the namespace's
+    claim_staleness_hours window — a verdict is a snapshot, not a subscription;
+    treat an expired verdict as unknown and re-run coord_reconcile, never as
+    still-true."""
     return await _backend().coord_reconcile(namespace, limit=limit)
 
 

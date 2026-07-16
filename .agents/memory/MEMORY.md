@@ -11,5 +11,7 @@
 - [valid_until live reads](valid-until-live-reads.md) — a new not-live column must be honored in BOTH SQL WHEREs and Python `_is_live` post-filters; the latter's explicit SELECT must include the column or superseded rows leak.
 - [Main-agent git sync](main-agent-git-sync.md) — main agent can't fetch/reset/checkout; sync to remote main via GitHub compare+contents API file writes; run tests on a scratch DB, not live DATABASE_URL.
 - [constraints.txt / pyproject lockstep](constraints-pyproject-lockstep.md) — a pyproject pin bump without regenerating constraints.txt breaks post-merge with ResolutionImpossible; fix = pip install -e . then scripts/lock-deps.sh.
+- [MCP tool arg shapes](mcp-tool-arg-shapes.md) — memory_save has no top-level session_id (use meta); observation_log category enum; missing-key get = empty content, not error.
+- [Prod DB operator-only](prod-db-operator-only.md) — prod Postgres is separate from dev and agent SQL is SELECT-only; probes needing prod writes → verify on identical dev build + log deviation.
 - [Deploy healthcheck root + main's dropped shims](deploy-healthcheck-root.md) — platform probes GET / (keep DB-independent 200); GitHub main lacks BOTH the GET / root AND the /mcp path-normalization shim, so re-apply both on every deploy-from-main or the deploy 404s / bare POST /mcp 307s.
 - [Deterministic deploy deps](deterministic-deploy-deps.md) — loose pyproject ranges + no lock caused the /mcp 421; constraints.txt pins the full closure and is wired into every install path; regenerate via `make lock`, never hand-edit.

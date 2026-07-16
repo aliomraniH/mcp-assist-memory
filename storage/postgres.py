@@ -33,6 +33,7 @@ from errors.catalog import FEEDBACK_NUDGE
 from storage.base import StorageBackend
 from storage.curator import Curator, DisabledCurator
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
+from storage.idempotency import idem_fingerprint
 from storage.phi import assert_no_phi
 from storage.profiles import resolve_profile
 from storage.reconcile import (
@@ -43,6 +44,9 @@ from storage.reconcile import (
     reconcile_claim,
     sha_match,
 )
+from storage.sha_equiv import canonicalize as canonicalize_sha
+from storage.sha_equiv import equivalent as sha_equivalent
+from storage.sha_equiv import validate_ref as validate_sha_ref
 from storage.sanitize import sanitize, wrap_value
 from storage.screening import screen_value
 from storage.telemetry import build_event_row
@@ -107,7 +111,23 @@ def _retry_if_idempotent(fn):
 
 # Coordination-envelope keys projected out of `meta` into indexed columns. The
 # full envelope is still stored in the `meta` jsonb column, losslessly.
-_META_COLS = ("repo_sha", "base_sha", "branch", "dirty", "session_id")
+_META_COLS = ("repo_sha", "base_sha", "branch", "dirty", "session_id", "temporal_mode")
+
+# v3 item 5: the closed enum for meta.temporal_mode (nullable column 0007).
+_TEMPORAL_MODES = ("head_tracking", "historical_snapshot", "interval", "timeless")
+# Modes whose subject is NOT the live head — they never participate in
+# head-comparison (health's stale projection, the R5 stale-pin advisory).
+_NON_HEAD_MODES = ("historical_snapshot", "interval", "timeless")
+
+# v3 item 6: local-evidence ladder. HARD RULE (schema + tool description):
+# local_attested is EVIDENCE, never verification — it can never satisfy a
+# verification gate; promotion to remote_confirmed happens ONLY via the
+# resolver observing the sha remotely (coord_reconcile), so a writer may
+# declare the first two states but never the third.
+_DECLARABLE_EVIDENCE_STATES = ("local_attested", "pending_remote")
+# Attestation payloads carry hashes, never raw command/output text — in
+# clinical namespaces these keys are rejected outright (PHI hard gate 0.5).
+_ATTESTATION_RAW_KEYS = ("command", "cmd", "output", "stdout", "stderr", "logs")
 
 # LIKE patterns (backslash-escaped underscores, so `_` is literal) for the
 # internal house-band that ranked search must NOT surface: reconcile verdict
@@ -122,6 +142,10 @@ _SEARCH_EXCLUDE_LIKE = (r"coord/\_reconcile/%", r"\_meta/%")
 # model. Backfill default is 'unknown' — historical rows annotate forward only.
 _ORIGINS = ("tool", "retrieval", "synthesized", "human", "unknown")
 
+# v3 item 7: the capacity an actor wrote in. RECORDING ONLY this phase — the
+# closed enum is validated, stored, and returned, but nothing is gated on it.
+_ROLES = ("author", "observer", "verifier", "curator", "approver")
+
 
 def _content_hash(value: Any) -> str:
     """sha256 over a canonical JSON encoding of the (already-sanitized) value.
@@ -133,16 +157,18 @@ def _content_hash(value: Any) -> str:
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
-def _split_meta(meta: dict | None) -> tuple[Any, Any, Any, Any, Any, Any]:
-    """Return ``(repo_sha, base_sha, branch, dirty, session_id, meta_jsonb)``.
+def _split_meta(meta: dict | None) -> tuple[Any, Any, Any, Any, Any, Any, Any]:
+    """Return ``(repo_sha, base_sha, branch, dirty, session_id, temporal_mode,
+    meta_jsonb)``.
 
-    The five well-known keys become indexed columns; the whole envelope is kept
+    The well-known keys become indexed columns; the whole envelope is kept
     as jsonb (None when empty) so nothing the caller sent is dropped. A non-dict
     ``meta`` is ignored (treated as absent) rather than failing the write."""
     if not isinstance(meta, dict) or not meta:
-        return (None, None, None, None, None, None)
-    repo_sha, base_sha, branch, dirty, session_id = (meta.get(c) for c in _META_COLS)
-    return repo_sha, base_sha, branch, dirty, session_id, Jsonb(meta)
+        return (None, None, None, None, None, None, None)
+    repo_sha, base_sha, branch, dirty, session_id, temporal_mode = (
+        meta.get(c) for c in _META_COLS)
+    return repo_sha, base_sha, branch, dirty, session_id, temporal_mode, Jsonb(meta)
 
 
 # Deterministic event_id namespace for curator writes, so re-running coord_curate
@@ -237,6 +263,14 @@ def _row_to_entry(row: dict, *, wrap: bool = True) -> dict:
         # rows written before the trust-spine migration — annotate forward only.
         "server_version": row.get("server_version"),
         "schema_version": row.get("schema_version"),
+        # v3 item 4: boundary-computed JCS fingerprint of event_id writes (null
+        # for writes without an idempotency key, and rows predating 0007).
+        "idem_fingerprint": row.get("idem_fingerprint"),
+        # v3 item 5: the claim's time-binding (nullable; see migrations/0007).
+        "temporal_mode": row.get("temporal_mode"),
+        # v3 item 7: the capacity the actor wrote in (recording only, no
+        # enforcement this phase).
+        "role": row.get("role"),
     }
 
 
@@ -378,6 +412,51 @@ class PostgresBackend(StorageBackend):
         return await cur.fetchone()
 
     @staticmethod
+    def _finalize_ack(entry: dict) -> dict:
+        """v3 items 3+8: the composite layered status. ONE top-level field says
+        whether this ack is a plain success, and ONE line says what happened —
+        instead of trust signals scattered across ≥7 of ~34 fields (the measured
+        baseline: 1,506 bytes for a 320-byte value). Layers, most severe wins:
+        deduplicated_replay (nothing new persisted) > quarantined (persisted but
+        hidden from default reads) > ok. Advisories don't change the status but
+        are named in the summary. Additive: every other field stays."""
+        if entry.get("status") != "deduplicated_replay":
+            entry["status"] = "quarantined" if entry.get("quarantined") else "ok"
+        key, rev, kind = entry.get("key"), entry.get("revision"), entry.get("kind")
+        if entry["status"] == "deduplicated_replay":
+            summary = (f"replay: {key} rev {rev} was already persisted at "
+                       f"{entry.get('original_created_at')} — nothing new written")
+        elif entry["status"] == "quarantined":
+            patterns = ", ".join(entry.get("screening") or [])
+            summary = (f"QUARANTINED: {key} rev {rev} persisted but hidden from "
+                       f"default reads (screening: {patterns}) — not a plain success")
+        elif entry.get("tombstone"):
+            summary = f"deleted: {key} rev {rev} (tombstone appended; history kept)"
+        else:
+            summary = f"saved: {key} rev {rev} ({kind}); read-back verified"
+        names = [a.get("name") if isinstance(a, dict) else str(a)
+                 for a in (entry.get("advisories") or [])]
+        if names:
+            summary += f"; advisories: {', '.join(n for n in names if n)}"
+        entry["summary"] = summary
+        return entry
+
+    @staticmethod
+    def _check_idem_conflict(existing: dict, fingerprint: str | None, event_id: str) -> None:
+        """v3 item 4 (S2, draft rev -07): the same idempotency key with a
+        DIFFERENT payload is MUST-NOT reuse — answered with the draft's 422
+        analog ``idempotency_conflict``, never a phantom ack echoing the
+        original write. Rows that predate the fingerprint column (or writes
+        without one) fall back to the plain visible dedup."""
+        stored = existing.get("idem_fingerprint")
+        if stored and fingerprint and stored != fingerprint:
+            raise AppError(
+                "idempotency_conflict",
+                f"event_id {event_id} was already used for a DIFFERENT payload "
+                f"(stored fingerprint {stored[:12]}…, this request {fingerprint[:12]}…)",
+            )
+
+    @staticmethod
     def _dedup_entry(row: dict) -> dict:
         """T2.2: a replay returns the canonical original record, visibly marked."""
         entry = _row_to_entry(row)
@@ -385,7 +464,13 @@ class PostgresBackend(StorageBackend):
         entry["original_created_at"] = entry["created_at"]
         # The dedup check itself just read the row back from the store.
         entry["verified_persisted"] = True
-        return entry
+        # v3 item 3 (interim, measured against the skill-transfer T02 collision):
+        # a replay is NOT a plain success — nothing new was persisted. Escalate
+        # to a top-level non-"ok" status so a caller checking one field can't
+        # mistake the echo of an old record for a fresh write (the phantom-ack
+        # class). The buried deduplicated:true stays for compatibility.
+        entry["status"] = "deduplicated_replay"
+        return PostgresBackend._finalize_ack(entry)
 
     _PROFILE_TTL_S = 60.0
 
@@ -410,12 +495,95 @@ class PostgresBackend(StorageBackend):
         dict response and snapshotted into tool_events."""
         return resolve_profile(await self._namespace_profile(namespace))
 
+    async def _boundary_meta(self, namespace: str, meta: dict | None) -> dict | None:
+        """v3 item 1 (S1a): the write boundary is where sha refs get validated and
+        canonicalized — EVERY write path flows through here (memory_save, handoff,
+        delete tombstones, and curate ops via ``_write_curation_op`` → ``_append``),
+        so the projected ``repo_sha`` column can no longer receive a non-hex or
+        unresolvably-abbreviated ref verbatim (the rev-1 defect shape).
+
+        * ``meta.repo_sha`` — validated (hex, 7..40) then best-effort resolved to
+          the canonical 40-char sha when the resolver can reach GitHub. The
+          caller's original ref is preserved as ``meta.repo_sha_input`` whenever
+          resolution or normalization changed it; an ambiguous abbreviation is
+          rejected with ``ambiguous_sha``.
+        * ``meta.base_sha`` — validated the same way (no resolution; it is never
+          compared against live state).
+        Resolution is best-effort with a hard 2s budget — a miss stores the
+        validated abbreviation, never blocks the write."""
+        if not isinstance(meta, dict) or not meta:
+            return meta
+        # v3 item 5: temporal_mode is a closed enum (nullable — absent means the
+        # reconciler infers, advisorily).
+        mode = meta.get("temporal_mode")
+        if mode is not None and mode not in _TEMPORAL_MODES:
+            raise AppError(
+                "invalid_temporal_mode",
+                f"invalid temporal_mode {mode!r}",
+            )
+        # v3 item 6: evidence_state is declarable only up the ladder —
+        # remote_confirmed is DERIVED by coord_reconcile observing the sha
+        # remotely, never self-declared (that would be forged verification).
+        evidence_state = meta.get("evidence_state")
+        if evidence_state is not None and evidence_state not in _DECLARABLE_EVIDENCE_STATES:
+            raise AppError(
+                "invalid_evidence_state",
+                f"invalid evidence_state {evidence_state!r} — declare "
+                "local_attested or pending_remote; remote_confirmed is assigned "
+                "only by coord_reconcile observing the sha remotely",
+            )
+        attestation = meta.get("attestation")
+        if attestation is not None:
+            if not isinstance(attestation, dict) or not attestation.get("sha"):
+                raise AppError(
+                    "invalid_attestation",
+                    "meta.attestation must be an object carrying at least the "
+                    "attested sha (plus hashes: method, attested_at, "
+                    "command_hash, evidence_hash)",
+                )
+            validate_sha_ref(attestation["sha"], field="attestation.sha")
+            profile = await self._namespace_profile(namespace)
+            if profile.get("clinical"):
+                raw = sorted(set(attestation) & set(_ATTESTATION_RAW_KEYS))
+                if raw:
+                    raise AppError(
+                        "invalid_attestation",
+                        f"attestation carries raw fields {raw} — in clinical "
+                        "namespaces attestation payloads carry hashes, never "
+                        "raw commands or output (PHI hard gate)",
+                    )
+        ref = meta.get("repo_sha")
+        base = meta.get("base_sha")
+        if ref is None and base is None:
+            return meta
+        out = dict(meta)
+        if ref is not None:
+            normal = validate_sha_ref(ref, field="repo_sha")
+            canonical, _resolved = await canonicalize_sha(
+                normal, repo=meta.get("repo"), resolver=self.resolver)
+            out["repo_sha"] = canonical
+            if canonical != ref:
+                out["repo_sha_input"] = ref
+        if base is not None:
+            normal_base = validate_sha_ref(base, field="base_sha")
+            out["base_sha"] = normal_base
+            if normal_base != base:
+                out["base_sha_input"] = base
+        return out
+
     async def _append(
         self, namespace, key, value, kind, tags, source_surface, event_id, tombstone, meta=None,
         *, actor="unattributed", salience=None, confidence=None, valid_until=None, embeddings=None,
         origin="unknown", origin_detail=None, origin_model_id=None, origin_model_family=None,
-        derived_from=None,
+        derived_from=None, tool="memory_save", role=None,
     ) -> dict:
+        # v3 item 4: capture the INCOMING envelope for fingerprinting before any
+        # boundary canonicalization touches it — a replay must fingerprint
+        # identically whether or not the resolver was reachable either time.
+        raw_meta = meta if isinstance(meta, dict) and meta else None
+        # v3 item 7: role is recorded (validated enum), never enforced this phase.
+        if role is not None and role not in _ROLES:
+            raise AppError("invalid_role", f"invalid role {role!r}")
         # Embed BEFORE taking a pooled connection so the (network) embedding call
         # never holds a connection, and compute it once so retries don't re-embed.
         # The curator supplies its own (summary, hyde) strings via `embeddings`:
@@ -428,8 +596,17 @@ class PostgresBackend(StorageBackend):
         else:
             embedding = await self._maybe_embed(key, value, tombstone)
             hyde_embedding = None
-        repo_sha, base_sha, branch, dirty, session_id, meta_json = _split_meta(meta)
+        meta = await self._boundary_meta(namespace, meta)
+        (repo_sha, base_sha, branch, dirty, session_id, temporal_mode,
+         meta_json) = _split_meta(meta)
         sanitized = sanitize(value)
+        # v3 item 4: fingerprint event_id writes at the boundary (sanitized
+        # incoming value + the caller's own meta — NEVER a jsonb round-trip).
+        fingerprint = (
+            idem_fingerprint(tool=tool, namespace=namespace, key=key, kind=kind,
+                             payload=sanitized, meta=raw_meta)
+            if event_id else None
+        )
         # Tombstones carry no content hash (the value is a delete marker, not a fact).
         content_hash = None if tombstone else _content_hash(sanitized)
         actor = actor or "unattributed"
@@ -467,6 +644,7 @@ class PostgresBackend(StorageBackend):
             if event_id:
                 existing = await self._seen_event(conn, namespace, actor, event_id)
                 if existing is not None:
+                    self._check_idem_conflict(existing, fingerprint, event_id)
                     return self._dedup_entry(existing)
 
             payload = Jsonb(sanitized)
@@ -483,14 +661,14 @@ class PostgresBackend(StorageBackend):
                                  salience, confidence, valid_until, hyde_embedding,
                                  server_version, schema_version, actor, quarantined, screening,
                                  origin, origin_detail, origin_model_id, origin_model_family,
-                                 derived_from)
+                                 derived_from, idem_fingerprint, temporal_mode, role)
                             SELECT %s, %s,
                                    COALESCE(MAX(revision), 0) + 1,
                                    %s, %s, %s, %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s, %s, %s,
                                    %s, %s, %s, %s::vector,
                                    %s, %s, %s, %s, %s,
-                                   %s, %s, %s, %s, %s
+                                   %s, %s, %s, %s, %s, %s, %s, %s
                             FROM memory_entry WHERE namespace = %s AND key = %s
                             RETURNING *
                             """,
@@ -500,7 +678,7 @@ class PostgresBackend(StorageBackend):
                              salience, confidence, valid_until, hyde_embedding,
                              SERVER_VERSION, SCHEMA_VERSION, actor, quarantined, hits or None,
                              origin, origin_detail, origin_model_id, origin_model_family,
-                             derived_from,
+                             derived_from, fingerprint, temporal_mode, role,
                              namespace, key),
                         )
                         row = await cur.fetchone()
@@ -516,6 +694,7 @@ class PostgresBackend(StorageBackend):
                             c2.row_factory = dict_row
                             existing = await self._seen_event(c2, namespace, actor, event_id)
                             if existing is not None:
+                                self._check_idem_conflict(existing, fingerprint, event_id)
                                 return self._dedup_entry(existing)
                     continue
             if row is None:
@@ -558,7 +737,7 @@ class PostgresBackend(StorageBackend):
         if origin_detail_suppressed:
             entry["advisories"] = (list(entry.get("advisories") or [])
                                    + ["origin_detail_suppressed_clinical"])
-        return entry
+        return self._finalize_ack(entry)
 
     async def _stale_pin_advisory(self, meta: dict, mode: str) -> tuple[dict | None, str | None]:
         """R5 (T7.2): at claim-write time, check whether the pinned sha is already
@@ -599,17 +778,20 @@ class PostgresBackend(StorageBackend):
     async def memory_save(
         self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None, meta=None,
         actor="unattributed", origin="unknown", origin_detail=None,
-        origin_model_id=None, origin_model_family=None, derived_from=None,
+        origin_model_id=None, origin_model_family=None, derived_from=None, role=None,
     ) -> dict:
         entry = await self._append(
             namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta, actor=actor,
             origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
-            origin_model_family=origin_model_family, derived_from=derived_from,
+            origin_model_family=origin_model_family, derived_from=derived_from, role=role,
         )
         # R5 advisory arm (per-namespace): claims that pin external mutable
         # state get a write-time freshness check. Control arm ('off') skips
         # the lookup entirely.
-        if kind == "claim" and isinstance(meta, dict) and not entry.get("deduplicated"):
+        if (kind == "claim" and isinstance(meta, dict) and not entry.get("deduplicated")
+                # v3 item 5: non-head modes pin an old sha deliberately — a
+                # stale-pin advisory would be noise, not signal.
+                and meta.get("temporal_mode") not in _NON_HEAD_MODES):
             profile = resolve_profile(await self._namespace_profile(namespace))
             mode = profile["advisory_mode"]
             if mode in ("full", "minimal"):
@@ -618,7 +800,37 @@ class PostgresBackend(StorageBackend):
                     entry["advisory_status"] = status
                 if advisory is not None:
                     entry["advisories"] = list(entry.get("advisories") or []) + [advisory]
+                    self._finalize_ack(entry)  # re-summarize with the advisory named
         return entry
+
+    async def _annotate_verdict_freshness(self, namespace, entries: list[dict]) -> None:
+        """v3 item 2: every reconcile-verdict READ carries its own freshness
+        inline — checked_at (when the resolver last looked), age_hours, and
+        freshness: "fresh" | "expired" once the verdict is older than the
+        namespace's claim_staleness_hours window. A verdict is a snapshot, not a
+        subscription; before this, a reader had to call coord_health to learn a
+        verdict had decayed (the S6 stale-snapshot misread: a 07-14 context pack
+        trusted a superseded coord/_reconcile record). Annotation only — the
+        stored record is never rewritten."""
+        verdicts = [e for e in entries
+                    if e and str(e.get("key", "")).startswith(self._RECONCILE_PREFIX)
+                    and e.get("created_at")]
+        if not verdicts:
+            return
+        profile = await self._namespace_profile(namespace)
+        staleness_hours = float(
+            profile.get("claim_staleness_hours")
+            or settings.default_claim_staleness_hours)
+        now = datetime.now(timezone.utc)
+        for e in verdicts:
+            try:
+                checked = datetime.fromisoformat(e["created_at"])
+            except (TypeError, ValueError):
+                continue
+            age_hours = (now - checked).total_seconds() / 3600.0
+            e["checked_at"] = e["created_at"]
+            e["age_hours"] = round(age_hours, 1)
+            e["freshness"] = "expired" if age_hours > staleness_hours else "fresh"
 
     @_retry_on_disconnect
     async def memory_get(self, namespace, key, *, include_quarantined=False) -> dict | None:
@@ -637,7 +849,9 @@ class PostgresBackend(StorageBackend):
         # (the verdict stays visible on the returned entry).
         if row.get("quarantined") and not include_quarantined:
             return None
-        return _row_to_entry(row)
+        entry = _row_to_entry(row)
+        await self._annotate_verdict_freshness(namespace, [entry])
+        return entry
 
     @_retry_on_disconnect
     async def memory_list_page(
@@ -706,6 +920,7 @@ class PostgresBackend(StorageBackend):
             base64.urlsafe_b64encode(page[-1]["key"].encode("utf-8")).decode("ascii")
             if truncated and page else None
         )
+        await self._annotate_verdict_freshness(namespace, page)
         return {"entries": page, "truncated": truncated, "next_cursor": next_cursor}
 
     async def memory_list(
@@ -727,11 +942,14 @@ class PostgresBackend(StorageBackend):
                 (namespace, key, limit),
             )
             rows = await cur.fetchall()
-        return [_row_to_entry(r) for r in rows]
+        entries = [_row_to_entry(r) for r in rows]
+        await self._annotate_verdict_freshness(namespace, entries)
+        return entries
 
     @_retry_if_idempotent
     async def memory_delete(
         self, namespace, key, *, source_surface=None, event_id=None, meta=None, actor="unattributed",
+        role=None,
     ) -> dict:
         # Tombstone = append a deleting revision (history is preserved). `meta`
         # lets a delete record the provenance of the deletion (who/at-what-sha).
@@ -746,7 +964,7 @@ class PostgresBackend(StorageBackend):
         kind = latest["kind"] if latest else "note"
         return await self._append(
             namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True,
-            meta=meta, actor=actor,
+            meta=meta, actor=actor, tool="memory_delete", role=role,
         )
 
     @_retry_on_disconnect
@@ -897,7 +1115,7 @@ class PostgresBackend(StorageBackend):
                 """
                 SELECT DISTINCT ON (key) id, key, revision, kind, repo_sha,
                        content_hash, value, meta, tombstone, valid_until, created_at,
-                       quarantined, screening, derived_from, actor
+                       quarantined, screening, derived_from, actor, temporal_mode
                 FROM memory_entry WHERE namespace = %s
                 ORDER BY key, revision DESC
                 """,
@@ -908,14 +1126,22 @@ class PostgresBackend(StorageBackend):
                     if _is_live(r) and not r["key"].startswith("_meta/")]
         quarantined_count = sum(1 for r in rows if r.get("quarantined"))
 
-        with_sha = [r for r in rows if r["repo_sha"]]
+        # v3 item 5: only head-bound entries participate in the stale-vs-latest
+        # projection — a historical_snapshot/interval/timeless entry pins an old
+        # sha DELIBERATELY and must never be compared to the moving head.
+        with_sha = [r for r in rows
+                    if r["repo_sha"] and r.get("temporal_mode") not in _NON_HEAD_MODES]
         latest_repo_sha = (
             max(with_sha, key=lambda r: r["created_at"])["repo_sha"] if with_sha else None
         )
+        # v3 item 1 (S1a): the stale projection uses the SHARED equivalence rule
+        # (prefix-aware, like reconcile) instead of strict string equality, so a
+        # 7-char abbreviation of the namespace's latest sha no longer reads
+        # `current` from reconcile and `stale` from health at the same time.
         stale = [
             {"key": r["key"], "repo_sha": r["repo_sha"], "revision": r["revision"]}
             for r in with_sha
-            if r["repo_sha"] != latest_repo_sha
+            if not sha_equivalent(r["repo_sha"], latest_repo_sha)
         ]
 
         by_hash: dict[str, list[str]] = defaultdict(list)
@@ -1125,11 +1351,16 @@ class PostgresBackend(StorageBackend):
         for r in rows:
             entry = _row_to_entry(r, wrap=False)
             verdict = await reconcile_claim(entry, self.resolver)
+            # v3 item 2: the verdict value itself records WHEN the resolver
+            # looked, so a stored snapshot is self-dating even before the
+            # read-time freshness annotation.
+            verdict["checked_at"] = datetime.now(timezone.utc).isoformat()
             # Distinct actor (T2.1): the instrument recording a verdict must
             # never share an actor with the subject under measurement.
             await self.memory_save(
                 r["namespace"], f"{self._RECONCILE_PREFIX}{r['key']}", verdict,
                 kind="config", tags=["reconcile", verdict["state"]], actor="reconciler",
+                role="verifier",  # v3 item 7: the instrument writes as verifier
             )
             verdicts.append(verdict)
         return verdicts
@@ -1226,7 +1457,8 @@ class PostgresBackend(StorageBackend):
             latest.get("source_surface"),
             _curate_event_id(namespace, session_id, key, "supersede-boundary"),
             False, meta=meta, valid_until=datetime.now(timezone.utc),
-            embeddings=(None, None), actor="curator",
+            embeddings=(None, None), actor="curator", tool="coord_curate",
+            role="curator",
         )
 
     def _curator_identity(self) -> tuple[str | None, str | None]:
@@ -1263,7 +1495,7 @@ class PostgresBackend(StorageBackend):
             namespace, key, value, kind, tags, op.get("source_surface"),
             _curate_event_id(namespace, session_id, key, action), False, meta=meta,
             salience=_as_int(op.get("salience")), confidence=_as_float(op.get("confidence")),
-            embeddings=embeddings, actor="curator",
+            embeddings=embeddings, actor="curator", tool="coord_curate", role="curator",
             origin="synthesized", origin_model_id=curator_model_id,
             origin_model_family=curator_family,
             derived_from=op.get("derived_from"),
@@ -1311,10 +1543,11 @@ class PostgresBackend(StorageBackend):
         operations = (result or {}).get("operations") or []
         counts = {"added": 0, "updated": 0, "merged": 0, "superseded": 0,
                   "noop": 0, "phi_dropped": 0, "downgraded": 0, "invalid": 0,
-                  "family_conflict": 0}
+                  "family_conflict": 0, "idempotency_conflict": 0}
         applied: list[dict] = []
         noops: list[dict] = []
         family_conflicts: list[dict] = []
+        idempotency_conflicts: list[dict] = []
         for op in operations:
             if not isinstance(op, dict):
                 counts["invalid"] += 1
@@ -1363,14 +1596,27 @@ class PostgresBackend(StorageBackend):
                                       "revision — confirmation recorded, revision not churned",
                         })
                         continue
-            written = await self._write_curation_op(
-                namespace, op, session_id=session_id, action=action)
+            # v3 item 4: a re-applied session op whose deterministic event_id
+            # landed with DIFFERENT content is a payload-mismatch replay — the
+            # T02 class. Surface it per-op (visible, counted) instead of failing
+            # the whole curation pass or phantom-acking the old record.
+            try:
+                written = await self._write_curation_op(
+                    namespace, op, session_id=session_id, action=action)
+            except AppError as exc:
+                if exc.code != "idempotency_conflict":
+                    raise
+                counts["idempotency_conflict"] += 1
+                idempotency_conflicts.append({"key": op.get("key"), **exc.payload})
+                continue
             applied.append(written)
             counts[{"ADD": "added", "UPDATE": "updated",
                     "MERGE": "merged", "SUPERSEDE": "superseded"}[action]] += 1
         out = {"applied": applied, "noops": noops, "counts": counts}
         if family_conflicts:
             out["family_conflicts"] = family_conflicts
+        if idempotency_conflicts:
+            out["idempotency_conflicts"] = idempotency_conflicts
         return out
 
     def _trace_query_text(self, events: list[dict]) -> str:
@@ -1431,10 +1677,11 @@ class PostgresBackend(StorageBackend):
     async def handoff_save(
         self, namespace, key, value, *, source_surface=None, event_id=None, meta=None, actor="unattributed",
         origin="unknown", origin_detail=None, origin_model_id=None, origin_model_family=None,
-        derived_from=None,
+        derived_from=None, role=None,
     ) -> dict:
         return await self._append(
             namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta, actor=actor,
+            tool="handoff_save", role=role,
             origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
             origin_model_family=origin_model_family, derived_from=derived_from,
         )
@@ -1486,7 +1733,10 @@ class PostgresBackend(StorageBackend):
                         )
                         existing = await cur.fetchone()
                         if existing is not None:
-                            return {**_event_to_dict(existing), "deduplicated": True}
+                            # v3 item 3: replays escalate to a top-level non-"ok"
+                            # status here too — same phantom-ack class as memory.
+                            return {**_event_to_dict(existing), "deduplicated": True,
+                                    "status": "deduplicated_replay"}
                     async with conn.transaction():
                         # Tenant guard: the session must exist under this namespace.
                         cur = await conn.execute(
