@@ -48,6 +48,7 @@ def build_event_row(
     error_code: str | None = None,
     remedy_emitted: bool = False,
     latency_ms: int | None = None,
+    source_surface: str | None = None,
 ) -> dict[str, Any]:
     """Assemble one PHI-safe tool_events row (column name → value)."""
     arg_names, arg_value_meta = redact(args)
@@ -73,6 +74,7 @@ def build_event_row(
         "tool": tool,
         "actor": args.get("actor"),
         "session_id": str(args["session_id"]) if args.get("session_id") else None,
+        "source_surface": source_surface or args.get("source_surface"),
         "arg_names": arg_names,
         "arg_value_meta": arg_value_meta,
         "variant_profile": r.get("variant_profile"),
