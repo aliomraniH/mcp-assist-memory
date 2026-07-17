@@ -218,7 +218,9 @@ reads.
 
 ## C10 — Regression fixtures & deliberate non-goals (items 1, 9)
 
-Read-only, in `dev/mcp-assist-memory`:
+Read-only, in `dev/synch-pharma` (the namespace where the P2 repair happened —
+corrected 2026-07-16 after the first run found the fixture is not in
+`dev/mcp-assist-memory`):
 
 1. `memory_get claim/p2-build-completion` → rev 2, `kind:"knowledge"`, full
    40-char `meta.milestone_sha`, projected `repo_sha` null — the repaired
@@ -226,10 +228,11 @@ Read-only, in `dev/mcp-assist-memory`:
    the defective rev 1 was not preserved.)
 2. `memory_history` on it → rev 1 (the 7-char defect shape) still visible in
    history; append-only held.
-3. `coord_drift_scan` on your webtest namespace → confirm the report is
-   content-hash grouping only; **no SHA comparison exists there** (deliberate —
-   the sha_equiv module docstring documents it as out-of-scope; do not file
-   its absence as a bug).
+3. `coord_drift_scan` (store-wide — it takes only `limit`, no namespace
+   parameter; corrected 2026-07-16) → confirm the report is content-hash
+   grouping only; **no SHA comparison exists there** (deliberate — the
+   sha_equiv module docstring documents it as out-of-scope; do not file its
+   absence as a bug).
 
 ## C11 — Closeout hygiene (the coordination spine itself)
 
