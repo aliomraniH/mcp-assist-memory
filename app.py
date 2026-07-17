@@ -37,7 +37,7 @@ import json
 import pathlib
 import secrets as _secrets
 from contextlib import asynccontextmanager
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, parse_qsl, urlencode
 
 import structlog
 from fastapi import FastAPI, Request, Response
@@ -172,26 +172,60 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
             # in-place here — the mounted app then serves it directly (no redirect).
             if request.scope["path"] == "/mcp":
                 request.scope["path"] = "/mcp/"
-            active = admin.get_active_tokens()
-            if not active or not _request_has_token(request, active):
+            active = admin.get_active_token_map()
+            surface = _request_surface(request, active) if active else None
+            if surface is None:
+                log.warning("mcp_access_denied", method=request.method,
+                            path=request.url.path)
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
+            # Attribute the request to its token's surface label — every /mcp
+            # access is logged with the surface it came through, and downstream
+            # handlers can read it from request.state.surface.
+            request.state.surface = surface
+            # Strip ?token= from the scope AFTER auth so the secret never
+            # reaches downstream logging (uvicorn's access log prints the raw
+            # query string). The mounted MCP app doesn't use it.
+            if b"token=" in request.scope.get("query_string", b""):
+                cleaned = [(k, v) for k, v in parse_qsl(
+                    request.scope["query_string"].decode("latin-1"), keep_blank_values=True,
+                ) if k != "token"]
+                request.scope["query_string"] = urlencode(cleaned).encode("latin-1")
+            response = await call_next(request)
+            log.info("mcp_access", surface=surface, method=request.method,
+                     path=request.url.path, status=response.status_code)
+            return response
         return await call_next(request)
 
 
-def _matches_any(presented: str, active: set[str]) -> bool:
-    # Constant-time compare against each active token; any match authorizes.
-    return any(hmac.compare_digest(presented.encode(), t.encode()) for t in active)
+def _match_label(presented: str, active: dict[str, str]) -> str | None:
+    # Constant-time compare against each active token; any match authorizes and
+    # attributes the request to that token's surface label.
+    for token, label in active.items():
+        if hmac.compare_digest(presented.encode(), token.encode()):
+            return label
+    return None
 
 
-def _request_has_token(request: Request, active: set[str]) -> bool:
+def _request_surface(request: Request, active: dict[str, str]) -> str | None:
+    """The surface label of the active token presented, or None if unauthorized.
+    The matched token is stashed in request.state.mcp_token so downstream layers
+    (namespace ACL) can identify the caller even after ?token= is stripped from
+    the query string for log hygiene."""
     auth = request.headers.get("authorization", "")
-    if auth.startswith("Bearer ") and _matches_any(auth[len("Bearer ") :], active):
-        return True
-    # Fallback for headerless clients (e.g. the claude.ai web connector): ?token=
+    if auth.startswith("Bearer "):
+        presented = auth[len("Bearer ") :]
+        label = _match_label(presented, active)
+        if label is not None:
+            request.state.mcp_token = presented
+            return label
+    # Fallback for headerless clients (e.g. the claude.ai web connector and
+    # ChatGPT's connector UI): ?token=
     for candidate in parse_qs(request.url.query).get("token", []):
-        if _matches_any(candidate, active):
-            return True
-    return False
+        label = _match_label(candidate, active)
+        if label is not None:
+            request.state.mcp_token = candidate
+            return label
+    return None
 
 
 app.add_middleware(MCPAuthMiddleware)
