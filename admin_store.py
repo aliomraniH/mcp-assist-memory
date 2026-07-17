@@ -39,7 +39,7 @@ class AdminStore:
     def __init__(self, dsn: str) -> None:
         self._dsn = dsn
         self._lock = threading.Lock()
-        self._cache: set[str] | None = None
+        self._cache: dict[str, str] | None = None  # token -> label
         self._cache_at: float = 0.0
         self._initialized = False
 
@@ -104,17 +104,22 @@ class AdminStore:
                 return t
         return None
 
-    def get_active_tokens(self) -> set[str]:
-        """The set of every active token value (cached). Used by the auth gate."""
+    def get_active_token_map(self) -> dict[str, str]:
+        """Every active token value mapped to its surface label (cached). Used by
+        the auth gate both to authorize and to attribute the request's surface."""
         now = time.monotonic()
         with self._lock:
             if self._cache is not None and now - self._cache_at < CACHE_TTL_SECONDS:
                 return self._cache
-        tokens = {t.token for t in self._fetch_active()}
+        tokens = {t.token: t.label for t in self._fetch_active()}
         with self._lock:
             self._cache = tokens
             self._cache_at = time.monotonic()
         return tokens
+
+    def get_active_tokens(self) -> set[str]:
+        """The set of every active token value (cached). Used by the auth gate."""
+        return set(self.get_active_token_map())
 
     # ----------------------------------------------------------------- writes
     def _invalidate(self) -> None:
