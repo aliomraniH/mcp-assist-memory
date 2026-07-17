@@ -129,7 +129,7 @@ class Settings(BaseSettings):
     # Set to "*" to disable that dimension. The claude.ai web connector sends
     # Origin: https://claude.ai, so it must be allowed or the connector 403s.
     mcp_allowed_hosts: str = "mcp-assist-memory.replit.app,*.replit.app,*.replit.dev"
-    mcp_allowed_origins: str = "https://claude.ai"
+    mcp_allowed_origins: str = "https://claude.ai,https://chatgpt.com,https://chat.openai.com"
     mcp_host_origin_protection: bool = True
 
     @property
