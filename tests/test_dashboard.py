@@ -89,16 +89,19 @@ def test_admin_login_rotate_and_mcp_auth():
         web = re.search(r'id="tok-web">([^<]+)<', page).group(1)
         desktop = re.search(r'id="tok-desktop-cli">([^<]+)<', page).group(1)
         cursor = re.search(r'id="tok-cursor">([^<]+)<', page).group(1)
+        chatgpt = re.search(r'id="tok-chatgpt">([^<]+)<', page).group(1)
         csrf = re.search(r'name="csrf" value="([^"]+)"', page).group(1)
-        assert len({web, desktop, cursor}) == 3  # one distinct token per surface
+        assert len({web, desktop, cursor, chatgpt}) == 4  # one distinct token per surface
 
         # bearer gate on /mcp: no token rejected, ANY active token accepted
         assert client.post("/mcp/", json=INIT, headers=MCP_HEADERS).status_code == 401
-        for tok in (web, desktop, cursor):
+        for tok in (web, desktop, cursor, chatgpt):
             ok = client.post("/mcp/", json=INIT, headers={**MCP_HEADERS, "Authorization": f"Bearer {tok}"})
             assert ok.status_code != 401
         # web surface can't send headers -> ?token= must also be accepted
         assert client.post(f"/mcp/?token={web}", json=INIT, headers=MCP_HEADERS).status_code != 401
+        # ChatGPT's connector also rides the token in the URL
+        assert client.post(f"/mcp/?token={chatgpt}", json=INIT, headers=MCP_HEADERS).status_code != 401
 
         # rotate ONLY web → web token changes & old web rejected, desktop untouched
         assert client.post(
