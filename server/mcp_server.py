@@ -80,10 +80,17 @@ def instrument(fn):
     unchanged after being recorded.
     """
     sig = inspect.signature(fn)
+    accepts_surface = "source_surface" in sig.parameters
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
         start = time.monotonic()
+        surface = _request_surface_label()
+        # Surface attribution: if the caller didn't say where the write came
+        # from, default source_surface to the auth gate's token label so the
+        # stored entry itself records its surface of access.
+        if accepts_surface and surface is not None and not kwargs.get("source_surface"):
+            kwargs["source_surface"] = surface
         call_args = dict(sig.bind_partial(*args, **kwargs).arguments)
         outcome, error_code, remedy_emitted, result = "ok", None, False, None
         profile = await _profile_for(call_args.get("namespace"))
@@ -126,6 +133,7 @@ def instrument(fn):
                         outcome=outcome, error_code=error_code,
                         remedy_emitted=remedy_emitted,
                         latency_ms=int((time.monotonic() - start) * 1000),
+                        source_surface=surface,
                     )
                 except Exception as tel_exc:  # noqa: BLE001 - observability only
                     log.warning("tool_event_record_failed", tool=fn.__name__,
@@ -717,6 +725,18 @@ def _parse_acl(raw: str | None) -> dict | None:
         return None
 
 
+def _request_surface_label() -> str | None:
+    """Surface label of the current HTTP request (set by the auth gate in
+    request.state.surface), or None outside HTTP transport / if unset."""
+    try:
+        from fastmcp.server.dependencies import get_http_request
+
+        request = get_http_request()
+        return getattr(request.state, "surface", None)
+    except Exception:  # noqa: BLE001 - not in an HTTP request context
+        return None
+
+
 def _request_token() -> str | None:
     """Bearer token of the current HTTP request (None outside HTTP transport)."""
     try:
@@ -725,6 +745,11 @@ def _request_token() -> str | None:
         request = get_http_request()
     except Exception:  # noqa: BLE001 - not in an HTTP request context
         return None
+    # Preferred: the auth gate stashes the matched token (the gate also strips
+    # ?token= from the query string for log hygiene, so it can't be re-read).
+    stashed = getattr(request.state, "mcp_token", None)
+    if stashed:
+        return stashed
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         return auth[len("Bearer "):]
