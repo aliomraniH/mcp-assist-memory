@@ -41,6 +41,13 @@ SURFACES = [
                  "or paste the JSON into claude_desktop_config.json.",
     },
     {
+        "label": "chatgpt",
+        "title": "ChatGPT (connector / plugin)",
+        "blurb": "Add as a custom MCP connector in ChatGPT → Settings → Connectors "
+                 "(developer mode). ChatGPT's connector UI takes a server URL; the "
+                 "token rides in the URL. Rotates independently of every other surface.",
+    },
+    {
         "label": "cursor",
         "title": "Cursor",
         "blurb": "Paste the JSON into ~/.cursor/mcp.json (global) or "
@@ -55,6 +62,13 @@ def _snippets_for(label: str, mcp_url: str, token: str) -> list[tuple[str, str]]
     """(heading, copyable-content) blocks shown for a surface."""
     if label == "web":
         return [("Connector URL (paste into claude.ai)", f"{mcp_url}?token={token}")]
+    if label == "chatgpt":
+        return [
+            ("Connector URL (paste into ChatGPT → Settings → Connectors)",
+             f"{mcp_url}?token={token}"),
+            ("If your ChatGPT plan supports custom headers, use instead",
+             f'URL: {mcp_url}\nAuthorization: Bearer {token}'),
+        ]
     if label == "cursor":
         cursor_json = (
             '{\n  "mcpServers": {\n    "assist-memory": {\n'
