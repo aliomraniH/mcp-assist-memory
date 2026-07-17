@@ -1961,7 +1961,7 @@ class PostgresBackend(StorageBackend):
     async def record_tool_event(
         self, *, tool: str, args: dict, result: Any = None, outcome: str = "ok",
         error_code: str | None = None, remedy_emitted: bool = False,
-        latency_ms: int | None = None,
+        latency_ms: int | None = None, source_surface: str | None = None,
     ) -> None:
         """Append one PHI-safe row to tool_events (Phase 1). Values pass through
         redact() in build_event_row — names/lengths/hashes only. Raises on
@@ -1970,6 +1970,7 @@ class PostgresBackend(StorageBackend):
         row = build_event_row(
             tool=tool, args=args, result=result, outcome=outcome,
             error_code=error_code, remedy_emitted=remedy_emitted, latency_ms=latency_ms,
+            source_surface=source_surface,
         )
         # T8.1: remember the namespace's most recent friction so observation_log
         # can auto-attach it (codes/pattern names only — PHI-safe by shape).
