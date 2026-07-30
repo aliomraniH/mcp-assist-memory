@@ -69,6 +69,9 @@ def build_event_row(
             result_bytes = None
 
     screening = r.get("screening")
+    # Intent Gate (0009): the verdict travels on the row (nullable — ungated
+    # calls stay NULL). G2-1 asserts trigger discipline on gate_tier.
+    gate_block = r.get("gate") if isinstance(r.get("gate"), dict) else {}
     return {
         "namespace": args.get("namespace"),
         "tool": tool,
@@ -92,4 +95,6 @@ def build_event_row(
         "readback_latency_ms": r.get("readback_latency_ms"),
         "result_bytes": result_bytes,
         "truncated": r.get("truncated"),
+        "gate_tier": gate_block.get("tier"),
+        "gate_decision": gate_block.get("decision"),
     }
