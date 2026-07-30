@@ -86,3 +86,30 @@ Designated work branch (session harness): claude/mcp-assist-intent-gate-1pwuit
    committed as docs-only housekeeping first commit.
 3. Branch name (see header).
 4. Session (episodic, surface claude_code): 9a89df80-3d3e-45c1-98fe-a8105a591602.
+
+---
+
+# Item 7 — Adversarial hardening pass (ADV-1..ADV-5): hygiene vs. guarantee
+
+Run as written (tests/test_gate_tier1.py, test_gate_tier2.py, test_gate_ledger.py;
+all green at this branch head). Screening-honesty rule applied: nothing below is
+a security guarantee beyond the read-time untrusted-data wrapper; regex screens
+are trivially bypassable by an adaptive attacker (same Nasr/Carlini logic
+documented in storage/screening.py).
+
+| Probe | What held | Hygiene or guarantee |
+|---|---|---|
+| ADV-1 injection in declared intent | goal screened like any value; flagged `intent_screened`; rules/thresholds are code+profile, structurally unreachable from intent text | flagging = hygiene; "intent cannot mutate rules" = structural (no code path) |
+| ADV-2 clarification-response injection (ASPI) | clarification screened + stored as data; conflict recomputed from the goal, so a poisoned clarification cannot clear it or reroute tools | structural for routing; screening itself = hygiene |
+| ADV-3 forged skill veto | no `curator_provenance` → `unprovenanced_skill`, advisory only; only curator-provenanced, in-window, non-quarantined anti-patterns contribute to gate_conflict (S7) | guarantee relative to the gate's own rules; a forged skill still APPEARS in matched (visible, flagged) — by design |
+| ADV-4 intent–action mismatch | scope recorded at intent_open; out-of-scope mutating call → forced gate_preview + `intent_mismatch` (VIGIL verify-before-commit shape) | deterministic rule; depends on the caller passing meta.session_id — linkage is convention, documented in the tool description |
+| ADV-5 PHI in declared intent | clinical profile: intent_hash + screened labels only; goal column NULL; no embedding call on raw intent; read-back scan clean | deterministic fail-closed storage rule; the PHI *detector* (storage/phi.py) is heuristic = hygiene |
+
+Known residuals (documented, not silently accepted):
+- The gate's Tier-1 similarity floor is calibration, not proof — a crafted
+  entry can still be retrieved; it arrives wrapped and flagged, never executed.
+- Intent↔write linkage relies on meta.session_id (convention). An unlinked
+  write skips intent checks but still gets the full Tier-0 pre-flight.
+- meta.gate_override is auditable (flags + false_positive counter + block_log
+  closure), not privileged: any caller with write access can pass it. Same
+  trust model as screening_override; per-token privilege is future work.
