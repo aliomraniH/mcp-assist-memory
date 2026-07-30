@@ -73,6 +73,13 @@ class StorageBackend(abc.ABC):
         self, namespace: str, query: str, *, limit: int = 20, include_quarantined: bool = False
     ) -> list[dict]: ...
 
+    # ---------------- intent gate (Tier 1 entry point; optional) ----------------
+    # Backends without gate support may leave the default; the Postgres backend
+    # implements it (storage/gate.py). Non-abstract so alternative backends
+    # keep working ungated.
+    async def intent_open(self, namespace: str, *, goal: str, **kwargs: Any) -> dict:
+        raise NotImplementedError("this backend does not implement the intent gate")
+
     # ---------------- handoff: cross-surface convention, scoped to a project ----------------
     @abc.abstractmethod
     async def handoff_save(
