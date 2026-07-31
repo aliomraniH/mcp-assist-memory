@@ -1,4 +1,4 @@
-- [Admin token dashboard](admin-token-dashboard.md) — one dashboard-managed MCP token PER SURFACE label (web/desktop-cli); gate accepts any active token; 5s cache; one active row per label via partial unique index.
+- [Admin token dashboard](admin-token-dashboard.md) — one dashboard-managed MCP token PER SURFACE label (web/desktop-cli/chatgpt/cursor); gate maps token→label, stamps surface into logs/telemetry, strips ?token= post-auth.
 - [Git push past corrupt ref / diverged remote](git-push-corrupt-ref.md) — clone --single-branch to a temp repo to push past a corrupt unrelated ref; reconcile a diverged remote with merge -s ours (no force).
 - [MCP auth token: seed vs live](mcp-auth-token-seed.md) — env MCP_AUTH_TOKEN only seeds the `web` token; live per-label tokens live in Postgres, owned by /admin; verify with list_tokens().
 - [Reconnect retry policy](reconnect-retry-policy.md) — disconnect-retry: reads + event_id-gated writes always; session_* writes retry too (accepted at-least-once tradeoff); saves w/o event_id never retry.
