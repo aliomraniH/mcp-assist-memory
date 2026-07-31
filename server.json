@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.aliomranih/mcp-assist-memory",
+  "name": "io.github.aliomraniH/mcp-assist-memory",
   "title": "MCP Assist — Coordination Memory",
   "description": "Coordination memory with verification: reconcile-against-GitHub, verdict freshness, provenance.",
   "repository": {
