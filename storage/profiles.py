@@ -34,6 +34,15 @@ DEFAULT_PROFILE: dict = {
     "arg_strictness": "control",
     "remedy_errors": "on",
     "compact_acks": "off",
+    # Intent Gate v1 (charter: claude/intent-gate/INTENT_GATE_CHARTER.md).
+    # intent_gate gates Tier 0/1 per namespace (staged rollout, S4 — the
+    # charter's "no opt-out" binds within gated namespaces; rollout is the
+    # operator flipping profiles, exactly like compact_acks). tier2 arms the
+    # LLM reasoning tier and ships OFF by default (S3: an always-on LLM gate
+    # is a build failure; the operator flips it after the validator's baseline
+    # efficacy numbers land).
+    "intent_gate": "off",
+    "tier2": "off",
 }
 
 _VALID = {
@@ -42,6 +51,8 @@ _VALID = {
     "arg_strictness": {"hint", "plain", "control"},
     "remedy_errors": {"on", "off"},
     "compact_acks": {"on", "off"},
+    "intent_gate": {"on", "off"},
+    "tier2": {"on", "off"},
 }
 
 
@@ -54,7 +65,7 @@ def resolve_profile(raw: dict | None) -> dict:
         if isinstance(val, str) and val in valid:
             resolved[key] = val
     # pass-through, non-experiment keys
-    for key in ("claim_staleness_hours", "clinical"):
+    for key in ("claim_staleness_hours", "clinical", "skill_validity_hours"):
         if raw and key in raw:
             resolved[key] = raw[key]
     return resolved

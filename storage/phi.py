@@ -96,6 +96,19 @@ def _walk_has_phi(node: Any) -> bool:
     return False
 
 
+def text_looks_identifying(text: str) -> bool:
+    """Deterministic PHI screen for a FREE-TEXT channel (the gate's declared
+    intent, charter §7). Broader than ``_walk_has_phi`` on a bare string: prose
+    mentioning identifier-named tokens ("patient", "mrn", "dob"...) trips it
+    even when the identifier itself isn't pattern-shaped. Conservative on
+    purpose — in clinical namespaces a false positive only widens what is
+    already hash-only storage."""
+    if not isinstance(text, str) or not text:
+        return False
+    low = text.lower()
+    return _value_looks_identifying(text) or any(tok in low for tok in _PHI_KEY_TOKENS)
+
+
 def assert_no_phi(op: dict) -> bool:
     """Return True if ``op`` is safe to write, False if it carries (or might carry)
     patient-identifying detail. Fail-closed: a malformed op returns False."""

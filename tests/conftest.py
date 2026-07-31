@@ -112,6 +112,31 @@ CREATE INDEX IF NOT EXISTS memory_entry_ns_key_pattern
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS idem_fingerprint text;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS temporal_mode text;
 ALTER TABLE memory_entry ADD COLUMN IF NOT EXISTS role text;
+-- 0008_surface_attribution.sql (mirrored inline so the suite is self-contained).
+ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS source_surface text;
+-- 0009_intent_gate.sql (mirrored inline so the suite is self-contained).
+CREATE TABLE IF NOT EXISTS gate_pending (
+    token uuid PRIMARY KEY, namespace text NOT NULL, tool text NOT NULL,
+    key text NOT NULL, args_fingerprint text NOT NULL, preview jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL, consumed_at timestamptz);
+CREATE TABLE IF NOT EXISTS gate_intent (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    namespace text NOT NULL, session_id text NOT NULL,
+    intent_hash char(64) NOT NULL, goal text,
+    scope text[] NOT NULL DEFAULT '{}', labels text[] NOT NULL DEFAULT '{}',
+    screening text[], decision text, conflict jsonb, matched jsonb,
+    embedding vector(1024), actor text NOT NULL DEFAULT 'unattributed',
+    created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS gate_intent_ns_session
+    ON gate_intent (namespace, session_id, id);
+CREATE TABLE IF NOT EXISTS gate_block_log (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    namespace text NOT NULL, fingerprint text NOT NULL, rule text NOT NULL,
+    skill_key text, closed text,
+    created_at timestamptz NOT NULL DEFAULT now(), closed_at timestamptz);
+ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS gate_tier int;
+ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS gate_decision text;
 """
 
 def _load_migration_views() -> str:

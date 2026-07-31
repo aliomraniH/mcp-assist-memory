@@ -7,7 +7,7 @@ symbol names, which are stable).
 ## Tool registration
 
 * `server/mcp_server.py:46` — the single `FastMCP(name="assist-memory")` instance.
-* `server/mcp_server.py:50-265` — all `@mcp.tool` registrations (23 tools after Phase 8), thin
+* `server/mcp_server.py:50-265` — all `@mcp.tool` registrations (24 tools after the intent gate), thin
   relays into the injected `StorageBackend`.
 * `app.py:94` — `mcp.http_app(path="/", stateless_http=True)` builds the ASGI app;
   `app.py:173` mounts it at `/mcp`; `app.py:122` injects the backend on `deps`

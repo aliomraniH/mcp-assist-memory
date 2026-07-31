@@ -106,6 +106,13 @@ CATALOG: dict[str, tuple[str, bool]] = {
     "curator_family_conflict": (
         "CURATOR_FAMILY_MUST_DIFFER_FROM forbids same-family curation of "
         "these entries — configure a curator from a different model family", False),
+    "gate_blocked": (
+        "the intent gate blocked this call by a deterministic rule — "
+        "context.gate names the rule and tier. Resolve the named conflict "
+        "(open/refresh the intent, fix the contradicting key, or use the "
+        "confirm_token flow); an operator can retry with meta.gate_override "
+        "plus a real actor, which executes AND counts a false_positive in "
+        "gate/efficacy for threshold review — never a silent override", False),
 }
 
 

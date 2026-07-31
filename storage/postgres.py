@@ -30,8 +30,11 @@ from psycopg.types.json import Jsonb
 from config import settings
 from errors import AppError
 from errors.catalog import FEEDBACK_NUDGE
+from storage import gate
+from storage.awaken import awaken as _awaken
 from storage.base import StorageBackend
 from storage.curator import Curator, DisabledCurator
+from storage.tier2 import GateReasoner, build_gate_reasoner
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
 from storage.idempotency import idem_fingerprint
 from storage.phi import assert_no_phi
@@ -332,8 +335,17 @@ class PostgresBackend(StorageBackend):
         embedder: Embedder | None = None,
         resolver: Resolver | None = None,
         curator: Curator | None = None,
+        gate_reasoner: GateReasoner | None = None,
     ) -> None:
         self.pool = pool
+        # Intent Gate (charter claude/intent-gate/). Tier 2 is an optional,
+        # injected, best-effort dependency exactly like the curator: no
+        # Anthropic key ⇒ DisabledGateReasoner (and the profile arms it OFF by
+        # default regardless). gate_awaken_count is the in-process half of the
+        # GH-series telemetry counter (the durable half is tool_events rows
+        # with tool='gate_awaken').
+        self.gate_reasoner: GateReasoner = gate_reasoner or build_gate_reasoner(settings)
+        self.gate_awaken_count = 0
         # Best-effort semantic recall. Defaults to disabled so the backend works
         # with no provider key (keyword-only search, no embeddings written).
         self.embedder: Embedder = embedder or DisabledEmbedder()
@@ -774,17 +786,70 @@ class PostgresBackend(StorageBackend):
             )
         return advisory, "computed"
 
+    async def _gate_awaken(self, namespace: str, targets: list[dict]) -> dict:
+        """The awakening hook the gate calls from its dependency-freshness
+        step (S6 module boundary: storage/gate.py never imports the resolver;
+        this backend injects the budgeted awaken from storage/awaken.py)."""
+        return await _awaken(self, namespace, targets)
+
+    async def _gate_preflight(
+        self, namespace, *, tool, key, kind, value, meta, actor, event_id,
+        preview_requested=False, confirm_token=None,
+    ) -> gate.GateContext | None:
+        """Tier-0 pre-flight for one mutating call, or None when the namespace
+        is not gated / the writer is exempt (staged rollout via
+        variant_profiles.intent_gate)."""
+        profile = resolve_profile(await self._namespace_profile(namespace))
+        if not gate.enabled_for(profile, key=key, actor=actor):
+            return None
+        return await gate.preflight(
+            self, namespace=namespace, profile=profile, tool=tool, key=key,
+            kind=kind, value=value, meta=meta, actor=actor, event_id=event_id,
+            preview_requested=preview_requested, confirm_token=confirm_token,
+        )
+
+    async def _gate_profile(self, namespace) -> dict:
+        return resolve_profile(await self._namespace_profile(namespace))
+
+    async def intent_open(
+        self, namespace, *, goal, scope=None, session_id=None,
+        actor="unattributed", event_id=None, clarification=None,
+        include_quarantined=False,
+    ) -> dict:
+        """Tier 1: open a declared intent (see storage/gate.py)."""
+        return await gate.intent_open(
+            self, namespace, goal=goal, scope=scope, session_id=session_id,
+            actor=actor, event_id=event_id, clarification=clarification,
+            include_quarantined=include_quarantined,
+        )
+
     @_retry_if_idempotent
     async def memory_save(
         self, namespace, key, value, *, kind="note", tags=None, source_surface=None, event_id=None, meta=None,
         actor="unattributed", origin="unknown", origin_detail=None,
         origin_model_id=None, origin_model_family=None, derived_from=None, role=None,
+        preview=False, confirm_token=None,
     ) -> dict:
-        entry = await self._append(
-            namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta, actor=actor,
-            origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
-            origin_model_family=origin_model_family, derived_from=derived_from, role=role,
-        )
+        gate_ctx = await self._gate_preflight(
+            namespace, tool="memory_save", key=key, kind=kind, value=value,
+            meta=meta, actor=actor, event_id=event_id,
+            preview_requested=preview, confirm_token=confirm_token)
+        if gate_ctx is not None and gate_ctx.response is not None:
+            return gate_ctx.response  # gate_preview / gate_conflict: nothing persisted
+        try:
+            entry = await self._append(
+                namespace, key, value, kind, tags, source_surface, event_id, False, meta=meta, actor=actor,
+                origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
+                origin_model_family=origin_model_family, derived_from=derived_from, role=role,
+            )
+        except AppError as exc:
+            if gate_ctx is not None:
+                await gate.on_write_error(self, namespace, gate_ctx, exc)
+            raise
+        if gate_ctx is not None:
+            entry = await gate.on_write_success(
+                self, namespace, gate_ctx, entry,
+                profile=await self._gate_profile(namespace))
         # R5 advisory arm (per-namespace): claims that pin external mutable
         # state get a write-time freshness check. Control arm ('off') skips
         # the lookup entirely.
@@ -949,7 +1014,7 @@ class PostgresBackend(StorageBackend):
     @_retry_if_idempotent
     async def memory_delete(
         self, namespace, key, *, source_surface=None, event_id=None, meta=None, actor="unattributed",
-        role=None,
+        role=None, confirm_token=None,
     ) -> dict:
         # Tombstone = append a deleting revision (history is preserved). `meta`
         # lets a delete record the provenance of the deletion (who/at-what-sha).
@@ -962,10 +1027,29 @@ class PostgresBackend(StorageBackend):
             )
             latest = await cur.fetchone()
         kind = latest["kind"] if latest else "note"
-        return await self._append(
-            namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True,
-            meta=meta, actor=actor, tool="memory_delete", role=role,
-        )
+        # Gated namespaces: a delete is destructive — the gate forces the
+        # two-phase preview (G0-5) unless a valid confirm_token (or an
+        # operator override) accompanies the call.
+        gate_ctx = await self._gate_preflight(
+            namespace, tool="memory_delete", key=key, kind=kind,
+            value={"deleted": True}, meta=meta, actor=actor, event_id=event_id,
+            confirm_token=confirm_token)
+        if gate_ctx is not None and gate_ctx.response is not None:
+            return gate_ctx.response
+        try:
+            entry = await self._append(
+                namespace, key, {"deleted": True}, kind, [], source_surface, event_id, True,
+                meta=meta, actor=actor, tool="memory_delete", role=role,
+            )
+        except AppError as exc:
+            if gate_ctx is not None:
+                await gate.on_write_error(self, namespace, gate_ctx, exc)
+            raise
+        if gate_ctx is not None:
+            entry = await gate.on_write_success(
+                self, namespace, gate_ctx, entry,
+                profile=await self._gate_profile(namespace))
+        return entry
 
     @_retry_on_disconnect
     async def memory_search(
@@ -1677,14 +1761,30 @@ class PostgresBackend(StorageBackend):
     async def handoff_save(
         self, namespace, key, value, *, source_surface=None, event_id=None, meta=None, actor="unattributed",
         origin="unknown", origin_detail=None, origin_model_id=None, origin_model_family=None,
-        derived_from=None, role=None,
+        derived_from=None, role=None, preview=False, confirm_token=None,
     ) -> dict:
-        return await self._append(
-            namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta, actor=actor,
-            tool="handoff_save", role=role,
-            origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
-            origin_model_family=origin_model_family, derived_from=derived_from,
-        )
+        gate_ctx = await self._gate_preflight(
+            namespace, tool="handoff_save", key=key, kind="handoff", value=value,
+            meta=meta, actor=actor, event_id=event_id,
+            preview_requested=preview, confirm_token=confirm_token)
+        if gate_ctx is not None and gate_ctx.response is not None:
+            return gate_ctx.response
+        try:
+            entry = await self._append(
+                namespace, key, value, "handoff", [], source_surface, event_id, False, meta=meta, actor=actor,
+                tool="handoff_save", role=role,
+                origin=origin, origin_detail=origin_detail, origin_model_id=origin_model_id,
+                origin_model_family=origin_model_family, derived_from=derived_from,
+            )
+        except AppError as exc:
+            if gate_ctx is not None:
+                await gate.on_write_error(self, namespace, gate_ctx, exc)
+            raise
+        if gate_ctx is not None:
+            entry = await gate.on_write_success(
+                self, namespace, gate_ctx, entry,
+                profile=await self._gate_profile(namespace))
+        return entry
 
     async def handoff_load(self, namespace, key, *, include_quarantined=False) -> dict | None:
         # T3.2: quarantine exclusion now lives in memory_get; delegate so the two
