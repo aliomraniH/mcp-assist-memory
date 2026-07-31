@@ -1,0 +1,25 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.aliomranih/mcp-assist-memory",
+  "title": "MCP Assist — Coordination Memory",
+  "description": "Coordination memory with verification: reconcile-against-GitHub, verdict freshness, provenance.",
+  "repository": {
+    "url": "https://github.com/aliomraniH/mcp-assist-memory",
+    "source": "github"
+  },
+  "version": "0.3.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp-assist-memory.replit.app/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer <token> — operator-issued per-surface token; all MCP access requires it",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
