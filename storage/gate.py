@@ -25,6 +25,7 @@ Blocks raise ``AppError`` (isError:true at the tool layer) with the standard
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -1116,19 +1117,58 @@ async def intent_open(
     # Tier-1 retrieval: semantic leg (pgvector, floor-guarded) + deterministic
     # trigger-overlap leg for skills. Namespace-scoped, quarantine-excluded by
     # default; retrieved bodies are UNTRUSTED DATA (wrapped, never executed).
-    guard = await backend.gate_guard(namespace)
+    # 3e: Tier-1 is retrieval-dominated and the ~500ms budget had no mechanism
+    # behind it. Measured live: intent_open n=11, median 515ms, p95 810ms, while
+    # an EMPTY namespace costs 121ms — so ~400ms of the median is retrieval-path
+    # work, and which part dominates was never measured. Guessing at the fix
+    # would have been guessing at the cause, so the path is instrumented into
+    # named spans first and every response can report them.
+    spans: dict[str, int] = {}
+
+    # 3e STEP 2 — the mechanism.
+    #
+    # These four reads are INDEPENDENT: the semantic ANN query, the deterministic
+    # trigger scan, the structured-constraint scan, and the project block. v1 ran
+    # them one after another, so Tier-1 paid four sequential round trips plus the
+    # embedding call. Against a local Postgres that is invisible (measured here:
+    # ~14ms total). Against Neon it is not — a round trip from Replit compute to
+    # an external Neon endpoint has a documented floor around 59ms, so four
+    # sequential reads are ~240ms of pure waiting, which is most of the
+    # unexplained ~400ms in the live measurement.
+    #
+    # Running them concurrently makes wall time the SLOWEST read rather than the
+    # SUM. This is the environment-independent half of the fix: the round-trip
+    # COUNT drops from four to one regardless of what a round trip costs, and a
+    # [CI] fixture can assert the count even though only [NEON] can assert the
+    # milliseconds.
+    #
+    # If the pool is saturated these simply serialise again and behave exactly as
+    # before — the degradation is graceful, not a failure.
+    guard = await _timed(spans, "profile_guard", backend.gate_guard(namespace))
     matched: list[dict] = []
     seen: set[str] = set()
     semantic_raw: list[dict] = []
-    if not clinical:
-        semantic_raw = await _semantic_candidates(backend, namespace, goal,
-                                                  include_quarantined)
-        for cand in _guarded_candidates(semantic_raw, guard):
-            if cand["key"] not in seen:
-                seen.add(cand["key"])
-                matched.append(cand)
-    for cand in await _trigger_candidates(backend, namespace, goal,
-                                          include_quarantined):
+
+    async def _semantic():
+        if clinical:
+            return []
+        return await _semantic_candidates(
+            backend, namespace, goal, include_quarantined, spans=spans)
+
+    t_par = time.monotonic()
+    semantic_raw, trigger_hits, structured, project = await asyncio.gather(
+        _semantic(),
+        _trigger_candidates(backend, namespace, goal, include_quarantined),
+        _structured_conflict(backend, namespace, goal),
+        _project_block(backend, namespace),
+    )
+    spans["parallel_reads"] = int((time.monotonic() - t_par) * 1000)
+
+    for cand in _guarded_candidates(semantic_raw, guard):
+        if cand["key"] not in seen:
+            seen.add(cand["key"])
+            matched.append(cand)
+    for cand in trigger_hits:
         if cand["key"] not in seen:
             seen.add(cand["key"])
             matched.append(cand)
@@ -1136,7 +1176,9 @@ async def intent_open(
     # Deterministic features for the predicate leg. Extracted ONCE per intent —
     # it is the same for every candidate, and spaCy is the one non-trivial CPU
     # cost on this path.
+    _t = time.monotonic()
     features = extract_features(goal, clinical=clinical)
+    spans["feature_extraction"] = int((time.monotonic() - _t) * 1000)
 
     skill_window_h = float(profile.get("skill_validity_hours")
                            or DEFAULT_SKILL_VALIDITY_HOURS)
@@ -1224,12 +1266,13 @@ async def intent_open(
     # Calibration dataset (1a). EVERY skill candidate is logged, escalated or
     # not — a table holding only escalations cannot calibrate the floor that
     # produced it. Best-effort: a logging failure must not change a verdict.
-    await _log_gate_matches(backend, namespace, ihash, matched, gate_audit,
-                            guard, semantic_raw, clinical=clinical)
+    await _timed(spans, "match_log", _log_gate_matches(
+        backend, namespace, ihash, matched, gate_audit, guard, semantic_raw,
+        clinical=clinical))
 
-    # Structured-field contradiction (G1-2): deterministic scan of live
-    # entries carrying meta.structured — field-level, never prose-inferred.
-    structured = await _structured_conflict(backend, namespace, goal)
+    # Structured-field contradiction (G1-2): deterministic scan of live entries
+    # carrying meta.structured — field-level, never prose-inferred. Already
+    # fetched above, concurrently with the other independent reads.
     if structured:
         conflict = structured
         decision = GATE_CONFLICT
@@ -1301,6 +1344,10 @@ async def intent_open(
              Jsonb(_json_safe(matched_snapshot)), actor or "unattributed"))
 
     latency_ms = int((time.monotonic() - t0) * 1000)
+    # Whatever the named spans do not account for: serialisation, wrapping,
+    # the intent INSERT, the ledger. Reported rather than left implicit, so the
+    # breakdown always sums to the total and a missing cost cannot hide.
+    spans["other"] = max(0, latency_ms - sum(spans.values()))
     ctx = GateContext(tool="intent_open", key="", tier=1, decision=decision,
                       flags=flags, matched=[m["key"] for m in matched],
                       session_id=str(session_id) if session_id else None,
@@ -1309,7 +1356,7 @@ async def intent_open(
                   labels=labels)
 
     # project block (MD-1): served from project/meta; absent -> explicit null.
-    project = await _project_block(backend, namespace)
+    # Also fetched in the concurrent batch above.
 
     result = {
         "namespace": namespace, "session_id": session_id,
@@ -1320,6 +1367,11 @@ async def intent_open(
         "gate": ctx.gate_block(),
         "latency_ms": latency_ms,
     }
+    # 3e: the span breakdown rides on every response. Latency work that can only
+    # be measured by redeploying with extra logging does not get done, and the
+    # environment where these numbers actually mean something (real Neon
+    # round trips, a loaded namespace) is not one a test can enter.
+    result["latency_spans"] = spans
     if verbose_gate:
         # 1c: the per-candidate audit. Answers "why did this escalate / why did
         # it not" without a database read or a guess, which is what makes a
@@ -1445,11 +1497,36 @@ async def _log_gate_matches(backend, namespace: str, intent_hash_: str,
         pass
 
 
+async def _timed(spans: dict, name: str, awaitable):
+    """Await something and record its wall time under `name`.
+
+    Span names are a fixed vocabulary, not free text: they are a telemetry
+    dimension, and the point of the exercise is to compare the same spans across
+    runs and environments.
+    """
+    t0 = time.monotonic()
+    try:
+        return await awaitable
+    finally:
+        spans[name] = spans.get(name, 0) + int((time.monotonic() - t0) * 1000)
+
+
 async def _semantic_candidates(backend, namespace: str, goal: str,
-                               include_quarantined: bool) -> list[dict]:
+                               include_quarantined: bool,
+                               spans: dict | None = None) -> list[dict]:
+    spans = spans if spans is not None else {}
+    # SPAN 1 of 3: the goal-embedding call. On the deployed server this is a
+    # network round trip to the embedding provider, and it is the single most
+    # likely candidate for the unexplained ~400ms — an intent repeated verbatim
+    # would otherwise pay for it twice.
+    t0 = time.monotonic()
     qvec = await backend._maybe_embed_query(goal)
+    spans["goal_embedding"] = int((time.monotonic() - t0) * 1000)
     if qvec is None:
+        spans["ann_query"] = 0
         return []
+    # SPAN 2 of 3: the pgvector ANN query.
+    t0 = time.monotonic()
     async with backend.pool.connection() as conn:
         conn.row_factory = dict_row
         async with conn.transaction():
@@ -1473,6 +1550,7 @@ async def _semantic_candidates(backend, namespace: str, goal: str,
                 (qvec, namespace, include_quarantined,
                  r"coord/\_reconcile/%", r"\_meta/%", r"gate/%", qvec))
             rows = await cur.fetchall()
+    spans["ann_query"] = int((time.monotonic() - t0) * 1000)
     out = []
     for r in rows:
         sim = 1.0 - float(r.pop("_dist"))

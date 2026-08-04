@@ -14,6 +14,16 @@ class Settings(BaseSettings):
 
     # --- required ---
     database_url: str
+    # The DIRECT (non `-pooler`) Neon connection string, used by exactly one
+    # long-lived connection: the gate cache's LISTEN subscriber. Neon's pooled
+    # endpoint supports NOTIFY but not LISTEN — PgBouncer in transaction mode
+    # drops session-level features, and LISTEN is a session-level subscription.
+    #
+    # Optional. Unset means no listener, which is a supported configuration and
+    # not an error: the cache runs on pure TTL and reports listener_alive=false
+    # through gate_cache_status. Correctness is unaffected; only the speed of
+    # noticing a profile change is.
+    database_url_direct: str | None = None
     mcp_auth_token: str
 
     # --- admin dashboard (/admin): manage + rotate the live MCP token ---

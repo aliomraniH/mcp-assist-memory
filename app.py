@@ -163,13 +163,26 @@ async def lifespan(app: FastAPI):
         extractor_ready = False
         log.warning("gate_extractor_warmup_failed", error=str(exc))
 
+    # 3a: start the gate cache's LISTEN subscriber on the DIRECT connection.
+    # Best-effort and deliberately non-fatal — the listener is an optimisation,
+    # and every cache entry carries a TTL, so its absence degrades the system to
+    # slow rather than to wrong. gate_cache_status.listener_alive is how anyone
+    # finds out, because this failure is otherwise completely silent.
+    try:
+        await deps.backend.gate_cache.start(settings.database_url_direct)
+    except Exception as exc:  # noqa: BLE001 - best-effort: TTL fallback covers it
+        log.warning("gate_cache_listener_start_failed", error=str(exc))
+
     log.info("startup_ok", max_size=settings.pool_max_size,
              embeddings=embedder.enabled, reconciler=resolver.enabled,
-             curator=curator.enabled, gate_extractor=extractor_ready)
+             curator=curator.enabled, gate_extractor=extractor_ready,
+             gate_listener_configured=bool(settings.database_url_direct))
     try:
         async with mcp_app.lifespan(app):  # run the MCP session manager
             yield
     finally:
+        if deps.backend is not None:
+            await deps.backend.gate_cache.stop()
         deps.backend = None
         await pool.close()
         log.info("shutdown_ok")

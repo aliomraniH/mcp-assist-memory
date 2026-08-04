@@ -46,7 +46,7 @@ import sys
 # mcp_server / README "N tools" docs against the real registry, so an accidental
 # tool drop (or a stale number) fails CI loudly instead of shipping a half-broken
 # connector.
-DOCUMENTED_TOOL_COUNT = 26
+DOCUMENTED_TOOL_COUNT = 27
 
 
 def _derive_expected_tool_count(default: int) -> int:

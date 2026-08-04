@@ -34,6 +34,7 @@ from storage import gate
 from storage.awaken import awaken as _awaken
 from storage.base import StorageBackend
 from storage.curator import Curator, DisabledCurator
+from storage.gate_cache import GateCache
 from storage.tier2 import GateReasoner, build_gate_reasoner
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
 from storage.idempotency import idem_fingerprint
@@ -351,6 +352,12 @@ class PostgresBackend(StorageBackend):
         # a silent re-point at a different database — two facts that look
         # identical if the fingerprint only covers the connection string.
         self._boot_ts = datetime.now(timezone.utc).isoformat()
+        # 3e: goal-embedding cache. Keyed by sha256 of the normalised query.
+        self._query_embed_cache: dict[str, tuple[float, str]] = {}
+        # 3a: NOTIFY-invalidated cache for gate inputs. The listener is started
+        # by the app lifespan (it needs the DIRECT dsn); without one this is a
+        # pure-TTL cache that honestly reports listener_alive=false.
+        self.gate_cache = GateCache()
         # Best-effort semantic recall. Defaults to disabled so the backend works
         # with no provider key (keyword-only search, no embeddings written).
         self.embedder: Embedder = embedder or DisabledEmbedder()
@@ -380,14 +387,46 @@ class PostgresBackend(StorageBackend):
         return self._safe_literal(vecs)
 
     async def _maybe_embed_query(self, query: str) -> str | None:
-        """Embed a search query. Best-effort: None falls search back to keyword."""
+        """Embed a search query. Best-effort: None falls search back to keyword.
+
+        3e: results are cached by sha256 of the normalised query for a short TTL.
+        On the deployed server this is a NETWORK CALL to the embedding provider,
+        and it sits on the Tier-1 hot path — measured Tier-1 median was 515ms
+        against 121ms for an empty namespace, so ~400ms is retrieval-path work
+        and this call is the most likely single contributor.
+
+        Embedding the same goal twice is pure waste, and repeats are common in
+        exactly the situation that matters: a caller who gets a gate_conflict
+        re-opens the same intent with a clarification, and an agent retrying a
+        sequence re-declares a goal verbatim.
+
+        The cache is small, in-process, and TTL-bounded. An embedding is a pure
+        function of its input and the model, so the only staleness risk is a
+        model change under a live process — which is a redeploy, which clears
+        the cache by construction.
+        """
         if not self.embedder.enabled:
             return None
+        key = hashlib.sha256(" ".join(query.split()).encode()).hexdigest()
+        hit = self._query_embed_cache.get(key)
+        if hit and (time.monotonic() - hit[0]) < self._QUERY_EMBED_TTL_S:
+            return hit[1]
+        # Best-effort: an embedding failure falls back to keyword search rather
+        # than failing the call.
         try:
             vecs = await self.embedder.embed([query], input_type="query")
         except Exception:  # noqa: BLE001 - fall back to keyword search
             return None
-        return self._safe_literal(vecs)
+        literal = self._safe_literal(vecs)
+        if literal is not None:
+            # Bounded so a long-lived process with high goal churn cannot grow
+            # this without limit. Oldest-first eviction: crude, but the access
+            # pattern here is recency-dominated.
+            if len(self._query_embed_cache) >= self._QUERY_EMBED_MAX:
+                for stale in list(self._query_embed_cache)[:self._QUERY_EMBED_MAX // 4]:
+                    self._query_embed_cache.pop(stale, None)
+            self._query_embed_cache[key] = (time.monotonic(), literal)
+        return literal
 
     def _safe_literal(self, vecs) -> str | None:
         """Turn an embedder result into a pgvector literal, or None on anything
@@ -490,11 +529,23 @@ class PostgresBackend(StorageBackend):
         return PostgresBackend._finalize_ack(entry)
 
     _PROFILE_TTL_S = 60.0
+    # 3e: goal-embedding cache bounds. The TTL is short because the win is on
+    # near-duplicate goals within a working session (a clarified intent, a
+    # retried sequence), not on long-term reuse.
+    _QUERY_EMBED_TTL_S = 300.0
+    _QUERY_EMBED_MAX = 512
 
     async def _namespace_profile(self, namespace: str) -> dict:
         """The namespace's variant/config profile (Phase 5/6/7 shared lookup),
         cached ~60s so per-call profile echoes don't add a query per tool call.
         Missing row ⇒ {} (all defaults)."""
+        # 3a: NOTIFY-invalidated cache first. It supersedes the plain TTL cache
+        # below when a listener is configured; when one is not (or it has died)
+        # the TTL path still applies, so this degrades to slow rather than to
+        # wrong.
+        cached_v2 = self.gate_cache.get(namespace)
+        if cached_v2 is not None:
+            return cached_v2
         cached = self._profile_cache.get(namespace)
         if cached and (time.monotonic() - cached[0]) < self._PROFILE_TTL_S:
             return cached[1]
@@ -505,7 +556,28 @@ class PostgresBackend(StorageBackend):
             row = await cur.fetchone()
         profile = (row or {}).get("profile") or {}
         self._profile_cache[namespace] = (time.monotonic(), profile)
+        self.gate_cache.put(namespace, profile)
         return profile
+
+    def invalidate_profile(self, namespace: str) -> None:
+        """Drop a namespace's cached profile from BOTH caches.
+
+        There are two by design — the plain TTL cache and the NOTIFY-invalidated
+        one — and exactly one way to invalidate them, because a cache with two
+        entry points and one exit is how a profile edit silently fails to take
+        effect. In production the variant_profiles trigger fires pg_notify and
+        the listener calls this; a direct writer (a test, a migration, an admin
+        path) calls it explicitly.
+        """
+        self._profile_cache.pop(namespace, None)
+        self.gate_cache.invalidate(namespace)
+
+    def invalidate_all_profiles(self) -> None:
+        """Drop every cached profile from both caches. Used on listener
+        reconnect (the listener missed notifications it will never receive
+        again) and by tests that need to skip the TTL."""
+        self._profile_cache.clear()
+        self.gate_cache.invalidate()
 
     async def resolved_profile(self, namespace: str) -> dict:
         """T7.0: the namespace's profile merged over defaults — echoed on every

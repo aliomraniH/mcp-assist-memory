@@ -113,7 +113,7 @@ async def test_snapshot_skips_the_stale_pin_advisory(reconcile_backend, ns):
             "INSERT INTO variant_profiles (namespace, profile) VALUES (%s, %s) "
             "ON CONFLICT (namespace) DO UPDATE SET profile = EXCLUDED.profile",
             (ns, Jsonb({"advisory_mode": "full"})))
-    b._profile_cache.clear()
+    b.invalidate_all_profiles()
     b.resolver.heads[(REPO, "main")] = NEW
     out = await b.memory_save(ns, "run/x", {"m": 1}, kind="claim",
                               meta={"repo": REPO, "branch": "main", "repo_sha": OLD,

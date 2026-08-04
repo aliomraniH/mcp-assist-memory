@@ -177,6 +177,24 @@ CREATE INDEX IF NOT EXISTS skill_efficacy_events_ns_skill
     ON skill_efficacy_events (namespace, skill_key, stage);
 CREATE INDEX IF NOT EXISTS skill_efficacy_events_ns_intent
     ON skill_efficacy_events (namespace, intent_hash);
+-- 0012_gate_cache_invalidate.sql — version bump + pg_notify in the SAME
+-- transaction as the profile change, so a committed edit is never unannounced.
+ALTER TABLE variant_profiles ADD COLUMN IF NOT EXISTS cache_version bigint NOT NULL DEFAULT 0;
+CREATE SEQUENCE IF NOT EXISTS gate_cache_version_seq;
+CREATE OR REPLACE FUNCTION gate_notify_invalidate() RETURNS trigger AS $fn$
+DECLARE
+    v bigint;
+BEGIN
+    v := nextval('gate_cache_version_seq');
+    NEW.cache_version := v;
+    PERFORM pg_notify('gate_invalidate', v::text || ':' || NEW.namespace);
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS variant_profiles_gate_invalidate ON variant_profiles;
+CREATE TRIGGER variant_profiles_gate_invalidate
+    BEFORE INSERT OR UPDATE ON variant_profiles
+    FOR EACH ROW EXECUTE FUNCTION gate_notify_invalidate();
 """
 
 def _load_migration_views() -> str:

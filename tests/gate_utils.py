@@ -16,7 +16,10 @@ async def set_profile(backend, ns: str, profile: dict) -> None:
             "ON CONFLICT (namespace) DO UPDATE SET profile = EXCLUDED.profile",
             (ns, Jsonb(profile)),
         )
-    backend._profile_cache.pop(ns, None)
+    # One invalidation path for both caches (see
+    # PostgresBackend.invalidate_profile). In production the
+    # variant_profiles trigger + NOTIFY does this.
+    backend.invalidate_profile(ns)
 
 
 GATE_ON = {"intent_gate": "on"}

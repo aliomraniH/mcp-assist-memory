@@ -92,7 +92,7 @@ async def test_clinical_namespace_rejects_raw_command_fields(backend, ns):
             "INSERT INTO variant_profiles (namespace, profile) VALUES (%s, %s) "
             "ON CONFLICT (namespace) DO UPDATE SET profile = EXCLUDED.profile",
             (ns, Jsonb({"clinical": True})))
-    backend._profile_cache.clear()
+    backend.invalidate_all_profiles()
     with pytest.raises(AppError) as err:
         await backend.memory_save(ns, "k", {"v": 1}, meta={
             "attestation": {"sha": LOCAL_SHA, "command": "git log --oneline"}})

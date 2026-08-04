@@ -1,4 +1,4 @@
-"""FastMCP instance and the 26 tools.
+"""FastMCP instance and the 27 tools.
 
 The tools are thin: they validate/relay to the injected ``StorageBackend``.
 The backend is set on ``deps`` during the FastAPI lifespan (one pool, injected),
@@ -9,13 +9,13 @@ project == tenant) and the backend filters every query on it — there are no
 implicit cross-project reads. Artifacts are content-addressed and global, and
 ``coord_drift_scan``/``stats`` are deliberately store-wide coordination/admin views.
 
-Tool surface (26):
+Tool surface (27):
   memory:   memory_save, memory_get, memory_list, memory_history, memory_delete, memory_search
   handoff:  handoff_save, handoff_load, handoff_list
   session:  session_create, session_append_event, session_get, session_list, session_events
   artifact: artifact_put, artifact_get, artifact_list
   coord:    coord_health, coord_drift_scan, coord_reconcile, coord_curate
-  gate:     intent_open, skill_define, gate_close_outcome
+  gate:     intent_open, skill_define, gate_close_outcome, gate_cache_status
   feedback: observation_log
   admin:    stats
 """
@@ -810,6 +810,25 @@ async def gate_close_outcome(
         namespace, intent_hash=intent_hash, outcome=outcome, actor=actor,
         skill_key=skill_key,
     )
+
+
+@mcp.tool
+@instrument
+async def gate_cache_status() -> dict:
+    """Introspection only — reports the state of the Intent Gate's in-process
+    cache of gate inputs: {profiles_cached, verdicts_cached, listener_alive,
+    last_notify_ts, cache_version, ttl_seconds, stale_keys}.
+
+    If listener_alive=false the cache is running on TTL fallback. That is NOT an
+    outage: every entry carries a TTL, so gate decisions stay correct and merely
+    take up to ttl_seconds to notice a profile change. But nothing else will
+    tell you, because the failure is silent by design — check this after any
+    credential rotation or redeploy (the listener needs the DIRECT, non-pooler
+    connection string; Neon's pooled endpoint supports NOTIFY but not LISTEN).
+
+    An expired cache entry reads as UNKNOWN and is refetched, never served as
+    still-true — the gate must not become its own stale-authority problem."""
+    return _backend().gate_cache.status()
 
 
 # ------------------------------------------------------------- observations
