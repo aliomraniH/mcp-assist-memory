@@ -830,6 +830,18 @@ class PostgresBackend(StorageBackend):
             include_quarantined=include_quarantined, verbose_gate=verbose_gate,
         )
 
+    async def gate_close_outcome(self, namespace, *, intent_hash, outcome,
+                                 actor="unattributed", skill_key=None) -> dict:
+        """Close a gated intent's outcome — the only efficacy stage that may
+        tune a threshold (see storage/gate.py)."""
+        return await gate.gate_close_outcome(
+            self, namespace, intent_hash=intent_hash, outcome=outcome,
+            actor=actor, skill_key=skill_key)
+
+    async def skill_efficacy(self, namespace, skill_key) -> dict:
+        """Project the append-only efficacy log into counts. Never stored."""
+        return await gate.efficacy_projection(self, namespace, skill_key)
+
     async def skill_define(
         self, namespace, *, key, guidance, polarity, trigger=None,
         trigger_author="unvalidated", trigger_intent=None, temporal_mode=None,
@@ -2084,6 +2096,7 @@ class PostgresBackend(StorageBackend):
         self, *, tool: str, args: dict, result: Any = None, outcome: str = "ok",
         error_code: str | None = None, remedy_emitted: bool = False,
         latency_ms: int | None = None, source_surface: str | None = None,
+        gate: dict | None = None, emit_event_id: str | None = None,
     ) -> None:
         """Append one PHI-safe row to tool_events (Phase 1). Values pass through
         redact() in build_event_row — names/lengths/hashes only. Raises on
@@ -2092,7 +2105,7 @@ class PostgresBackend(StorageBackend):
         row = build_event_row(
             tool=tool, args=args, result=result, outcome=outcome,
             error_code=error_code, remedy_emitted=remedy_emitted, latency_ms=latency_ms,
-            source_surface=source_surface,
+            source_surface=source_surface, gate=gate, emit_event_id=emit_event_id,
         )
         # T8.1: remember the namespace's most recent friction so observation_log
         # can auto-attach it (codes/pattern names only — PHI-safe by shape).
@@ -2111,7 +2124,20 @@ class PostgresBackend(StorageBackend):
         ]
         async with self.pool.connection() as conn:
             await conn.execute(
-                f"INSERT INTO tool_events ({', '.join(cols)}) VALUES ({placeholders})",
+                f"INSERT INTO tool_events ({', '.join(cols)}) VALUES ({placeholders}) "
+                # Idempotent emission: a retried or double-invoked emit collapses
+                # instead of double-counting a block, which would make the new
+                # numbers as untrustworthy as the ones they replace.
+                #
+                # The index predicate is REQUIRED here, not decoration. The
+                # unique index is partial (emit_event_id IS NOT NULL), and
+                # Postgres cannot infer a partial index from the column list
+                # alone — it raises "no unique or exclusion constraint matching
+                # the ON CONFLICT specification". Since the tool layer swallows
+                # telemetry errors by design, omitting it silently drops EVERY
+                # tool_events row: a telemetry fix that destroys telemetry.
+                "ON CONFLICT (emit_event_id) WHERE emit_event_id IS NOT NULL "
+                "DO NOTHING",
                 values,
             )
 

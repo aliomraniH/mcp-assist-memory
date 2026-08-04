@@ -1,4 +1,4 @@
-"""FastMCP instance and the 25 tools.
+"""FastMCP instance and the 26 tools.
 
 The tools are thin: they validate/relay to the injected ``StorageBackend``.
 The backend is set on ``deps`` during the FastAPI lifespan (one pool, injected),
@@ -9,13 +9,13 @@ project == tenant) and the backend filters every query on it — there are no
 implicit cross-project reads. Artifacts are content-addressed and global, and
 ``coord_drift_scan``/``stats`` are deliberately store-wide coordination/admin views.
 
-Tool surface (25):
+Tool surface (26):
   memory:   memory_save, memory_get, memory_list, memory_history, memory_delete, memory_search
   handoff:  handoff_save, handoff_load, handoff_list
   session:  session_create, session_append_event, session_get, session_list, session_events
   artifact: artifact_put, artifact_get, artifact_list
   coord:    coord_health, coord_drift_scan, coord_reconcile, coord_curate
-  gate:     intent_open, skill_define
+  gate:     intent_open, skill_define, gate_close_outcome
   feedback: observation_log
   admin:    stats
 """
@@ -94,6 +94,11 @@ def instrument(fn):
             kwargs["source_surface"] = surface
         call_args = dict(sig.bind_partial(*args, **kwargs).arguments)
         outcome, error_code, remedy_emitted, result = "ok", None, False, None
+        # The gate verdict of a call that RAISED. A block is a completed
+        # operation with a verdict; without capturing it here the finally-path
+        # writes a row whose gate columns are null, and every analytics view
+        # concludes the gate never blocks (validation FINDING-5b).
+        gate_verdict: dict | None = None
         profile = await _profile_for(call_args.get("namespace"))
         try:
             result = await fn(*args, **kwargs)
@@ -110,6 +115,9 @@ def instrument(fn):
             # JSON-RPC protocol error), so the model sees it and can recover.
             outcome = "error"
             error_code = exc.code
+            ctx_gate = exc.context.get("gate") if isinstance(exc.context, dict) else None
+            if isinstance(ctx_gate, dict):
+                gate_verdict = ctx_gate
             payload = exc.payload
             # T7.4 (R9): the remedy field is variant-controlled — the raise
             # site always supplies it, the tool layer strips it when the
@@ -135,6 +143,7 @@ def instrument(fn):
                         remedy_emitted=remedy_emitted,
                         latency_ms=int((time.monotonic() - start) * 1000),
                         source_surface=surface,
+                        gate=gate_verdict,
                     )
                 except Exception as tel_exc:  # noqa: BLE001 - observability only
                     log.warning("tool_event_record_failed", tool=fn.__name__,
@@ -762,6 +771,44 @@ async def skill_define(
         trigger_intent=trigger_intent, temporal_mode=temporal_mode,
         calibration_ts=calibration_ts, actor=actor, role=role,
         event_id=event_id,
+    )
+
+
+@mcp.tool
+@instrument
+async def gate_close_outcome(
+    namespace: str,
+    intent_hash: str,
+    outcome: str,
+    actor: str = "unattributed",
+    skill_key: str | None = None,
+) -> dict:
+    """Record what ACTUALLY happened after the Intent Gate surfaced a skill for
+    an intent. outcome ∈ followed | overridden | abandoned. intent_hash is the
+    64-char hash returned by intent_open.
+
+    One outcome_closed increment per intent, ever; does not re-open earlier
+    stages. Replaying a closure is a visible no-op (the ack lists the skills
+    under already_closed), never a fresh close.
+
+    WHY THIS TOOL EXISTS: skill efficacy is event-sourced across four monotonic
+    stages — matched → surfaced → acted_upon → outcome_closed — and only this
+    last stage may tune a gate threshold. matched and surfaced are produced by
+    the mechanism under measurement, so they describe the gate but must never
+    calibrate it: the v1 counter was incremented by the gate on every match,
+    reached applied:5 including one increment caused by a false positive, and so
+    could not be used to judge the threshold that produced it.
+
+    acted_upon is a session-linkage proxy and over-counts; it is diagnostic,
+    never a quality signal. ANY subsequent gated write in the intent's session
+    flips it, including writes unrelated to the surfaced skill. Do not read it
+    as "the advice was taken".
+
+    Closing an outcome is cheap and it is the only signal that improves the
+    gate. Call it when you know how the intent actually resolved."""
+    return await _backend().gate_close_outcome(
+        namespace, intent_hash=intent_hash, outcome=outcome, actor=actor,
+        skill_key=skill_key,
     )
 
 

@@ -152,6 +152,31 @@ CREATE TABLE IF NOT EXISTS gate_match_log (
 CREATE INDEX IF NOT EXISTS gate_match_log_ns_ts ON gate_match_log (namespace, ts);
 CREATE INDEX IF NOT EXISTS gate_match_log_ns_intent
     ON gate_match_log (namespace, intent_hash);
+-- 0011_gate_telemetry.sql — the unified emitter's columns and the
+-- event-sourced efficacy log.
+ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS error_type text;
+ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS gate_rule text;
+ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS discontinuity boolean;
+ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS emit_event_id text;
+CREATE UNIQUE INDEX IF NOT EXISTS tool_events_emit_event_id_uq
+    ON tool_events (emit_event_id) WHERE emit_event_id IS NOT NULL;
+-- Append-only. Counts are projections; UNIQUE makes double-counting
+-- structurally impossible rather than conventionally avoided.
+CREATE TABLE IF NOT EXISTS skill_efficacy_events (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ts timestamptz NOT NULL DEFAULT now(),
+    namespace text NOT NULL, skill_key text NOT NULL,
+    intent_hash char(64) NOT NULL,
+    stage text NOT NULL CHECK (stage IN
+        ('matched','surfaced','acted_upon','outcome_closed')),
+    outcome text CHECK (outcome IS NULL OR outcome IN
+        ('followed','overridden','abandoned')),
+    writer_actor text NOT NULL, event_id text, session_id text,
+    UNIQUE (namespace, skill_key, intent_hash, stage));
+CREATE INDEX IF NOT EXISTS skill_efficacy_events_ns_skill
+    ON skill_efficacy_events (namespace, skill_key, stage);
+CREATE INDEX IF NOT EXISTS skill_efficacy_events_ns_intent
+    ON skill_efficacy_events (namespace, intent_hash);
 """
 
 def _load_migration_views() -> str:

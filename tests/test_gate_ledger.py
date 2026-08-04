@@ -76,19 +76,41 @@ async def test_md_3_gate_decision_event_payload_shape(gated, ns, sid):
 
 
 async def test_md_4_skill_counters_move_only_via_gate_outcomes(gated, ns, sid):
+    """MD-4, restated for event-sourced counters (remediation 2b).
+
+    The original assertion — that a match increments the skill's own
+    meta.efficacy.applied — described the very defect that had to go. The gate
+    was writing revisions of the skill it was measuring, under actor 'gate', so
+    skill/no-sorted-fold-replay reached applied:5 with one of those increments
+    caused by a false positive.
+
+    What MD-4 was really protecting is intact and asserted below: counters move
+    ONLY through gate machinery, and a raw write cannot move them. They are now
+    projections over an append-only log, so a raw write cannot move them by
+    construction rather than by discipline.
+    """
     await seed(gated, ns, SKILL_ANTI_PATTERN)
-    # a matching intent applies the skill -> applied+1, via the gate only
     await gated.intent_open(
         ns, goal="rebuild the projection by replaying the event log sorted by timestamp",
         scope=["memory_save"], session_id=sid)
+
+    eff = await gated.skill_efficacy(ns, "skill/no-sorted-fold-replay")
+    assert eff["matched"] == 1
+    assert eff["surfaced"] == 1
+    # Diagnostic stages only. Nothing has happened yet that could tune a
+    # threshold, and the projection must not pretend otherwise.
+    assert eff["outcome_closed"] == 0
+
+    # The gate no longer edits the skill it is measuring.
     skill = await gated.memory_get(ns, "skill/no-sorted-fold-replay")
-    assert skill["meta"]["efficacy"]["applied"] == 1
-    # a raw write to the skill does not move counters through the gate machinery
+    assert skill["revision"] == 1, "the gate must not write revisions of its own subject"
+
+    # A raw write still cannot move a counter.
     await gated.memory_save(
         ns, "skill/no-sorted-fold-replay", unwrap(skill["value"]), kind="knowledge",
         meta={**skill["meta"], "note": "raw touch"}, actor="raw-writer")
-    skill2 = await gated.memory_get(ns, "skill/no-sorted-fold-replay")
-    assert skill2["meta"]["efficacy"]["applied"] == 1  # unchanged by raw write
+    eff2 = await gated.skill_efficacy(ns, "skill/no-sorted-fold-replay")
+    assert eff2["matched"] == 1 and eff2["outcome_closed"] == 0
 
 
 async def test_g2_4_outcome_closure_false_positive_and_confirmed(gated, ns, sid):

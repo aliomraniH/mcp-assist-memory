@@ -651,7 +651,46 @@ async def on_write_success(backend, namespace: str, ctx: GateContext,
                                           "false_positive")
         await _ledger(backend, namespace, ctx, decision=ctx.decision,
                       closure=closure)
+        await _link_acted_upon(backend, namespace, ctx)
     return entry
+
+
+async def _link_acted_upon(backend, namespace: str, ctx: GateContext) -> None:
+    """Flip acted_upon for skills surfaced to this session's open intent.
+
+    KNOWN BIAS, DOCUMENTED RATHER THAN HIDDEN. Session linkage is a WEAK causal
+    proxy: any subsequent gated write in the intent's session flips acted_upon,
+    including writes that have nothing to do with the surfaced skill. So
+    acted_upon over-counts from day one, and it will keep over-counting — this
+    is a property of the design, not a bug awaiting a fix.
+
+    That is tolerable only because of where the number is allowed to go. It is
+    diagnostic; it never tunes a threshold. Threshold tuning reads
+    outcome_closed, which requires someone to deliberately record what actually
+    happened. The bias is asserted by the negative_attribution fixture so it
+    stays visible instead of quietly becoming folklore, and it is restated in
+    the tool descriptions so a caller cannot pick the number up without it.
+    """
+    if not ctx.session_id:
+        return
+    try:
+        intent = await _load_intent(backend, namespace, ctx.session_id)
+        if not intent:
+            return
+        async with backend.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                "SELECT DISTINCT skill_key FROM skill_efficacy_events "
+                "WHERE namespace = %s AND intent_hash = %s AND stage = %s",
+                (namespace, intent["intent_hash"], STAGE_SURFACED))
+            keys = [r["skill_key"] for r in await cur.fetchall()]
+        for key in keys:
+            await record_efficacy_event(
+                backend, namespace, key, intent["intent_hash"], STAGE_ACTED_UPON,
+                writer_actor=STAGE_WRITER[STAGE_ACTED_UPON],
+                session_id=ctx.session_id)
+    except Exception:  # pragma: no cover - linkage never fails a write
+        pass
 
 
 async def on_write_error(backend, namespace: str, ctx: GateContext,
@@ -752,6 +791,169 @@ def _deep_merge_base(value: Any) -> dict:
         else:
             out[k] = v
     return out
+
+
+# --------------------------------------------------------------------------
+# 2b — event-sourced skill efficacy.
+#
+# The v1 counters were mutable integers on the skill's own meta, incremented by
+# actor 'gate' on every match. skill/no-sorted-fold-replay went applied 0 -> 5,
+# every increment written by the gate, including one from the catering false
+# positive: the instrument shared identity with the subject, and the metric that
+# was supposed to decide whether a skill earns its keep was inflated by that
+# skill's own false positives.
+#
+# Counts are now PROJECTIONS over an append-only log.
+# --------------------------------------------------------------------------
+STAGE_MATCHED = "matched"
+STAGE_SURFACED = "surfaced"
+STAGE_ACTED_UPON = "acted_upon"
+STAGE_OUTCOME_CLOSED = "outcome_closed"
+STAGES = (STAGE_MATCHED, STAGE_SURFACED, STAGE_ACTED_UPON, STAGE_OUTCOME_CLOSED)
+
+# A DISTINCT writer actor per stage, enforced. Not ceremony: event dedup on this
+# server is scoped to (namespace, actor), so sharing an actor across stages
+# would let one stage's dedup silently swallow another's events — the same class
+# of bug as the instrument sharing identity with its subject.
+STAGE_WRITER = {
+    STAGE_MATCHED: "gate-eval",
+    STAGE_SURFACED: "gate-eval",
+    STAGE_ACTED_UPON: "gate-linkage",
+    STAGE_OUTCOME_CLOSED: "gate-closure",
+}
+
+CLOSURE_OUTCOMES = ("followed", "overridden", "abandoned")
+
+
+async def record_efficacy_event(
+    backend, namespace: str, skill_key: str, intent_hash_: str, stage: str,
+    *, writer_actor: str, outcome: str | None = None,
+    session_id: str | None = None, event_id: str | None = None,
+    strict: bool = False,
+) -> bool:
+    """Append one efficacy event. Returns True if a NEW row landed.
+
+    Rejects a wrong writer actor for the stage. In strict mode that is an
+    AppError (the caller asked to record something and deserves to know it did
+    not happen); otherwise it is a silent no-op, because the gate's own inline
+    stage writes must never fail a user's tool call.
+
+    Duplicate suppression is structural — UNIQUE(namespace, skill_key,
+    intent_hash, stage) — so "one increment per intent per stage, ever" is a
+    property of the schema rather than a convention the next writer must
+    remember.
+    """
+    if stage not in STAGES:
+        raise AppError("invalid_argument", f"stage must be one of {STAGES}")
+    expected = STAGE_WRITER[stage]
+    if writer_actor != expected:
+        if strict:
+            raise AppError(
+                "invalid_argument",
+                f"stage {stage!r} must be written by actor {expected!r}, "
+                f"got {writer_actor!r}",
+                remedy="each stage has a distinct writer actor; dedup is "
+                       "scoped to (namespace, actor)")
+        return False
+    try:
+        async with backend.pool.connection() as conn:
+            cur = await conn.execute(
+                "INSERT INTO skill_efficacy_events (namespace, skill_key, "
+                "intent_hash, stage, outcome, writer_actor, event_id, session_id) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (namespace, skill_key, intent_hash, stage) DO NOTHING",
+                (namespace, skill_key, intent_hash_, stage, outcome,
+                 writer_actor, event_id, session_id))
+            return cur.rowcount > 0
+    except Exception:
+        if strict:
+            raise
+        return False
+
+
+async def efficacy_projection(backend, namespace: str, skill_key: str) -> dict:
+    """Project the append-only log into counts. NEVER stored authoritative —
+    a stored count is a number nobody re-derives, which is how the v1 counter
+    drifted five increments away from anything real."""
+    async with backend.pool.connection() as conn:
+        conn.row_factory = dict_row
+        cur = await conn.execute(
+            "SELECT stage, count(*) AS n FROM skill_efficacy_events "
+            "WHERE namespace = %s AND skill_key = %s GROUP BY stage", (namespace, skill_key))
+        rows = await cur.fetchall()
+        cur = await conn.execute(
+            "SELECT outcome, count(*) AS n FROM skill_efficacy_events "
+            "WHERE namespace = %s AND skill_key = %s AND stage = %s AND outcome IS NOT NULL "
+            "GROUP BY outcome", (namespace, skill_key, STAGE_OUTCOME_CLOSED))
+        outcome_rows = await cur.fetchall()
+    counts = {stage: 0 for stage in STAGES}
+    for r in rows:
+        counts[r["stage"]] = r["n"]
+    return {
+        **counts,
+        "outcomes": {r["outcome"]: r["n"] for r in outcome_rows},
+        # Restated at every read so a consumer cannot pick the number up without
+        # the caveat attached to it.
+        "note": ("matched/surfaced are diagnostic; acted_upon is a "
+                 "session-linkage proxy and over-counts; tune thresholds on "
+                 "outcome_closed only"),
+    }
+
+
+async def gate_close_outcome(
+    backend, namespace: str, *, intent_hash: str, outcome: str,
+    actor: str = "unattributed", skill_key: str | None = None,
+) -> dict:
+    """Close the outcome of a gated intent — the only stage that may tune a
+    threshold, and the only one a human or agent writes deliberately."""
+    if outcome not in CLOSURE_OUTCOMES:
+        raise AppError("invalid_argument",
+                       f"outcome must be one of {CLOSURE_OUTCOMES}")
+    if not isinstance(intent_hash, str) or len(intent_hash) != 64:
+        raise AppError("invalid_argument",
+                       "intent_hash must be the 64-char hash returned by intent_open")
+
+    # Which skills were surfaced for this intent. Closure attaches to those, so
+    # a caller cannot close an outcome against a skill the gate never showed
+    # them.
+    async with backend.pool.connection() as conn:
+        conn.row_factory = dict_row
+        cur = await conn.execute(
+            "SELECT DISTINCT skill_key FROM skill_efficacy_events "
+            "WHERE namespace = %s AND intent_hash = %s", (namespace, intent_hash))
+        keys = [r["skill_key"] for r in await cur.fetchall()]
+    if skill_key is not None:
+        keys = [k for k in keys if k == skill_key]
+
+    closed, already = [], []
+    for key in keys:
+        landed = await record_efficacy_event(
+            backend, namespace, key, intent_hash, STAGE_OUTCOME_CLOSED,
+            writer_actor=STAGE_WRITER[STAGE_OUTCOME_CLOSED], outcome=outcome,
+            strict=True)
+        (closed if landed else already).append(key)
+
+    # Backfill the calibration dataset's outcome column so the match log can be
+    # judged against what actually happened, not just against itself.
+    try:
+        async with backend.pool.connection() as conn:
+            await conn.execute(
+                "UPDATE gate_match_log SET acted_upon = %s "
+                "WHERE namespace = %s AND intent_hash = %s",
+                (outcome == "followed", namespace, intent_hash))
+    except Exception:  # pragma: no cover - calibration backfill is never fatal
+        pass
+
+    return {
+        "namespace": namespace,
+        "intent_hash": intent_hash,
+        "outcome": outcome,
+        "closed": closed,
+        # Named explicitly rather than folded into `closed`: a replay must be
+        # visibly a no-op, never look like a fresh close.
+        "already_closed": already,
+        "actor": actor,
+    }
 
 
 async def bump_skill_efficacy(backend, namespace: str, skill_key: str,
@@ -1057,13 +1259,32 @@ async def intent_open(
     else:
         decision = GATE_APPROVED
 
-    # apply counters for the valid skills that informed this decision (MD-4)
+    # 2b: efficacy is now recorded as append-only STAGE EVENTS, not as an
+    # increment on the skill's own mutable counter.
+    #
+    # The v1 line here called bump_skill_efficacy(..., "applied"), which wrote a
+    # new revision of the matched skill under actor 'gate' on every match. That
+    # is how skill/no-sorted-fold-replay reached applied:5 — including one
+    # increment from the catering false positive. The instrument was editing its
+    # own subject, so the counter could never be used to judge the threshold
+    # that produced it.
+    #
+    # matched and surfaced are DIAGNOSTIC. They are produced by the mechanism
+    # under measurement, so they may describe the gate but must never tune it;
+    # only outcome_closed does that.
     for m in matched:
         if (m["key"].startswith(SKILL_PREFIX) and m.get("polarity")
                 and "expired_skill" not in m["flags"]
                 and "unprovenanced_skill" not in m["flags"]
                 and "quarantined_skill" not in m["flags"]):
-            await bump_skill_efficacy(backend, namespace, m["key"], "applied")
+            await record_efficacy_event(
+                backend, namespace, m["key"], ihash, STAGE_MATCHED,
+                writer_actor=STAGE_WRITER[STAGE_MATCHED],
+                session_id=str(session_id) if session_id else None)
+            await record_efficacy_event(
+                backend, namespace, m["key"], ihash, STAGE_SURFACED,
+                writer_actor=STAGE_WRITER[STAGE_SURFACED],
+                session_id=str(session_id) if session_id else None)
 
     # register the intent (clinical: hash + labels only, no goal, no embedding)
     matched_snapshot = [{"key": m["key"], "revision_id": m.get("revision_id"),
