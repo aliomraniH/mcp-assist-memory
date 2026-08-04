@@ -40,9 +40,11 @@ from psycopg.types.json import Jsonb
 from config import settings
 from errors import AppError
 from storage.idempotency import idem_fingerprint
+from storage.intent_features import extract_features
 from storage.phi import text_looks_identifying
 from storage.sanitize import sanitize, wrap_value
 from storage.screening import screen_value
+from storage.triggers import evaluate_trigger, validate_trigger
 
 GATE_APPROVED = "gate_approved"
 GATE_PREVIEW = "gate_preview"
@@ -66,8 +68,19 @@ DEFAULT_SKILL_VALIDITY_HOURS = 720.0
 # Tier-1 retrieval floor — no fabricated matches (G1-5): a semantic candidate
 # below this cosine similarity is dropped, and the trigger-overlap leg needs
 # at least TRIGGER_OVERLAP_MIN shared content tokens.
-SIMILARITY_FLOOR = 0.25
+#
+# RETRIEVAL_HARD_FLOOR is the widest the ANN query is ever allowed to be. The
+# effective floor is per-namespace (variant_profiles.gate_similarity_floor,
+# default 0.45) and is applied on top of this; this constant only stops a
+# namespace from setting a floor so low that the candidate list becomes the
+# whole namespace. v1's 0.25 is retained here as the hard bound because the
+# match log needs to see NEAR-floor rejects to calibrate the real floor — a
+# query that never retrieves them can never justify moving it.
+RETRIEVAL_HARD_FLOOR = 0.25
 TRIGGER_OVERLAP_MIN = 2
+
+# Back-compat alias: external callers and older fixtures referenced this name.
+SIMILARITY_FLOOR = RETRIEVAL_HARD_FLOOR
 
 # The gate's own house band + machine writers are never themselves gated —
 # otherwise a ledger write would recurse through the gate.
@@ -765,6 +778,98 @@ async def bump_skill_efficacy(backend, namespace: str, skill_key: str,
         pass  # counter bump is best-effort; the decision itself already stood
 
 
+SKILL_POLARITIES = ("anti-pattern", "best-practice")
+TRIGGER_AUTHORS = ("human", "curator", "unvalidated")
+
+
+async def skill_define(
+    backend, namespace: str, *, key: str, guidance: str, polarity: str,
+    trigger: dict | None = None, trigger_author: str = "unvalidated",
+    trigger_intent: str | None = None, temporal_mode: str | None = None,
+    calibration_ts: str | None = None, actor: str = "unattributed",
+    role: str | None = None, event_id: str | None = None,
+) -> dict:
+    """Define or update a skill, validating its trigger predicate fail-closed.
+
+    THE VALIDATION CONTRACT. A trigger is stored ONLY if it passes the
+    deterministic schema + operator-whitelist validator. A failing predicate is
+    not stored in a degraded form and is not stored "pending review": it is
+    dropped, the skill persists display-only, and the errors come back so the
+    author can see exactly what was rejected.
+
+    That asymmetry is deliberate. A half-validated predicate that escalates is
+    strictly worse than no predicate at all — it is the v1 failure mode with
+    extra steps. A skill that merely advises can be wrong without blocking
+    anyone's work.
+    """
+    if not isinstance(key, str) or not key.startswith(SKILL_PREFIX):
+        raise AppError("invalid_argument",
+                       f"skill key must start with {SKILL_PREFIX!r}",
+                       remedy=f"use {SKILL_PREFIX}<slug>")
+    if polarity not in SKILL_POLARITIES:
+        raise AppError("invalid_argument",
+                       f"polarity must be one of {SKILL_POLARITIES}",
+                       remedy="anti-pattern skills escalate; best-practice skills advise")
+    if trigger_author not in TRIGGER_AUTHORS:
+        raise AppError("invalid_argument",
+                       f"trigger_author must be one of {TRIGGER_AUTHORS}",
+                       remedy="record who authored the predicate")
+    if not isinstance(guidance, str) or not guidance.strip():
+        raise AppError("invalid_argument", "guidance must be a non-empty string")
+
+    trigger_schema_errors = validate_trigger(trigger) if trigger is not None else []
+    trigger_valid = trigger is not None and not trigger_schema_errors
+
+    row = await _latest_row(backend, namespace, key)
+    meta = dict((row or {}).get("meta") or {})
+    meta["polarity"] = polarity
+    if trigger_intent is not None:
+        meta["trigger_intent"] = trigger_intent
+    meta.setdefault("trigger_intent", guidance[:200])
+    if trigger_valid:
+        meta["trigger"] = trigger
+        meta["trigger_author"] = trigger_author
+        # Freshness provenance on the predicate itself, for the same reason the
+        # floor carries it: a rule with no calibration date is a stale authority
+        # nobody re-examines.
+        meta["trigger_temporal_mode"] = temporal_mode or "historical_snapshot"
+        meta["trigger_calibration_ts"] = calibration_ts
+        # S7 discipline: only curator-provenanced, in-window skills may
+        # contribute to a gate_conflict. Going through this entrypoint with a
+        # named author IS that provenance — the predicate was validated
+        # deterministically and attributed to a human or the curator. An
+        # 'unvalidated' author explicitly does not earn it, so such a skill can
+        # be defined but never escalates.
+        if trigger_author in ("human", "curator"):
+            meta["curator_provenance"] = True
+            meta["last_validated"] = (calibration_ts
+                                      or datetime.now(timezone.utc).isoformat())
+    else:
+        # Never leave a stale VALID trigger behind a rejected update — that
+        # would silently keep escalating on a rule the author just tried to
+        # replace.
+        meta.pop("trigger", None)
+        meta.pop("trigger_author", None)
+
+    ack = await backend.memory_save(
+        namespace, key, guidance, kind="knowledge", meta=meta, actor=actor,
+        origin="tool", role=role, event_id=event_id)
+
+    return {
+        "skill_id": key,
+        "revision_id": ack.get("revision_id"),
+        "revision": ack.get("revision"),
+        "polarity": polarity,
+        "trigger_valid": trigger_valid,
+        "trigger_schema_errors": trigger_schema_errors or None,
+        # An invalid trigger is not an error the caller can ignore: it changes
+        # what the skill DOES. Name the consequence rather than only the fault.
+        "display_only": not trigger_valid,
+        "quarantined": bool(ack.get("quarantined")),
+        "verified_persisted": bool(ack.get("verified_persisted")),
+    }
+
+
 # --------------------------------------------------------------------------
 # Tier 1 — intent_open: the memory-similarity critic
 # --------------------------------------------------------------------------
@@ -772,7 +877,7 @@ async def intent_open(
     backend, namespace: str, *, goal: str, scope: list[str] | None = None,
     session_id: str | None = None, actor: str = "unattributed",
     event_id: str | None = None, clarification: str | None = None,
-    include_quarantined: bool = False,
+    include_quarantined: bool = False, verbose_gate: bool = False,
 ) -> dict:
     """Open (or refresh) a declared intent: embed it, retrieve similar
     decisions/constraints/skills from THIS namespace only, detect structured
@@ -809,11 +914,14 @@ async def intent_open(
     # Tier-1 retrieval: semantic leg (pgvector, floor-guarded) + deterministic
     # trigger-overlap leg for skills. Namespace-scoped, quarantine-excluded by
     # default; retrieved bodies are UNTRUSTED DATA (wrapped, never executed).
+    guard = await backend.gate_guard(namespace)
     matched: list[dict] = []
     seen: set[str] = set()
+    semantic_raw: list[dict] = []
     if not clinical:
-        for cand in await _semantic_candidates(backend, namespace, goal,
-                                               include_quarantined):
+        semantic_raw = await _semantic_candidates(backend, namespace, goal,
+                                                  include_quarantined)
+        for cand in _guarded_candidates(semantic_raw, guard):
             if cand["key"] not in seen:
                 seen.add(cand["key"])
                 matched.append(cand)
@@ -823,12 +931,18 @@ async def intent_open(
             seen.add(cand["key"])
             matched.append(cand)
 
+    # Deterministic features for the predicate leg. Extracted ONCE per intent —
+    # it is the same for every candidate, and spaCy is the one non-trivial CPU
+    # cost on this path.
+    features = extract_features(goal, clinical=clinical)
+
     skill_window_h = float(profile.get("skill_validity_hours")
                            or DEFAULT_SKILL_VALIDITY_HOURS)
     now = datetime.now(timezone.utc)
     conflict: dict | None = None
     clarify: str | None = None
     skill_conflict_key: str | None = None
+    gate_audit: list[dict] = []
     for m in matched:
         if not m["key"].startswith(SKILL_PREFIX):
             continue
@@ -842,13 +956,74 @@ async def intent_open(
             m["flags"].append("unprovenanced_skill")
         if m.get("quarantined"):
             m["flags"].append("quarantined_skill")
-        # S7: only curator-provenanced, in-window, non-quarantined skills can
-        # contribute to gate_conflict; everything else advises.
-        if (m["polarity"] == "anti-pattern" and provenanced and not expired
-                and not m.get("quarantined") and skill_conflict_key is None):
+
+        # ------------------------------------------------------------------
+        # PREDICATE-FIRST ESCALATION (validation FINDING-4).
+        #
+        # v1 escalated here on the strength of the candidate having been
+        # RETRIEVED at all — which meant embedding proximity decided violation.
+        # It conflicted "schedule the quarterly workshop catering" against an
+        # event-log skill at cosine 0.288, and conflicted a goal that OBEYED
+        # that skill, because compliance and violation are adjacent in
+        # embedding space. Cosine cannot separate them at any threshold.
+        #
+        # Escalation is now decided by the skill's structured trigger predicate
+        # evaluated against the intent's extracted features. Cosine NEVER
+        # escalates; it selects what is shown and nothing more.
+        #
+        # A skill with no valid trigger is DISPLAY-ONLY and can never, by
+        # itself, escalate. That is a deliberate behaviour change with a
+        # deliberate direction: on deploy, existing anti-pattern skills have no
+        # trigger and stop escalating until one is authored. Failing toward
+        # silence is correct here because the conflict stream this replaces was
+        # false-positive dominated — a gate that cries wolf trains the operator
+        # to ignore it, which is worse than a gate that stays quiet.
+        # ------------------------------------------------------------------
+        trigger = meta.get("trigger")
+        trigger_errors = validate_trigger(trigger) if trigger is not None else ["no trigger"]
+        predicate_match = evaluate_trigger(trigger, features) if not trigger_errors else None
+        m["predicate_match"] = predicate_match
+        if trigger is None:
+            m["flags"].append("display_only_no_trigger")
+        elif trigger_errors:
+            # An invalid trigger is louder than a missing one: something wrote a
+            # predicate that does not validate, and a human should see that.
+            m["flags"].append("invalid_trigger")
+
+        eligible = (m["polarity"] == "anti-pattern" and provenanced and not expired
+                    and not m.get("quarantined"))
+        escalates = bool(eligible and predicate_match is True)
+        if escalates and skill_conflict_key is None:
             skill_conflict_key = m["key"]
+
+        gate_audit.append({
+            "skill_key": m["key"],
+            "cosine": m.get("similarity"),
+            "predicate_evaluated": trigger is not None and not trigger_errors,
+            "predicate_match": predicate_match,
+            "trigger_schema_errors": trigger_errors or None,
+            # Phase 4 (NLI backstop) is descoped on this branch. The keys are
+            # present and null so the audit shape does not change when it lands.
+            "nli_pair_direction": None,
+            "nli_contradiction": None,
+            "nli_verdict": None,
+            "escalated": escalates,
+            "escalation_reason": (
+                "predicate_match" if escalates
+                else "no_trigger" if trigger is None
+                else "invalid_trigger" if trigger_errors
+                else "predicate_did_not_match" if predicate_match is False
+                else "trigger_unevaluable" if predicate_match is None
+                else "skill_not_eligible"),
+        })
     for m in matched:
         m.pop("_meta", None)
+
+    # Calibration dataset (1a). EVERY skill candidate is logged, escalated or
+    # not — a table holding only escalations cannot calibrate the floor that
+    # produced it. Best-effort: a logging failure must not change a verdict.
+    await _log_gate_matches(backend, namespace, ihash, matched, gate_audit,
+                            guard, semantic_raw, clinical=clinical)
 
     # Structured-field contradiction (G1-2): deterministic scan of live
     # entries carrying meta.structured — field-level, never prose-inferred.
@@ -868,11 +1043,15 @@ async def intent_open(
     elif skill_conflict_key is not None:
         decision = GATE_CONFLICT
         m = next(m for m in matched if m["key"] == skill_conflict_key)
-        clarify = (f"The declared intent matches anti-pattern {skill_conflict_key} "
-                   "(curator-provenanced, in-window). Proceed anyway, or adjust "
-                   "the approach?")
+        clarify = (f"The declared intent satisfies the prohibition predicate of "
+                   f"anti-pattern {skill_conflict_key} (curator-provenanced, "
+                   "in-window). Proceed anyway, or adjust the approach?")
+        # basis records WHY, and it is no longer "this was retrieved". A reader
+        # of a stored conflict can now tell a predicate decision from the v1
+        # proximity decision without re-deriving anything.
         conflict = {"key": skill_conflict_key, "revision": m.get("revision"),
-                    "revision_id": m.get("revision_id"), "basis": "anti_pattern_skill",
+                    "revision_id": m.get("revision_id"),
+                    "basis": "anti_pattern_predicate",
                     "skill_key": skill_conflict_key}
         m["flags"].append("conflict_contributor")
     else:
@@ -911,7 +1090,7 @@ async def intent_open(
     # project block (MD-1): served from project/meta; absent -> explicit null.
     project = await _project_block(backend, namespace)
 
-    return {
+    result = {
         "namespace": namespace, "session_id": session_id,
         "intent_hash": ihash, "decision": decision,
         "matched": matched, "flags": flags, "labels": labels,
@@ -920,6 +1099,21 @@ async def intent_open(
         "gate": ctx.gate_block(),
         "latency_ms": latency_ms,
     }
+    if verbose_gate:
+        # 1c: the per-candidate audit. Answers "why did this escalate / why did
+        # it not" without a database read or a guess, which is what makes a
+        # false positive reportable instead of merely annoying.
+        result["gate_audit"] = gate_audit
+        result["gate_guard"] = {
+            "absolute_floor": guard.get("gate_similarity_floor"),
+            "alpha": guard.get("gate_top_fraction_alpha"),
+            "temporal_mode": guard.get("temporal_mode"),
+            "calibration_ts": guard.get("calibration_ts"),
+            # Surfaced so "nothing matched" can be told apart from "the
+            # extractor is down and every predicate silently failed".
+            "feature_extractor": features.get("extractor"),
+        }
+    return result
 
 
 def _skill_expired(last_validated: Any, window_h: float, now: datetime) -> bool:
@@ -946,6 +1140,88 @@ def _match_entry(row: dict, *, similarity: float | None, flags: list[str]) -> di
         "flags": list(flags),
         "_meta": row.get("meta") or {},
     }
+
+
+def _guarded_candidates(candidates: list[dict], guard: dict) -> list[dict]:
+    """A2: accept a semantic candidate only if it clears BOTH guards.
+
+        cosine >= absolute_floor        AND        cosine >= alpha x top_score
+
+    The absolute floor answers "is this related at all" — v1's 0.25 admitted
+    seven unrelated latency-sample notes at 0.369-0.376 alongside a true match
+    at 0.539. The relative guard answers a different question the floor cannot:
+    "is this as good as the best thing we found". A namespace whose best match
+    is 0.50 should not also surface a 0.46 long tail merely because both
+    cleared an absolute bar.
+
+    Both are RETRIEVAL guards. Neither escalates anything, ever; that is the
+    predicate's job. Passing the floor is not evidence of a violation, and the
+    two must not be conflated again.
+    """
+    if not candidates:
+        return []
+    floor = float(guard.get("gate_similarity_floor", 0.45))
+    alpha = float(guard.get("gate_top_fraction_alpha", 0.85))
+    top = max((c.get("similarity") or 0.0) for c in candidates)
+    relative = alpha * top
+    return [c for c in candidates
+            if (c.get("similarity") or 0.0) >= floor
+            and (c.get("similarity") or 0.0) >= relative]
+
+
+async def _log_gate_matches(backend, namespace: str, intent_hash_: str,
+                            matched: list[dict], gate_audit: list[dict],
+                            guard: dict, semantic_raw: list[dict],
+                            *, clinical: bool) -> None:
+    """Append the calibration record for this intent's skill candidates.
+
+    Logs candidates that PASSED the guard and, critically, the near-floor ones
+    that did not: a dataset containing only survivors cannot tell you whether
+    the floor is right. passed_guard distinguishes them.
+
+    PHI: intent_hash only — this table has no goal column to leak into.
+
+    Best-effort by construction. The verdict has already been decided by the
+    time this runs, and a calibration-log failure must never change or fail a
+    gate decision.
+    """
+    audit_by_key = {a["skill_key"]: a for a in gate_audit}
+    top = max((c.get("similarity") or 0.0) for c in semantic_raw) if semantic_raw else None
+    rows = []
+    passed_keys = {m["key"] for m in matched}
+    seen: set[str] = set()
+
+    for m in matched:
+        if not m["key"].startswith(SKILL_PREFIX):
+            continue
+        seen.add(m["key"])
+        audit = audit_by_key.get(m["key"], {})
+        rows.append((namespace, intent_hash_, m["key"], m.get("similarity"), top,
+                     guard.get("gate_similarity_floor"),
+                     guard.get("gate_top_fraction_alpha"), True,
+                     audit.get("predicate_match"), None,
+                     guard.get("temporal_mode"), guard.get("calibration_ts")))
+    # Guard-rejected skill candidates: the negative half of the dataset.
+    for c in semantic_raw:
+        if not c["key"].startswith(SKILL_PREFIX) or c["key"] in passed_keys or c["key"] in seen:
+            continue
+        seen.add(c["key"])
+        rows.append((namespace, intent_hash_, c["key"], c.get("similarity"), top,
+                     guard.get("gate_similarity_floor"),
+                     guard.get("gate_top_fraction_alpha"), False,
+                     None, None,
+                     guard.get("temporal_mode"), guard.get("calibration_ts")))
+    if not rows:
+        return
+    try:
+        async with backend.pool.connection() as conn:
+            await conn.cursor().executemany(
+                "INSERT INTO gate_match_log (namespace, intent_hash, skill_key, "
+                "cosine, top_score, absolute_floor, alpha, passed_guard, "
+                "predicate_match, nli_contradiction, temporal_mode, calibration_ts) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
+    except Exception:  # pragma: no cover - calibration logging is never fatal
+        pass
 
 
 async def _semantic_candidates(backend, namespace: str, goal: str,
@@ -979,7 +1255,11 @@ async def _semantic_candidates(backend, namespace: str, goal: str,
     out = []
     for r in rows:
         sim = 1.0 - float(r.pop("_dist"))
-        if sim >= SIMILARITY_FLOOR:  # no fabricated matches (G1-5)
+        # Retrieval is bounded by the HARD floor here; the per-namespace floor
+        # and the relative guard are applied by _guarded_candidates(). Keeping
+        # the near-floor rejects visible to that step is what lets the match log
+        # record what the floor turned away.
+        if sim >= RETRIEVAL_HARD_FLOOR:  # no fabricated matches (G1-5)
             out.append(_match_entry(r, similarity=sim, flags=[]))
     return out
 

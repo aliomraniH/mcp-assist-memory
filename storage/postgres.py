@@ -38,7 +38,7 @@ from storage.tier2 import GateReasoner, build_gate_reasoner
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
 from storage.idempotency import idem_fingerprint
 from storage.phi import assert_no_phi
-from storage.profiles import resolve_profile
+from storage.profiles import resolve_gate_guard, resolve_profile
 from storage.reconcile import (
     STALE,
     UNVERIFIABLE,
@@ -507,6 +507,13 @@ class PostgresBackend(StorageBackend):
         dict response and snapshotted into tool_events."""
         return resolve_profile(await self._namespace_profile(namespace))
 
+    async def gate_guard(self, namespace: str) -> dict:
+        """Intent Gate Tier-1 retrieval guard (floor, alpha, calibration
+        provenance). Reads the SAME cached profile row as resolved_profile, so
+        it costs no extra round trip, but stays out of the echoed profile dict
+        to keep ack shapes unchanged."""
+        return resolve_gate_guard(await self._namespace_profile(namespace))
+
     async def _boundary_meta(self, namespace: str, meta: dict | None) -> dict | None:
         """v3 item 1 (S1a): the write boundary is where sha refs get validated and
         canonicalized — EVERY write path flows through here (memory_save, handoff,
@@ -814,13 +821,28 @@ class PostgresBackend(StorageBackend):
     async def intent_open(
         self, namespace, *, goal, scope=None, session_id=None,
         actor="unattributed", event_id=None, clarification=None,
-        include_quarantined=False,
+        include_quarantined=False, verbose_gate=False,
     ) -> dict:
         """Tier 1: open a declared intent (see storage/gate.py)."""
         return await gate.intent_open(
             self, namespace, goal=goal, scope=scope, session_id=session_id,
             actor=actor, event_id=event_id, clarification=clarification,
-            include_quarantined=include_quarantined,
+            include_quarantined=include_quarantined, verbose_gate=verbose_gate,
+        )
+
+    async def skill_define(
+        self, namespace, *, key, guidance, polarity, trigger=None,
+        trigger_author="unvalidated", trigger_intent=None, temporal_mode=None,
+        calibration_ts=None, actor="unattributed", role=None, event_id=None,
+    ) -> dict:
+        """Define or update a gate skill, validating its trigger fail-closed
+        (see storage/gate.py)."""
+        return await gate.skill_define(
+            self, namespace, key=key, guidance=guidance, polarity=polarity,
+            trigger=trigger, trigger_author=trigger_author,
+            trigger_intent=trigger_intent, temporal_mode=temporal_mode,
+            calibration_ts=calibration_ts, actor=actor, role=role,
+            event_id=event_id,
         )
 
     @_retry_if_idempotent

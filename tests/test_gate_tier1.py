@@ -47,9 +47,13 @@ async def test_g1_1_anti_pattern_skill_matched_wrapped_polarity(gated, ns, sid):
     m = next(m for m in res["matched"] if m["key"] == "skill/no-sorted-fold-replay")
     assert m["polarity"] == "anti-pattern"
     assert "<<<UNTRUSTED_DATA>>>" in m["guidance"] and "<<<END>>>" in m["guidance"]
-    # a fresh, curator-provenanced anti-pattern contributes a conflict + clarify
+    # A fresh, curator-provenanced anti-pattern WITH a valid authored trigger,
+    # against a goal that satisfies the prohibition predicate (folding in
+    # sorted/timestamp order), escalates. Under the remediated rule the trigger
+    # is what escalates it — retrieval alone no longer can.
     assert res["decision"] in ("gate_conflict", "gate_clarify")
     assert res["clarify"]
+    assert res["conflict"]["basis"] == "anti_pattern_predicate"
 
 
 async def test_g1_2_structured_field_contradiction(gated, ns, sid):

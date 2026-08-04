@@ -44,6 +44,52 @@ SKILL_ANTI_PATTERN = {
         "last_validated": "2026-07-25T00:00:00Z",
         "origin_model_family": "claude",
         "curator_provenance": True,
+        # AUTHORED TRIGGER (remediation 1e). Written to match the PROHIBITED
+        # case, never the compliant one — the distinction the v1 gate could not
+        # make. The skill's guidance is "replay must fold in insertion order";
+        # the violation is folding in sorted/timestamp order, and that lives in
+        # the prepositional scope the feature extractor exposes as `condition`:
+        #
+        #   "...replaying the event log sorted by timestamp"
+        #        -> condition "replay event log sort timestamp"   MATCHES
+        #   "...replaying the event log in insertion order"
+        #        -> condition "replay event log insertion order"  DOES NOT
+        #
+        # Both goals sit at effectively the same cosine distance from this
+        # skill, which is exactly why escalation cannot be a similarity
+        # question.
+        "trigger": {
+            "and": [
+                {"in": [{"var": "action"},
+                        ["replay", "rebuild", "fold", "reduce", "reconcile"]]},
+                {"or": [
+                    {"in": ["timestamp", {"var": "condition"}]},
+                    {"in": ["sort", {"var": "condition"}]},
+                    {"in": ["chronological", {"var": "condition"}]},
+                    {"in": ["occurred_at", {"var": "condition"}]},
+                ]},
+            ]
+        },
+        "trigger_author": "curator",
+        "trigger_temporal_mode": "historical_snapshot",
+        "trigger_calibration_ts": "2026-08-04T00:00:00Z",
+    },
+}
+
+# Same skill, no trigger — the state EVERY existing anti-pattern skill is in on
+# deploy until one is authored. Pins the deliberate fail-toward-silence
+# behaviour so it can never regress back to escalating on proximity.
+SKILL_ANTI_PATTERN_NO_TRIGGER = {
+    "key": "skill/no-trigger-antipattern",
+    "kind": "knowledge",
+    "value": ("ANTI-PATTERN: replaying an event log by (occurred_at, event_id) "
+              "sort breaks sticky-tombstone resurrection; replay must fold in "
+              "insertion order (rowid ASC)."),
+    "meta": {
+        "polarity": "anti-pattern",
+        "trigger_intent": "implement event log replay projection rebuild fold order",
+        "last_validated": "2026-07-25T00:00:00Z",
+        "curator_provenance": True,
     },
 }
 

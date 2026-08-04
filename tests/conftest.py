@@ -137,6 +137,21 @@ CREATE TABLE IF NOT EXISTS gate_block_log (
     created_at timestamptz NOT NULL DEFAULT now(), closed_at timestamptz);
 ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS gate_tier int;
 ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS gate_decision text;
+-- 0010_gate_match_log.sql — the Tier-1 retrieval calibration dataset. EVERY
+-- skill candidate lands here, guard-passed or not, so the floor that produced
+-- a decision can later be judged against outcomes. intent_hash only: this
+-- table has no goal column to leak raw intent text into.
+CREATE TABLE IF NOT EXISTS gate_match_log (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ts timestamptz NOT NULL DEFAULT now(),
+    namespace text NOT NULL, intent_hash char(64) NOT NULL, skill_key text NOT NULL,
+    cosine real, top_score real, absolute_floor real, alpha real,
+    passed_guard boolean NOT NULL,
+    predicate_match boolean, nli_contradiction real, acted_upon boolean,
+    temporal_mode text, calibration_ts timestamptz);
+CREATE INDEX IF NOT EXISTS gate_match_log_ns_ts ON gate_match_log (namespace, ts);
+CREATE INDEX IF NOT EXISTS gate_match_log_ns_intent
+    ON gate_match_log (namespace, intent_hash);
 """
 
 def _load_migration_views() -> str:

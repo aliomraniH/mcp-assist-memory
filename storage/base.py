@@ -164,3 +164,10 @@ class StorageBackend(abc.ABC):
 
     async def resolved_profile(self, namespace: str) -> dict:  # pragma: no cover - default
         return {}
+
+    async def gate_guard(self, namespace: str) -> dict:  # pragma: no cover - default
+        """Tier-1 retrieval guard. An alternate backend that does not implement
+        variant profiles still gets the server defaults — never an absent floor,
+        which would silently restore the v1 behaviour this branch exists to fix."""
+        from storage.profiles import resolve_gate_guard
+        return resolve_gate_guard(None)
