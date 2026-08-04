@@ -434,3 +434,38 @@ async def test_cosine_never_escalates_at_any_similarity(gated, ns, sid):
     assert entry["cosine"] is None or entry["cosine"] > 0.5, "should rank highly"
     assert entry["escalated"] is False
     assert res["decision"] == "gate_approved"
+
+
+def test_scripts_authored_triggers_all_validate():
+    """[CI] Keeps scripts/author_gate_triggers.py honest. Every predicate the
+    operator-facing script would persist must pass the deterministic validator
+    AND its paired violating/compliant examples — a predicate that fires on the
+    compliant case is the v1 bug, and the script must refuse to ship it."""
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "author_gate_triggers.py"
+    spec = importlib.util.spec_from_file_location("author_gate_triggers", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    ok, bad = mod.validate_all()
+    assert not bad, bad
+    assert "skill/no-sorted-fold-replay" in ok
+
+
+def test_scripts_refuse_to_write_to_evidence_namespaces():
+    """The probe namespaces hold the validation run's evidence. A later reader
+    must be able to reproduce the original finding, so writes are refused
+    structurally rather than by convention."""
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "author_gate_triggers.py"
+    spec = importlib.util.spec_from_file_location("author_gate_triggers", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert "dev/gate-probe-20260803" in mod.PROTECTED_NAMESPACES
+    import asyncio
+    assert asyncio.run(mod.apply("dev/gate-probe-20260803", dry_run=False)) == 2
