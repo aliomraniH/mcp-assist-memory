@@ -346,6 +346,11 @@ class PostgresBackend(StorageBackend):
         # with tool='gate_awaken').
         self.gate_reasoner: GateReasoner = gate_reasoner or build_gate_reasoner(settings)
         self.gate_awaken_count = 0
+        # Boot timestamp, fixed for the life of the process. It is an input to
+        # boot_connection_fingerprint so that a restart is DISTINGUISHABLE from
+        # a silent re-point at a different database — two facts that look
+        # identical if the fingerprint only covers the connection string.
+        self._boot_ts = datetime.now(timezone.utc).isoformat()
         # Best-effort semantic recall. Defaults to disabled so the backend works
         # with no provider key (keyword-only search, no embeddings written).
         self.embedder: Embedder = embedder or DisabledEmbedder()
@@ -2158,7 +2163,68 @@ class PostgresBackend(StorageBackend):
                 """
             )
             row = await cur.fetchone()
-        return dict(row)
+        out = dict(row)
+        out["db_identity"] = await self.db_identity()
+        return out
+
+    async def db_identity(self) -> dict:
+        """Which database is THIS SERVER PROCESS actually connected to.
+
+        The structural fix for the split-brain that cost the last deploy its
+        closeout. The Replit workspace shell's $DATABASE_URL resolved to
+        `heliumdb` while the deployed server read `neondb`, so a correct
+        variant_profiles INSERT executed successfully against a database the
+        server never reads, and the gate silently failed to arm across three
+        checks over seven minutes. The two diverged in BOTH directions, so it
+        was not replica lag and no amount of care with the SQL would have caught
+        it.
+
+        The lesson generalises: an environment variable in a shell is a claim
+        about a connection, not the connection. The only trustworthy answer to
+        "which database is the server using" comes from the server, over its own
+        pool. That is what this returns, and it is why the post-deploy protocol
+        asserts through here rather than through psql.
+
+        boot_connection_fingerprint is the comparable value: sha256 of
+        host+db+user+boot_ts, stable for the life of the process, recorded in
+        the deploy record and re-checked after any credential rotation. A
+        changed fingerprint with an unchanged deploy means something moved
+        underneath the server.
+        """
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                "SELECT current_database() AS current_database, "
+                "       current_user AS current_user_name, "
+                "       inet_server_addr()::text AS server_addr, "
+                "       inet_server_port() AS server_port, "
+                "       version() AS server_version_string, "
+                "       (SELECT extversion FROM pg_extension WHERE extname = 'vector') "
+                "           AS pgvector_version")
+            row = dict(await cur.fetchone())
+            # The host as the CLIENT resolved it. current_database() alone would
+            # not have distinguished two Neon endpoints serving databases of the
+            # same name, and endpoint identity is exactly what split-brain is
+            # about.
+            info = conn.info
+            host = info.host or ""
+            port = str(info.port or "")
+
+        fingerprint = hashlib.sha256(
+            f"{host}|{port}|{row['current_database']}|{row['current_user_name']}|"
+            f"{self._boot_ts}".encode()
+        ).hexdigest()
+        return {
+            "current_database": row["current_database"],
+            "current_user": row["current_user_name"],
+            "endpoint_host": host,
+            "endpoint_port": port,
+            "server_addr": row["server_addr"],
+            "pgvector_version": row["pgvector_version"],
+            "postgres_version": (row["server_version_string"] or "").split(" on ")[0],
+            "server_boot_ts": self._boot_ts,
+            "boot_connection_fingerprint": fingerprint,
+        }
 
     @_retry_on_disconnect
     async def health(self) -> bool:

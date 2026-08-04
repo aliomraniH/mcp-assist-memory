@@ -847,7 +847,20 @@ async def observation_log(
 @mcp.tool
 @instrument
 async def stats() -> dict:
-    """Return store-wide counts (memory revisions/keys, sessions, events, artifacts, bytes)."""
+    """Return store-wide counts (memory revisions/keys, sessions, events, artifacts, bytes)
+    plus a db_identity block.
+
+    db_identity reports the database this server process is actually connected
+    to: {current_database, current_user, endpoint_host, endpoint_port,
+    pgvector_version, postgres_version, server_boot_ts,
+    boot_connection_fingerprint}. Compare boot_connection_fingerprint against
+    the expected deploy record.
+
+    Ask the SERVER, never a shell. A $DATABASE_URL in a terminal is a claim
+    about a connection, not the connection: a previous deploy ran correct SQL
+    against `heliumdb` while the deployed server read `neondb`, so the change
+    appeared to succeed and armed nothing. Any post-deploy check that asserts
+    through psql instead of through here can reproduce that failure exactly."""
     return await _backend().stats()
 
 
