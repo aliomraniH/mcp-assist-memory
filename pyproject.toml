@@ -98,6 +98,11 @@ addopts = "-m 'not neon and not postdeploy'"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+# The en_core_web_sm model is pinned as a PEP 508 direct wheel URL (it is not
+# on PyPI); hatchling rejects direct references unless this is set.
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 # Top-level service modules (app.py, config.py, admin_store.py, dashboard.py) are
 # imported from the repo root (editable install / `uvicorn app:app`); the
