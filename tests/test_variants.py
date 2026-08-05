@@ -23,7 +23,7 @@ async def _set_profile(backend, ns, profile):
             "INSERT INTO variant_profiles (namespace, profile) VALUES (%s, %s) "
             "ON CONFLICT (namespace) DO UPDATE SET profile = EXCLUDED.profile",
             (ns, Jsonb(profile)))
-    backend._profile_cache.clear()  # test convenience: skip the 60s TTL
+    backend.invalidate_all_profiles()  # test convenience: skip the 60s TTL
 
 
 @pytest.fixture

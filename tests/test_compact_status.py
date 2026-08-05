@@ -34,7 +34,7 @@ async def _set_profile(backend, ns, profile):
             "INSERT INTO variant_profiles (namespace, profile) VALUES (%s, %s) "
             "ON CONFLICT (namespace) DO UPDATE SET profile = EXCLUDED.profile",
             (ns, Jsonb(profile)))
-    backend._profile_cache.clear()
+    backend.invalidate_all_profiles()
 
 
 # ------------------------------------------------- additive layer (all profiles)

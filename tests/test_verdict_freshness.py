@@ -69,7 +69,7 @@ async def test_namespace_staleness_window_is_respected(reconcile_backend, ns):
             "INSERT INTO variant_profiles (namespace, profile) VALUES (%s, %s) "
             "ON CONFLICT (namespace) DO UPDATE SET profile = EXCLUDED.profile",
             (ns, Jsonb({"claim_staleness_hours": 500})))
-    b._profile_cache.clear()
+    b.invalidate_all_profiles()
     vkey = await _reconciled_verdict_key(b, ns)
     await _age_row(b, ns, vkey, 289)
     rec = await b.memory_get(ns, vkey)

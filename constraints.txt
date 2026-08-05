@@ -113,3 +113,61 @@ uvloop==0.22.1
 watchfiles==1.2.0
 websockets==16.0
 zipp==4.1.0
+
+# ---------------------------------------------------------------------------
+# Intent Gate remediation (Phases 1-3) — added 2026-08-04.
+# Full transitive closure, pinned exactly. Loose ranges have broken prod before
+# (the fastmcp 3.4.3 HostOriginGuard incident documented in the header), so the
+# gate-remediation dependencies land here as exact pins, not ranges.
+#
+#   spacy + en_core_web_sm : deterministic intent-feature extraction on the
+#                            Tier-1 hot path (ROOT verb, dobj, negation scope).
+#                            NO LLM on the hot path.
+#   panzi-json-logic       : JSON-Logic evaluation for skill trigger predicates.
+#                            MAINTAINED fork. Do NOT substitute
+#                            nadirizr/json-logic-py — that project is
+#                            discontinued and unmaintained.
+#   asyncpg                : the ONE dedicated DIRECT (non-pooler) Neon
+#                            connection that runs LISTEN gate_invalidate.
+#                            Neon's pooled endpoint supports NOTIFY but NOT
+#                            LISTEN (PgBouncer transaction mode drops session
+#                            features), so the listener cannot share the app's
+#                            pooled connection.
+#
+# The en_core_web_sm MODEL is not on PyPI; it installs from a direct wheel URL
+# declared in pyproject.toml as a PEP 508 direct reference. The pin below caps
+# the version; the URL in pyproject.toml is what actually resolves it. Both must
+# move together on an upgrade.
+#
+# Phase 4 (NLI backstop: onnxruntime, optimum) is DESCOPED from this branch and
+# deliberately NOT pinned here — see build/gate-remediation-p1-complete.
+# ---------------------------------------------------------------------------
+asyncpg==0.31.0
+blis==1.3.3
+catalogue==2.0.10
+charset-normalizer==3.4.6
+cloudpathlib==0.24.0
+colorama==0.4.6
+confection==1.3.3
+cymem==2.0.13
+en-core-web-sm==3.8.0
+jinja2==3.1.6
+markupsafe==3.0.3
+murmurhash==1.0.15
+numpy==2.4.6
+panzi-json-logic==1.0.1
+preshed==3.0.13
+requests==2.33.1
+shellingham==1.5.4
+smart-open==8.0.1
+spacy==3.8.14
+spacy-legacy==3.0.12
+spacy-loggers==1.0.5
+srsly==2.5.3
+thinc==8.3.13
+tqdm==4.70.0
+typer==0.27.1
+urllib3==2.6.3
+wasabi==1.1.3
+weasel==1.0.0
+wrapt==2.3.0

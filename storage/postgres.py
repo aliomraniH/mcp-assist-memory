@@ -34,11 +34,12 @@ from storage import gate
 from storage.awaken import awaken as _awaken
 from storage.base import StorageBackend
 from storage.curator import Curator, DisabledCurator
+from storage.gate_cache import GateCache
 from storage.tier2 import GateReasoner, build_gate_reasoner
 from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector_literal
 from storage.idempotency import idem_fingerprint
 from storage.phi import assert_no_phi
-from storage.profiles import resolve_profile
+from storage.profiles import resolve_gate_guard, resolve_profile
 from storage.reconcile import (
     STALE,
     UNVERIFIABLE,
@@ -346,6 +347,17 @@ class PostgresBackend(StorageBackend):
         # with tool='gate_awaken').
         self.gate_reasoner: GateReasoner = gate_reasoner or build_gate_reasoner(settings)
         self.gate_awaken_count = 0
+        # Boot timestamp, fixed for the life of the process. It is an input to
+        # boot_connection_fingerprint so that a restart is DISTINGUISHABLE from
+        # a silent re-point at a different database — two facts that look
+        # identical if the fingerprint only covers the connection string.
+        self._boot_ts = datetime.now(timezone.utc).isoformat()
+        # 3e: goal-embedding cache. Keyed by sha256 of the normalised query.
+        self._query_embed_cache: dict[str, tuple[float, str]] = {}
+        # 3a: NOTIFY-invalidated cache for gate inputs. The listener is started
+        # by the app lifespan (it needs the DIRECT dsn); without one this is a
+        # pure-TTL cache that honestly reports listener_alive=false.
+        self.gate_cache = GateCache()
         # Best-effort semantic recall. Defaults to disabled so the backend works
         # with no provider key (keyword-only search, no embeddings written).
         self.embedder: Embedder = embedder or DisabledEmbedder()
@@ -375,14 +387,46 @@ class PostgresBackend(StorageBackend):
         return self._safe_literal(vecs)
 
     async def _maybe_embed_query(self, query: str) -> str | None:
-        """Embed a search query. Best-effort: None falls search back to keyword."""
+        """Embed a search query. Best-effort: None falls search back to keyword.
+
+        3e: results are cached by sha256 of the normalised query for a short TTL.
+        On the deployed server this is a NETWORK CALL to the embedding provider,
+        and it sits on the Tier-1 hot path — measured Tier-1 median was 515ms
+        against 121ms for an empty namespace, so ~400ms is retrieval-path work
+        and this call is the most likely single contributor.
+
+        Embedding the same goal twice is pure waste, and repeats are common in
+        exactly the situation that matters: a caller who gets a gate_conflict
+        re-opens the same intent with a clarification, and an agent retrying a
+        sequence re-declares a goal verbatim.
+
+        The cache is small, in-process, and TTL-bounded. An embedding is a pure
+        function of its input and the model, so the only staleness risk is a
+        model change under a live process — which is a redeploy, which clears
+        the cache by construction.
+        """
         if not self.embedder.enabled:
             return None
+        key = hashlib.sha256(" ".join(query.split()).encode()).hexdigest()
+        hit = self._query_embed_cache.get(key)
+        if hit and (time.monotonic() - hit[0]) < self._QUERY_EMBED_TTL_S:
+            return hit[1]
+        # Best-effort: an embedding failure falls back to keyword search rather
+        # than failing the call.
         try:
             vecs = await self.embedder.embed([query], input_type="query")
         except Exception:  # noqa: BLE001 - fall back to keyword search
             return None
-        return self._safe_literal(vecs)
+        literal = self._safe_literal(vecs)
+        if literal is not None:
+            # Bounded so a long-lived process with high goal churn cannot grow
+            # this without limit. Oldest-first eviction: crude, but the access
+            # pattern here is recency-dominated.
+            if len(self._query_embed_cache) >= self._QUERY_EMBED_MAX:
+                for stale in list(self._query_embed_cache)[:self._QUERY_EMBED_MAX // 4]:
+                    self._query_embed_cache.pop(stale, None)
+            self._query_embed_cache[key] = (time.monotonic(), literal)
+        return literal
 
     def _safe_literal(self, vecs) -> str | None:
         """Turn an embedder result into a pgvector literal, or None on anything
@@ -485,11 +529,23 @@ class PostgresBackend(StorageBackend):
         return PostgresBackend._finalize_ack(entry)
 
     _PROFILE_TTL_S = 60.0
+    # 3e: goal-embedding cache bounds. The TTL is short because the win is on
+    # near-duplicate goals within a working session (a clarified intent, a
+    # retried sequence), not on long-term reuse.
+    _QUERY_EMBED_TTL_S = 300.0
+    _QUERY_EMBED_MAX = 512
 
     async def _namespace_profile(self, namespace: str) -> dict:
         """The namespace's variant/config profile (Phase 5/6/7 shared lookup),
         cached ~60s so per-call profile echoes don't add a query per tool call.
         Missing row ⇒ {} (all defaults)."""
+        # 3a: NOTIFY-invalidated cache first. It supersedes the plain TTL cache
+        # below when a listener is configured; when one is not (or it has died)
+        # the TTL path still applies, so this degrades to slow rather than to
+        # wrong.
+        cached_v2 = self.gate_cache.get(namespace)
+        if cached_v2 is not None:
+            return cached_v2
         cached = self._profile_cache.get(namespace)
         if cached and (time.monotonic() - cached[0]) < self._PROFILE_TTL_S:
             return cached[1]
@@ -500,12 +556,40 @@ class PostgresBackend(StorageBackend):
             row = await cur.fetchone()
         profile = (row or {}).get("profile") or {}
         self._profile_cache[namespace] = (time.monotonic(), profile)
+        self.gate_cache.put(namespace, profile)
         return profile
+
+    def invalidate_profile(self, namespace: str) -> None:
+        """Drop a namespace's cached profile from BOTH caches.
+
+        There are two by design — the plain TTL cache and the NOTIFY-invalidated
+        one — and exactly one way to invalidate them, because a cache with two
+        entry points and one exit is how a profile edit silently fails to take
+        effect. In production the variant_profiles trigger fires pg_notify and
+        the listener calls this; a direct writer (a test, a migration, an admin
+        path) calls it explicitly.
+        """
+        self._profile_cache.pop(namespace, None)
+        self.gate_cache.invalidate(namespace)
+
+    def invalidate_all_profiles(self) -> None:
+        """Drop every cached profile from both caches. Used on listener
+        reconnect (the listener missed notifications it will never receive
+        again) and by tests that need to skip the TTL."""
+        self._profile_cache.clear()
+        self.gate_cache.invalidate()
 
     async def resolved_profile(self, namespace: str) -> dict:
         """T7.0: the namespace's profile merged over defaults — echoed on every
         dict response and snapshotted into tool_events."""
         return resolve_profile(await self._namespace_profile(namespace))
+
+    async def gate_guard(self, namespace: str) -> dict:
+        """Intent Gate Tier-1 retrieval guard (floor, alpha, calibration
+        provenance). Reads the SAME cached profile row as resolved_profile, so
+        it costs no extra round trip, but stays out of the echoed profile dict
+        to keep ack shapes unchanged."""
+        return resolve_gate_guard(await self._namespace_profile(namespace))
 
     async def _boundary_meta(self, namespace: str, meta: dict | None) -> dict | None:
         """v3 item 1 (S1a): the write boundary is where sha refs get validated and
@@ -814,13 +898,40 @@ class PostgresBackend(StorageBackend):
     async def intent_open(
         self, namespace, *, goal, scope=None, session_id=None,
         actor="unattributed", event_id=None, clarification=None,
-        include_quarantined=False,
+        include_quarantined=False, verbose_gate=False,
     ) -> dict:
         """Tier 1: open a declared intent (see storage/gate.py)."""
         return await gate.intent_open(
             self, namespace, goal=goal, scope=scope, session_id=session_id,
             actor=actor, event_id=event_id, clarification=clarification,
-            include_quarantined=include_quarantined,
+            include_quarantined=include_quarantined, verbose_gate=verbose_gate,
+        )
+
+    async def gate_close_outcome(self, namespace, *, intent_hash, outcome,
+                                 actor="unattributed", skill_key=None) -> dict:
+        """Close a gated intent's outcome — the only efficacy stage that may
+        tune a threshold (see storage/gate.py)."""
+        return await gate.gate_close_outcome(
+            self, namespace, intent_hash=intent_hash, outcome=outcome,
+            actor=actor, skill_key=skill_key)
+
+    async def skill_efficacy(self, namespace, skill_key) -> dict:
+        """Project the append-only efficacy log into counts. Never stored."""
+        return await gate.efficacy_projection(self, namespace, skill_key)
+
+    async def skill_define(
+        self, namespace, *, key, guidance, polarity, trigger=None,
+        trigger_author="unvalidated", trigger_intent=None, temporal_mode=None,
+        calibration_ts=None, actor="unattributed", role=None, event_id=None,
+    ) -> dict:
+        """Define or update a gate skill, validating its trigger fail-closed
+        (see storage/gate.py)."""
+        return await gate.skill_define(
+            self, namespace, key=key, guidance=guidance, polarity=polarity,
+            trigger=trigger, trigger_author=trigger_author,
+            trigger_intent=trigger_intent, temporal_mode=temporal_mode,
+            calibration_ts=calibration_ts, actor=actor, role=role,
+            event_id=event_id,
         )
 
     @_retry_if_idempotent
@@ -2062,6 +2173,7 @@ class PostgresBackend(StorageBackend):
         self, *, tool: str, args: dict, result: Any = None, outcome: str = "ok",
         error_code: str | None = None, remedy_emitted: bool = False,
         latency_ms: int | None = None, source_surface: str | None = None,
+        gate: dict | None = None, emit_event_id: str | None = None,
     ) -> None:
         """Append one PHI-safe row to tool_events (Phase 1). Values pass through
         redact() in build_event_row — names/lengths/hashes only. Raises on
@@ -2070,7 +2182,7 @@ class PostgresBackend(StorageBackend):
         row = build_event_row(
             tool=tool, args=args, result=result, outcome=outcome,
             error_code=error_code, remedy_emitted=remedy_emitted, latency_ms=latency_ms,
-            source_surface=source_surface,
+            source_surface=source_surface, gate=gate, emit_event_id=emit_event_id,
         )
         # T8.1: remember the namespace's most recent friction so observation_log
         # can auto-attach it (codes/pattern names only — PHI-safe by shape).
@@ -2089,7 +2201,20 @@ class PostgresBackend(StorageBackend):
         ]
         async with self.pool.connection() as conn:
             await conn.execute(
-                f"INSERT INTO tool_events ({', '.join(cols)}) VALUES ({placeholders})",
+                f"INSERT INTO tool_events ({', '.join(cols)}) VALUES ({placeholders}) "
+                # Idempotent emission: a retried or double-invoked emit collapses
+                # instead of double-counting a block, which would make the new
+                # numbers as untrustworthy as the ones they replace.
+                #
+                # The index predicate is REQUIRED here, not decoration. The
+                # unique index is partial (emit_event_id IS NOT NULL), and
+                # Postgres cannot infer a partial index from the column list
+                # alone — it raises "no unique or exclusion constraint matching
+                # the ON CONFLICT specification". Since the tool layer swallows
+                # telemetry errors by design, omitting it silently drops EVERY
+                # tool_events row: a telemetry fix that destroys telemetry.
+                "ON CONFLICT (emit_event_id) WHERE emit_event_id IS NOT NULL "
+                "DO NOTHING",
                 values,
             )
 
@@ -2110,7 +2235,68 @@ class PostgresBackend(StorageBackend):
                 """
             )
             row = await cur.fetchone()
-        return dict(row)
+        out = dict(row)
+        out["db_identity"] = await self.db_identity()
+        return out
+
+    async def db_identity(self) -> dict:
+        """Which database is THIS SERVER PROCESS actually connected to.
+
+        The structural fix for the split-brain that cost the last deploy its
+        closeout. The Replit workspace shell's $DATABASE_URL resolved to
+        `heliumdb` while the deployed server read `neondb`, so a correct
+        variant_profiles INSERT executed successfully against a database the
+        server never reads, and the gate silently failed to arm across three
+        checks over seven minutes. The two diverged in BOTH directions, so it
+        was not replica lag and no amount of care with the SQL would have caught
+        it.
+
+        The lesson generalises: an environment variable in a shell is a claim
+        about a connection, not the connection. The only trustworthy answer to
+        "which database is the server using" comes from the server, over its own
+        pool. That is what this returns, and it is why the post-deploy protocol
+        asserts through here rather than through psql.
+
+        boot_connection_fingerprint is the comparable value: sha256 of
+        host+db+user+boot_ts, stable for the life of the process, recorded in
+        the deploy record and re-checked after any credential rotation. A
+        changed fingerprint with an unchanged deploy means something moved
+        underneath the server.
+        """
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                "SELECT current_database() AS current_database, "
+                "       current_user AS current_user_name, "
+                "       inet_server_addr()::text AS server_addr, "
+                "       inet_server_port() AS server_port, "
+                "       version() AS server_version_string, "
+                "       (SELECT extversion FROM pg_extension WHERE extname = 'vector') "
+                "           AS pgvector_version")
+            row = dict(await cur.fetchone())
+            # The host as the CLIENT resolved it. current_database() alone would
+            # not have distinguished two Neon endpoints serving databases of the
+            # same name, and endpoint identity is exactly what split-brain is
+            # about.
+            info = conn.info
+            host = info.host or ""
+            port = str(info.port or "")
+
+        fingerprint = hashlib.sha256(
+            f"{host}|{port}|{row['current_database']}|{row['current_user_name']}|"
+            f"{self._boot_ts}".encode()
+        ).hexdigest()
+        return {
+            "current_database": row["current_database"],
+            "current_user": row["current_user_name"],
+            "endpoint_host": host,
+            "endpoint_port": port,
+            "server_addr": row["server_addr"],
+            "pgvector_version": row["pgvector_version"],
+            "postgres_version": (row["server_version_string"] or "").split(" on ")[0],
+            "server_boot_ts": self._boot_ts,
+            "boot_connection_fingerprint": fingerprint,
+        }
 
     @_retry_on_disconnect
     async def health(self) -> bool:

@@ -69,7 +69,7 @@ async def test_invalid_category_and_clinical_gate(backend, ns):
             "INSERT INTO variant_profiles (namespace, profile) VALUES (%s, %s) "
             "ON CONFLICT (namespace) DO UPDATE SET profile = EXCLUDED.profile",
             (ns, Jsonb({"clinical": True})))
-    backend._profile_cache.clear()
+    backend.invalidate_profile(ns)
     with pytest.raises(AppError) as exc:
         await backend.observation_log(ns, category="ergonomics")
     assert exc.value.code == "observations_disabled"
@@ -93,7 +93,7 @@ async def test_advisory_carries_nudge(reconcile_backend, ns):
             "INSERT INTO variant_profiles (namespace, profile) VALUES (%s, %s) "
             "ON CONFLICT (namespace) DO UPDATE SET profile = EXCLUDED.profile",
             (ns, Jsonb({"advisory_mode": "minimal"})))
-    reconcile_backend._profile_cache.clear()
+    reconcile_backend.invalidate_profile(ns)
     reconcile_backend.resolver.heads[("o/r", "main")] = "f" * 40
     out = await reconcile_backend.memory_save(
         ns, "claim/pin", {"c": "x"}, kind="claim",

@@ -51,6 +51,7 @@ from config import settings
 from dashboard import SURFACE_LABELS, build_routes
 from server.mcp_server import deps, mcp
 from storage.curator import build_curator
+from storage import intent_features
 from storage.embeddings import build_embedder
 from storage.postgres import PostgresBackend
 from storage.reconcile import build_resolver, verify_signature
@@ -144,13 +145,44 @@ async def lifespan(app: FastAPI):
     resolver = build_resolver(settings)  # GitHub when keyed, else disabled (unverifiable)
     curator = build_curator(settings)    # Anthropic when keyed, else disabled (no-op curate)
     deps.backend = PostgresBackend(pool, embedder=embedder, resolver=resolver, curator=curator)
+
+    # Warm the Intent Gate's feature extractor at boot. spaCy's model load is
+    # ~0.5s and happens lazily on first use, which would otherwise land on
+    # whichever caller happens to open the first intent — a half-second spike on
+    # the Tier-1 hot path, attributed to the wrong request. Loading it here moves
+    # the cost to boot where it belongs.
+    #
+    # Deliberately off the critical path for readiness: a failed model load is
+    # NOT fatal. Without features every trigger simply fails to match and skills
+    # degrade to display-only, which is the same fail-toward-silence direction
+    # the gate takes everywhere else. A gate that cannot parse should go quiet,
+    # not take the server down.
+    try:
+        extractor_ready = await asyncio.to_thread(intent_features.model_available)
+    except Exception as exc:  # noqa: BLE001 - never fatal
+        extractor_ready = False
+        log.warning("gate_extractor_warmup_failed", error=str(exc))
+
+    # 3a: start the gate cache's LISTEN subscriber on the DIRECT connection.
+    # Best-effort and deliberately non-fatal — the listener is an optimisation,
+    # and every cache entry carries a TTL, so its absence degrades the system to
+    # slow rather than to wrong. gate_cache_status.listener_alive is how anyone
+    # finds out, because this failure is otherwise completely silent.
+    try:
+        await deps.backend.gate_cache.start(settings.database_url_direct)
+    except Exception as exc:  # noqa: BLE001 - best-effort: TTL fallback covers it
+        log.warning("gate_cache_listener_start_failed", error=str(exc))
+
     log.info("startup_ok", max_size=settings.pool_max_size,
              embeddings=embedder.enabled, reconciler=resolver.enabled,
-             curator=curator.enabled)
+             curator=curator.enabled, gate_extractor=extractor_ready,
+             gate_listener_configured=bool(settings.database_url_direct))
     try:
         async with mcp_app.lifespan(app):  # run the MCP session manager
             yield
     finally:
+        if deps.backend is not None:
+            await deps.backend.gate_cache.stop()
         deps.backend = None
         await pool.close()
         log.info("shutdown_ok")

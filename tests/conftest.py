@@ -137,6 +137,64 @@ CREATE TABLE IF NOT EXISTS gate_block_log (
     created_at timestamptz NOT NULL DEFAULT now(), closed_at timestamptz);
 ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS gate_tier int;
 ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS gate_decision text;
+-- 0010_gate_match_log.sql — the Tier-1 retrieval calibration dataset. EVERY
+-- skill candidate lands here, guard-passed or not, so the floor that produced
+-- a decision can later be judged against outcomes. intent_hash only: this
+-- table has no goal column to leak raw intent text into.
+CREATE TABLE IF NOT EXISTS gate_match_log (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ts timestamptz NOT NULL DEFAULT now(),
+    namespace text NOT NULL, intent_hash char(64) NOT NULL, skill_key text NOT NULL,
+    cosine real, top_score real, absolute_floor real, alpha real,
+    passed_guard boolean NOT NULL,
+    predicate_match boolean, nli_contradiction real, acted_upon boolean,
+    temporal_mode text, calibration_ts timestamptz);
+CREATE INDEX IF NOT EXISTS gate_match_log_ns_ts ON gate_match_log (namespace, ts);
+CREATE INDEX IF NOT EXISTS gate_match_log_ns_intent
+    ON gate_match_log (namespace, intent_hash);
+-- 0011_gate_telemetry.sql — the unified emitter's columns and the
+-- event-sourced efficacy log.
+ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS error_type text;
+ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS gate_rule text;
+ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS discontinuity boolean;
+ALTER TABLE tool_events ADD COLUMN IF NOT EXISTS emit_event_id text;
+CREATE UNIQUE INDEX IF NOT EXISTS tool_events_emit_event_id_uq
+    ON tool_events (emit_event_id) WHERE emit_event_id IS NOT NULL;
+-- Append-only. Counts are projections; UNIQUE makes double-counting
+-- structurally impossible rather than conventionally avoided.
+CREATE TABLE IF NOT EXISTS skill_efficacy_events (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ts timestamptz NOT NULL DEFAULT now(),
+    namespace text NOT NULL, skill_key text NOT NULL,
+    intent_hash char(64) NOT NULL,
+    stage text NOT NULL CHECK (stage IN
+        ('matched','surfaced','acted_upon','outcome_closed')),
+    outcome text CHECK (outcome IS NULL OR outcome IN
+        ('followed','overridden','abandoned')),
+    writer_actor text NOT NULL, event_id text, session_id text,
+    UNIQUE (namespace, skill_key, intent_hash, stage));
+CREATE INDEX IF NOT EXISTS skill_efficacy_events_ns_skill
+    ON skill_efficacy_events (namespace, skill_key, stage);
+CREATE INDEX IF NOT EXISTS skill_efficacy_events_ns_intent
+    ON skill_efficacy_events (namespace, intent_hash);
+-- 0012_gate_cache_invalidate.sql — version bump + pg_notify in the SAME
+-- transaction as the profile change, so a committed edit is never unannounced.
+ALTER TABLE variant_profiles ADD COLUMN IF NOT EXISTS cache_version bigint NOT NULL DEFAULT 0;
+CREATE SEQUENCE IF NOT EXISTS gate_cache_version_seq;
+CREATE OR REPLACE FUNCTION gate_notify_invalidate() RETURNS trigger AS $fn$
+DECLARE
+    v bigint;
+BEGIN
+    v := nextval('gate_cache_version_seq');
+    NEW.cache_version := v;
+    PERFORM pg_notify('gate_invalidate', v::text || ':' || NEW.namespace);
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS variant_profiles_gate_invalidate ON variant_profiles;
+CREATE TRIGGER variant_profiles_gate_invalidate
+    BEFORE INSERT OR UPDATE ON variant_profiles
+    FOR EACH ROW EXECUTE FUNCTION gate_notify_invalidate();
 """
 
 def _load_migration_views() -> str:

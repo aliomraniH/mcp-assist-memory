@@ -1,7 +1,7 @@
 # mcp-assist-memory
 
 A **generic, project-agnostic** memory / coordination / artifact server for
-multi-agent and multi-surface work. One FastAPI process serves a **24-tool MCP**
+multi-agent and multi-surface work. One FastAPI process serves a **27-tool MCP**
 over Streamable HTTP, backed by **Postgres (+ pgvector)**, deployed standalone on
 a **Replit Reserved VM**.
 
@@ -11,7 +11,7 @@ namespace *values*, never in tool names, tables, columns, or code.
 
 ### Capabilities at a glance
 
-- **24-tool MCP** over Streamable HTTP (memory, handoff, session, artifact,
+- **27-tool MCP** over Streamable HTTP (memory, handoff, session, artifact,
   coordination, feedback, admin).
 - **Trust-boundary spine (Plan v2)** — actor-scoped exactly-once writes with
   visible dedup, read-back-verified acks (`verified_persisted`), standardized
@@ -36,7 +36,7 @@ namespace *values*, never in tool names, tables, columns, or code.
 - **Content-addressed artifacts** (sha256, global dedup), 50 MB cap, ranged reads.
 - **Per-surface rotatable tokens** (web vs. desktop-cli) managed from a password-gated `/admin` dashboard.
 
-## The 24 tools
+## The 27 tools
 
 | Group | Tools |
 |---|---|
@@ -45,7 +45,7 @@ namespace *values*, never in tool names, tables, columns, or code.
 | session | `session_create` `session_append_event` `session_get` `session_list` `session_events` |
 | artifact | `artifact_put` `artifact_get` `artifact_list` |
 | coordination | `coord_health` `coord_drift_scan` `coord_reconcile` `coord_curate` |
-| gate | `intent_open` |
+| gate | `intent_open` `skill_define` `gate_close_outcome` `gate_cache_status` |
 | feedback | `observation_log` |
 | admin | `stats` |
 
@@ -221,7 +221,7 @@ migrates it, runs `pytest`, and deletes the branch. Set repo secrets
 
 `scripts/smoke_mcp.py` performs the exact handshake a Claude connector does —
 `initialize` + `tools/list` over `/mcp` with a valid token — and asserts HTTP 200
-with the full **24-tool** surface, plus the guard rails (no/bad token ⇒ 401,
+with the full **27-tool** surface, plus the guard rails (no/bad token ⇒ 401,
 `/healthz` db ok). It exists so a transport/auth/host regression (like the
 fastmcp 3.4.3 421) can never ship silently again.
 
