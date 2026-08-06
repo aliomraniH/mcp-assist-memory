@@ -134,10 +134,14 @@ zipp==4.1.0
 #                            features), so the listener cannot share the app's
 #                            pooled connection.
 #
-# The en_core_web_sm MODEL is not on PyPI; it installs from a direct wheel URL
-# declared in pyproject.toml as a PEP 508 direct reference. The pin below caps
-# the version; the URL in pyproject.toml is what actually resolves it. Both must
-# move together on an upgrade.
+# The en_core_web_sm MODEL is not on PyPI and is deliberately NOT declared in
+# pyproject.toml (Replit's deploy-time locker segfaults on PEP 508 direct-URL
+# references). It installs from a direct wheel URL via an explicit
+# `pip install --no-deps '<url>'` step in every install path: the .replit
+# [deployment] build command, the Makefile, post-merge.sh, and CI
+# (.github/workflows/test.yml). The pin below caps the version; the wheel URL
+# in those commands is what actually resolves it. All must move together on an
+# upgrade.
 #
 # Phase 4 (NLI backstop: onnxruntime, optimum) is DESCOPED from this branch and
 # deliberately NOT pinned here — see build/gate-remediation-p1-complete.
