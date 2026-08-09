@@ -1,6 +1,6 @@
 - [Admin token dashboard](admin-token-dashboard.md) — one dashboard-managed MCP token PER SURFACE label (web/desktop-cli/chatgpt/cursor); gate maps token→label, stamps surface into logs/telemetry, strips ?token= post-auth.
 - [Git push past corrupt ref / diverged remote](git-push-corrupt-ref.md) — clone --single-branch to a temp repo to push past a corrupt unrelated ref; reconcile a diverged remote with merge -s ours (no force).
-- [MCP auth token: seed vs live](mcp-auth-token-seed.md) — env MCP_AUTH_TOKEN only seeds the `web` token; live per-label tokens live in Postgres, owned by /admin; verify with list_tokens().
+- [MCP auth token: seed vs live](mcp-auth-token-seed.md) — MCP_AUTH_TOKEN is optional (legacy workspace-only env; requiring it crashed prod boot); live per-label tokens live in Postgres, owned by /admin.
 - [Reconnect retry policy](reconnect-retry-policy.md) — disconnect-retry: reads + event_id-gated writes always; session_* writes retry too (accepted at-least-once tradeoff); saves w/o event_id never retry.
 - [MCP stateless transport](mcp-stateless-transport.md) — /mcp runs stateless_http=True so sessions survive VM restart/redeploy; never revert to stateful to "fix" a session bug.
 - [Deployed /mcp 421 = fastmcp HostOriginGuard](mcp-sse-edge-421.md) — prod-only 421 = fastmcp's Host guard (not SSE/edge); now RUN configured on fastmcp==3.4.3/mcp==1.28.1 via config.mcp_allowed_hosts/origins, don't disable it.
@@ -12,6 +12,8 @@
 - [Main-agent git sync](main-agent-git-sync.md) — main agent can't fetch/reset/checkout; sync to remote main via GitHub compare+contents API file writes; run tests on a scratch DB, not live DATABASE_URL.
 - [constraints.txt / pyproject lockstep](constraints-pyproject-lockstep.md) — a pyproject pin bump without regenerating constraints.txt breaks post-merge with ResolutionImpossible; fix = pip install -e . then scripts/lock-deps.sh.
 - [MCP tool arg shapes](mcp-tool-arg-shapes.md) — memory_save has no top-level session_id (use meta); observation_log category enum; missing-key get = empty content, not error.
-- [Prod DB operator-only](prod-db-operator-only.md) — prod Postgres is separate from dev and agent SQL is SELECT-only; probes needing prod writes → verify on identical dev build + log deviation.
+- [Prod DB operator-only](prod-db-operator-only.md) — prod Postgres is separate from dev and agent SQL is SELECT-only; direct writes now possible via user-provided PROD_DATABASE_URL_DIRECT secret (verification use only).
+- [Gate latency verification](gate-latency-verification.md) — harness needs an armed namespace or it passes hollow (n=0); run long harnesses as a temp workflow (bg shells get reaped); workspace vantage adds ~22ms vs VM.
 - [Deploy healthcheck root + main's dropped shims](deploy-healthcheck-root.md) — platform probes GET / (keep DB-independent 200); GitHub main lacks BOTH the GET / root AND the /mcp path-normalization shim, so re-apply both on every deploy-from-main or the deploy 404s / bare POST /mcp 307s.
+- [Deploy locker vs direct-URL deps](upm-direct-url-dep.md) — never put `pkg @ https://...whl` in pyproject deps; Replit's upm/uv locker segfaults at build. Install via deploy build command instead.
 - [Deterministic deploy deps](deterministic-deploy-deps.md) — loose pyproject ranges + no lock caused the /mcp 421; constraints.txt pins the full closure and is wired into every install path; regenerate via `make lock`, never hand-edit.
