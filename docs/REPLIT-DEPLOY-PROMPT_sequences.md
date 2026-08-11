@@ -1,7 +1,11 @@
 # Replit Deploy Prompt — Server-Side Sequences + Shared Retrieval Guard (v0.4.0)
 
-**Give this whole document to the Replit deploy agent.** It is self-contained
-and assumes the previous release (v0.3.0, merge `d48ad0b`) is already live.
+**Give this whole document to the Replit deploy agent.** It is self-contained.
+
+Deploy target: **`main` @ `a00674ebc246fab511f4e34b82b82481fe49b297`** (PR #17).
+Assumes the previous release (v0.3.0, merge `d48ad0b`) plus the Replit deploy
+fixes already on `main` (spaCy wheel install, optional `MCP_AUTH_TOKEN`) are
+live. Nothing in this release changes those.
 
 ---
 
@@ -107,11 +111,16 @@ See `docs/runbooks/neon-credential-rotation.md`.
 DATABASE_URL=<throwaway pg> python -m pytest -q
 ```
 
-Expected: **533 collected, 532 pass**. The one failure is in
-`tests/test_gate_awaken.py` (`test_gh_2_…` / `test_gh_3_…`, which one varies per
-run) — these are **pre-existing timing flakes**, verified as flaking identically
-on the v0.3.0 merge commit with these changes stashed. They are not caused by
-this release. Do not "fix" them as part of this deploy.
+Expected: **533 passed, 0 failed** (verified on the merge content, local
+Postgres 16 + pgvector 0.6.0, 5 deselected `[NEON]`/`[POST-DEPLOY]` markers).
+
+One caveat so you read a red run correctly: `tests/test_gate_awaken.py`
+(`test_gh_2_…` / `test_gh_3_…`) contains **pre-existing timing flakes** — they
+use a `claim_staleness_hours` of ~4ms and lose the race on a loaded machine.
+They were verified as flaking identically on the v0.3.0 merge commit with this
+release's changes stashed, so a failure there is not a regression and is not
+yours to fix. **Any other failure is real** — stop and report it rather than
+re-running until green.
 
 New files: `tests/test_retrieval_guard.py` (12 tests),
 `tests/test_sequences.py` (29 tests).
