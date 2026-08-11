@@ -195,6 +195,19 @@ DROP TRIGGER IF EXISTS variant_profiles_gate_invalidate ON variant_profiles;
 CREATE TRIGGER variant_profiles_gate_invalidate
     BEFORE INSERT OR UPDATE ON variant_profiles
     FOR EACH ROW EXECUTE FUNCTION gate_notify_invalidate();
+-- 0013_namespace_registry.sql — provenance for deliberately created namespaces.
+CREATE TABLE IF NOT EXISTS namespace_registry (
+    namespace       text PRIMARY KEY,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    created_by      text NOT NULL DEFAULT 'unattributed',
+    purpose         text,
+    clinical        boolean NOT NULL DEFAULT false,
+    created_profile jsonb NOT NULL DEFAULT '{}'::jsonb,
+    lifecycle       text);
+CREATE INDEX IF NOT EXISTS namespace_registry_created_at
+    ON namespace_registry (created_at DESC);
+CREATE INDEX IF NOT EXISTS namespace_registry_clinical
+    ON namespace_registry (clinical) WHERE clinical;
 """
 
 def _load_migration_views() -> str:

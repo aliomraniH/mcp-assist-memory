@@ -1,7 +1,7 @@
 # mcp-assist-memory
 
 A **generic, project-agnostic** memory / coordination / artifact server for
-multi-agent and multi-surface work. One FastAPI process serves a **27-tool MCP**
+multi-agent and multi-surface work. One FastAPI process serves a **30-tool MCP**
 over Streamable HTTP, backed by **Postgres (+ pgvector)**, deployed standalone on
 a **Replit Reserved VM**.
 
@@ -11,7 +11,7 @@ namespace *values*, never in tool names, tables, columns, or code.
 
 ### Capabilities at a glance
 
-- **27-tool MCP** over Streamable HTTP (memory, handoff, session, artifact,
+- **30-tool MCP** over Streamable HTTP (memory, handoff, session, artifact,
   coordination, feedback, admin).
 - **Trust-boundary spine (Plan v2)** — actor-scoped exactly-once writes with
   visible dedup, read-back-verified acks (`verified_persisted`), standardized
@@ -36,7 +36,7 @@ namespace *values*, never in tool names, tables, columns, or code.
 - **Content-addressed artifacts** (sha256, global dedup), 50 MB cap, ranged reads.
 - **Per-surface rotatable tokens** (web vs. desktop-cli) managed from a password-gated `/admin` dashboard.
 
-## The 27 tools
+## The 30 tools
 
 | Group | Tools |
 |---|---|
@@ -46,8 +46,28 @@ namespace *values*, never in tool names, tables, columns, or code.
 | artifact | `artifact_put` `artifact_get` `artifact_list` |
 | coordination | `coord_health` `coord_drift_scan` `coord_reconcile` `coord_curate` |
 | gate | `intent_open` `skill_define` `gate_close_outcome` `gate_cache_status` |
+| sequence | `session_bootstrap` `namespace_init` `recall` |
 | feedback | `observation_log` |
 | admin | `stats` |
+
+**Sequences** are the paths an agent should take. Correct use of this server has
+always been a *sequence* — learn which database answered, resolve the profile,
+check what is stale, then act — and that ordering used to live in tool
+descriptions and skills, i.e. it was enforced by a model remembering advice
+mid-task, and a skipped step produced no signal whatsoever. The three sequence
+tools run their steps server-side in a fixed order and return `steps_run`, so
+the ordering is something the server did rather than something a caller got
+right. They are strictly additive: every primitive they are built from still
+works exactly as before, for surgical use.
+
+`recall` and `memory_search` now share ONE retrieval guard
+(`storage/retrieval.py`): the same absolute floor and relative alpha the Intent
+Gate applies. Previously `memory_search` had no floor at all while `intent_open`
+had both, so the same store answered the same question differently depending on
+which tool the caller reached for. They still differ in what they do with the
+verdict — `memory_search` annotates every row and drops nothing, `recall`
+filters by default and reports the rejected counts — but they can no longer
+disagree about what counts as a match.
 
 The **Intent Gate** (`claude/intent-gate/INTENT_GATE_CHARTER.md`) is a
 per-namespace opt-in (`variant_profiles.profile.intent_gate: "on"`): mutating
@@ -221,7 +241,7 @@ migrates it, runs `pytest`, and deletes the branch. Set repo secrets
 
 `scripts/smoke_mcp.py` performs the exact handshake a Claude connector does —
 `initialize` + `tools/list` over `/mcp` with a valid token — and asserts HTTP 200
-with the full **27-tool** surface, plus the guard rails (no/bad token ⇒ 401,
+with the full **30-tool** surface, plus the guard rails (no/bad token ⇒ 401,
 `/healthz` db ok). It exists so a transport/auth/host regression (like the
 fastmcp 3.4.3 421) can never ship silently again.
 

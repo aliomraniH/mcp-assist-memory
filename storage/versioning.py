@@ -8,7 +8,7 @@ stamp when Phase 4 gives them envelopes.
 """
 from __future__ import annotations
 
-SERVER_VERSION = "0.3.0"   # bump per released phase batch
+SERVER_VERSION = "0.4.0"   # bump per released phase batch
 SCHEMA_VERSION = 6         # == highest applied migrations/NNNN_*.sql
 
 

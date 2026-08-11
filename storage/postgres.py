@@ -40,6 +40,7 @@ from storage.embeddings import DisabledEmbedder, Embedder, embed_text, to_vector
 from storage.idempotency import idem_fingerprint
 from storage.phi import assert_no_phi
 from storage.profiles import resolve_gate_guard, resolve_profile
+from storage.retrieval import apply_guard
 from storage.reconcile import (
     STALE,
     UNVERIFIABLE,
@@ -305,6 +306,29 @@ def _rrf_fuse(*legs_and_limit, k: int = _RRF_K) -> list[dict]:
             rows_by_key.setdefault(key, row)
     ordered = sorted(scores, key=lambda key: (-scores[key], best_rank[key], key))
     return [_row_to_entry(rows_by_key[key]) for key in ordered[:limit]]
+
+
+def _guard_search_rows(
+    entries: list[dict], cosines: dict[str, float], guard: dict,
+    *, with_scores: bool,
+) -> list[dict]:
+    """Attach the shared retrieval verdict to each search row, in place.
+
+    Ordering is left exactly as the fusion produced it. The guard's job on this
+    surface is to make the boundary VISIBLE at every call path, not to reorder
+    or prune — see memory_search's docstring for why search annotates where
+    `recall` enforces.
+    """
+    outcome = apply_guard([(e, cosines.get(e["key"])) for e in entries], guard)
+    verdicts = {e["key"]: v for e, v in outcome.all_scored}
+    for entry in entries:
+        verdict = verdicts.get(entry["key"])
+        if verdict is None:  # pragma: no cover - every row is judged
+            continue
+        entry["retrieval"] = verdict.as_dict()
+        if with_scores:
+            entry["_cosine"] = verdict.cosine
+    return entries
 
 
 def _session_to_dict(row: dict) -> dict:
@@ -590,6 +614,98 @@ class PostgresBackend(StorageBackend):
         it costs no extra round trip, but stays out of the echoed profile dict
         to keep ack shapes unchanged."""
         return resolve_gate_guard(await self._namespace_profile(namespace))
+
+    async def write_variant_profile(self, namespace: str, profile: dict) -> dict:
+        """Write a namespace's variant profile and invalidate every cache of it.
+
+        The only supported programmatic writer. Until now the profile row was
+        set by hand — by a migration, an admin psql session, or a test — and
+        each of those had to remember to invalidate the caches afterwards. The
+        0012 trigger covers production (it bumps cache_version and fires
+        pg_notify in the committing transaction), but a process whose listener
+        is dead keeps serving the old profile for up to the TTL and says nothing
+        about it. So this also invalidates in-process, making the write take
+        effect immediately for THIS process regardless of listener health.
+
+        Merges over the existing row rather than replacing it: a caller setting
+        a retrieval floor must not silently clear an unrelated experiment arm
+        somebody else set.
+        """
+        if not isinstance(profile, dict):
+            raise AppError("invalid_argument", "profile must be an object")
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                "INSERT INTO variant_profiles (namespace, profile) VALUES (%s, %s) "
+                "ON CONFLICT (namespace) DO UPDATE "
+                "SET profile = variant_profiles.profile || EXCLUDED.profile "
+                "RETURNING profile, cache_version",
+                (namespace, Jsonb(profile)))
+            row = await cur.fetchone()
+        self.invalidate_profile(namespace)
+        return {"namespace": namespace, "profile": (row or {}).get("profile") or {},
+                "cache_version": (row or {}).get("cache_version")}
+
+    async def register_namespace(
+        self, namespace: str, *, actor: str = "unattributed",
+        profile: dict | None = None, clinical: bool = False,
+        purpose: str | None = None, lifecycle: str | None = None,
+    ) -> dict:
+        """Record that this namespace was created deliberately, by whom, and
+        under which profile (see migrations/0013 for why).
+
+        First writer wins: re-registering an existing namespace leaves the
+        original provenance intact. The creation record is a historical fact,
+        and a retry — or a second agent running the same bootstrap — must not
+        rewrite who created it.
+        """
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                "INSERT INTO namespace_registry "
+                "(namespace, created_by, purpose, clinical, created_profile, lifecycle) "
+                "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (namespace) DO NOTHING "
+                "RETURNING namespace, created_at, created_by",
+                (namespace, actor, purpose, clinical, Jsonb(profile or {}), lifecycle))
+            row = await cur.fetchone()
+        return {"namespace": namespace, "registered": row is not None,
+                "created_at": (row or {}).get("created_at").isoformat()
+                if row and row.get("created_at") else None}
+
+    async def namespace_record(self, namespace: str) -> dict | None:
+        """The registry row for one namespace, or None if it was never
+        registered. Distinct from "has rows": a namespace can be deliberately
+        created, with a policy decided, before anything is written to it."""
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                "SELECT namespace, created_at, created_by, purpose, clinical, "
+                "       created_profile, lifecycle "
+                "FROM namespace_registry WHERE namespace = %s", (namespace,))
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {**row, "created_at": row["created_at"].isoformat()}
+
+    async def namespace_list(self, *, limit: int = 200) -> list[dict]:
+        """Namespaces that were deliberately created, newest first.
+
+        Registry rows only. It does NOT scan memory_entry for distinct
+        namespaces, and the difference is the point: a namespace that exists
+        because somebody once typo'd a write target is not a namespace, it is a
+        stray row. Anything created before this migration, or by a direct write
+        rather than `namespace_init`, is legitimately absent — that is a true
+        statement about the registry, not a gap to paper over with a scan.
+        """
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                "SELECT namespace, created_at, created_by, purpose, clinical, "
+                "       created_profile, lifecycle "
+                "FROM namespace_registry ORDER BY created_at DESC LIMIT %s",
+                (min(int(limit), 1000),))
+            rows = await cur.fetchall()
+        return [{**r, "created_at": r["created_at"].isoformat()} for r in rows]
 
     async def _boundary_meta(self, namespace: str, meta: dict | None) -> dict | None:
         """v3 item 1 (S1a): the write boundary is where sha refs get validated and
@@ -1165,7 +1281,37 @@ class PostgresBackend(StorageBackend):
     @_retry_on_disconnect
     async def memory_search(
         self, namespace, query, *, limit=20, include_quarantined=False,
+        _with_scores=False,
     ) -> list[dict]:
+        """Hybrid search, with the SHARED retrieval guard applied to every row.
+
+        Until the sequences work, this method had no similarity floor at all: it
+        ordered by raw cosine distance and returned top-N, while `intent_open`
+        ran the same store through a 0.45 floor and a 0.85 relative guard. The
+        same question asked two ways got two different notions of "a match",
+        and which one you got depended on which tool the model happened to
+        reach for. That made call ordering load-bearing, which is the least
+        reliable thing to depend on.
+
+        Now both paths call `storage.retrieval.apply_guard` — one floor, one
+        alpha, one definition of admitted. Here the verdict is ATTACHED rather
+        than enforced: every row still comes back, in RRF order, each carrying
+        `retrieval` with its cosine, the thresholds that judged it, and whether
+        it cleared them. Two reasons for annotate-not-drop on this method:
+
+          * Additive-schema constraint. Silently returning fewer rows than the
+            previous release would break callers who never asked for a floor.
+          * On most namespaces the floor is an UNCALIBRATED server default
+            (calibration_ts is null). Deleting evidence on the authority of a
+            number nobody has measured is how a retrieval layer becomes
+            unfalsifiable. Marking it is honest; hiding it is not.
+
+        The `recall` sequence is the enforcing surface: it uses this same guard
+        and filters by default, which is a choice a new tool is free to make.
+
+        `_with_scores` additionally exposes the raw `_cosine` per row. Private
+        (underscore) because it is plumbing for `recall`, not a public field.
+        """
         # Tenant-scoped: every leg filters on a single namespace first — no
         # implicit cross-project reads.
         #
@@ -1177,6 +1323,11 @@ class PostgresBackend(StorageBackend):
         # None and we degrade to pure keyword search — the exact pre-Phase-3
         # behavior (no fusion, keyword order preserved).
         qvec = await self._maybe_embed_query(query)
+        # Resolved BEFORE the connection is taken. gate_guard can hit the pool
+        # on a cold profile cache, and acquiring a second connection while
+        # holding one is how a pool deadlocks under concurrency — the cheapest
+        # kind of bug to avoid and the most expensive to diagnose.
+        guard = await self.gate_guard(namespace)
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
 
@@ -1202,7 +1353,13 @@ class PostgresBackend(StorageBackend):
                      f"%{query}%", limit),
                 )
                 rows = await cur.fetchall()
-                return [_row_to_entry(r) for r in rows[:limit]]
+                # No query vector ⇒ no cosine for anything. Every row is
+                # keyword_only: admitted, and explicitly NOT floored, because a
+                # floor is a statement about embedding proximity and means
+                # nothing for a row that was never ranked by one.
+                return _guard_search_rows(
+                    [_row_to_entry(r) for r in rows[:limit]], {}, guard,
+                    with_scores=_with_scores)
 
             # Semantic leg. Tune HNSW recall for this query only via
             # set_config(..., is_local=true): the value is scoped to the
@@ -1223,7 +1380,7 @@ class PostgresBackend(StorageBackend):
                 )
                 cur = await conn.execute(
                     """
-                    SELECT * FROM (
+                    SELECT *, (embedding <=> %s::vector) AS _dist FROM (
                         SELECT DISTINCT ON (key) *
                         FROM memory_entry
                         WHERE namespace = %s
@@ -1236,7 +1393,8 @@ class PostgresBackend(StorageBackend):
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    (namespace, include_quarantined, *_SEARCH_EXCLUDE_LIKE, qvec, limit),
+                    (qvec, namespace, include_quarantined, *_SEARCH_EXCLUDE_LIKE,
+                     qvec, limit),
                 )
                 semantic_rows = await cur.fetchall()
 
@@ -1247,7 +1405,7 @@ class PostgresBackend(StorageBackend):
                 # leg is naturally empty until the curator has run.
                 cur = await conn.execute(
                     """
-                    SELECT * FROM (
+                    SELECT *, (hyde_embedding <=> %s::vector) AS _dist FROM (
                         SELECT DISTINCT ON (key) *
                         FROM memory_entry
                         WHERE namespace = %s
@@ -1260,7 +1418,8 @@ class PostgresBackend(StorageBackend):
                     ORDER BY hyde_embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    (namespace, include_quarantined, *_SEARCH_EXCLUDE_LIKE, qvec, limit),
+                    (qvec, namespace, include_quarantined, *_SEARCH_EXCLUDE_LIKE,
+                     qvec, limit),
                 )
                 hyde_rows = await cur.fetchall()
 
@@ -1285,7 +1444,26 @@ class PostgresBackend(StorageBackend):
             )
             keyword_rows = await cur.fetchall()
 
-        return _rrf_fuse(semantic_rows, hyde_rows, keyword_rows, limit)
+        # One cosine per key, taken as the BEST of the two semantic legs. Both
+        # are the cosine between this query's vector and some embedding of the
+        # row (its text, or the curator's question-shaped restatement), so both
+        # answer the guard's question — "is this related at all" — and taking
+        # the better of the two is the honest reading. A key found only by the
+        # keyword leg has no cosine and stays None rather than being assigned a
+        # fabricated score.
+        cosines: dict[str, float] = {}
+        for leg in (semantic_rows, hyde_rows):
+            for r in leg:
+                dist = r.get("_dist")
+                if dist is None:
+                    continue
+                sim = 1.0 - float(dist)
+                key = r["key"]
+                if sim > cosines.get(key, float("-inf")):
+                    cosines[key] = sim
+
+        fused = _rrf_fuse(semantic_rows, hyde_rows, keyword_rows, limit)
+        return _guard_search_rows(fused, cosines, guard, with_scores=_with_scores)
 
     # ----------------------------------------------------------- coordination
     @_retry_on_disconnect
