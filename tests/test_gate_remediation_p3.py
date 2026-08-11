@@ -28,6 +28,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from storage.gate_cache import GateCache
 from storage.gate_targets import (
+    NESTED_SPANS,
     SPAN_NAMES,
     TIER0_MEDIAN_MS,
     TIER0_P95_MS,
@@ -275,7 +276,15 @@ async def test_span_breakdown_is_reported_and_sums_to_the_total(gated, ns):
     assert spans, "every intent_open must report its span breakdown"
     assert set(spans) <= set(SPAN_NAMES), f"unknown span names: {set(spans) - set(SPAN_NAMES)}"
     assert "other" in spans, "unaccounted time must be reported, not dropped"
-    assert sum(spans.values()) == pytest.approx(res["latency_ms"], abs=5)
+
+    # Only the SEQUENTIAL timeline is additive. This assertion used to sum every
+    # span, which counted parallel_reads AND its own concurrent children — an
+    # arithmetic error invisible in CI (FakeEmbedder makes goal_embedding 0ms,
+    # so there was nothing to double-count) and a live FAIL of 78-194ms. See
+    # tests/test_gate_defects_v041.py, which makes the embedding cost non-zero
+    # on purpose so the bug is reproducible here.
+    accounted = sum(v for k, v in spans.items() if k not in NESTED_SPANS)
+    assert accounted == pytest.approx(res["latency_ms"], rel=0.05, abs=3)
 
 
 # ===========================================================================
