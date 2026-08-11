@@ -29,3 +29,12 @@ valid token.
   never a blocked memory write and never a false verdict.
 - The startup `startup_ok` log's `reconciler` boolean is just
   `build_resolver(settings).enabled`; with the connector vars present it is `true`.
+- Quirk seen 2026-08-06: `?connector_names=github` filter returned 0 items while
+  the UNFILTERED `/api/v2/connection?include_secrets=true` call returned the
+  github item fine — if the filtered call comes back empty, retry unfiltered and
+  match on `connector_name` before concluding the connection is missing.
+- The workspace `GITHUB_PAT`/`GITHUB_PERSONAL_ACCESS_TOKEN` secrets are stale
+  (401 Bad credentials as of 2026-08-06); prefer the connector proxy.
+- The connector OAuth token has NO `workflow` scope: PUTs to
+  `.github/workflows/*` are refused with 403. Workflow-file changes must be
+  pushed by the user (or a PAT with workflow scope).

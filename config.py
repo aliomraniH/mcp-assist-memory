@@ -24,7 +24,10 @@ class Settings(BaseSettings):
     # through gate_cache_status. Correctness is unaffected; only the speed of
     # noticing a profile change is.
     database_url_direct: str | None = None
-    mcp_auth_token: str
+    # Optional: only SEEDS the `web` token on first boot. Live per-label tokens
+    # live in Postgres (admin_auth_tokens), owned by /admin. The deployment does
+    # not carry this env var, so boot must not require it.
+    mcp_auth_token: str | None = None
 
     # --- admin dashboard (/admin): manage + rotate the live MCP token ---
     # ADMIN_PASSWORD gates the dashboard; without it the dashboard refuses logins.

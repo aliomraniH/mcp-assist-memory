@@ -6,6 +6,11 @@ description: Why the MCP bearer token in Postgres can differ from the MCP_AUTH_T
 The `/mcp` tokens are NOT the `MCP_AUTH_TOKEN` env var at runtime. There is one
 active token PER SURFACE label (`web`, `desktop-cli`) — see admin-token-dashboard.md.
 
+- `mcp_auth_token` is OPTIONAL in config (made so 2026-08-08): deployments don't
+  carry the env var (it was a legacy workspace-only leftover, absent from the
+  secrets manager), and requiring it crashed prod boot at "waiting for deployment
+  to be ready" with NO runtime logs. Without it, `ensure_tokens` generates strong
+  tokens for missing surfaces; auth stays fail-closed against the DB token set.
 - On first boot `ensure_tokens(labels, seed={"web": MCP_AUTH_TOKEN})` inserts the
   env value as the active `web` row; `desktop-cli` is auto-generated.
 - `ensure_tokens` never overwrites an existing label. So the env var is a

@@ -34,11 +34,13 @@ dependencies = [
     # lemma, dobj lemma, negation scope. Escalation must be decidable without an
     # LLM, so the extractor is a dependency, not a service call.
     "spacy>=3.8,<3.9",
-    # The en_core_web_sm model is NOT published to PyPI. PEP 508 direct
-    # reference pins the exact wheel so the deploy build cannot resolve a
-    # different model revision than dev verified. Keep in lockstep with the
-    # en-core-web-sm pin in constraints.txt.
-    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    # The en_core_web_sm model is NOT published to PyPI and is deliberately NOT
+    # listed here as a PEP 508 direct-URL dependency: Replit's deploy-time
+    # package locker (upm/uv) segfaults on direct references, killing the build
+    # before our build command runs. The exact wheel is instead installed by the
+    # deployment build command in .replit and by dev setup, pinned in lockstep
+    # with the en-core-web-sm==3.8.0 pin in constraints.txt. The runtime loader
+    # (storage/intent_features.py) fails loudly if the model is missing.
     # JSON-Logic evaluation for skill trigger predicates. This is the MAINTAINED
     # fork; nadirizr/json-logic-py is discontinued and must not be substituted.
     "panzi-json-logic>=1.0.1,<2",
