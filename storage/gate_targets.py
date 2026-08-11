@@ -49,8 +49,9 @@ TIER0_MEDIAN_MS = 75
 #
 #   1. The path is now instrumented into named spans (goal_embedding, ann_query,
 #      trigger_scan, structured_scan, project_block, feature_extraction,
-#      match_log, parallel_reads, other) and every intent_open response reports
-#      them. Latency work that requires a redeploy to observe does not get done.
+#      match_log, parallel_reads, persist, other) and every intent_open response
+#      reports them. Latency work that requires a redeploy to observe does not
+#      get done. See NESTED_SPANS below for which of these are additive.
 #
 #   2. Two mechanisms were applied. The four independent reads now run
 #      CONCURRENTLY, dropping the sequential round-trip count from four to one —
@@ -93,5 +94,37 @@ SPAN_NAMES = (
     "parallel_reads",
     "feature_extraction",
     "match_log",
+    "persist",
     "other",
 )
+
+# SPANS THAT ARE NOT ADDITIVE.
+#
+# v1 summed every span and computed other = max(0, total - sum). Both halves of
+# that were wrong, and they hid each other:
+#
+#   1. goal_embedding and ann_query are measured INSIDE _semantic_candidates,
+#      which runs INSIDE the asyncio.gather covered by parallel_reads. Summing
+#      parent and children counts the same milliseconds twice. Worse, the four
+#      legs of that gather run CONCURRENTLY, so their durations do not add up to
+#      the block's wall time under any accounting — the block's wall time is the
+#      SLOWEST leg, which is the whole point of running them concurrently.
+#
+#   2. The max(0, ...) clamp then absorbed the resulting negative residual, so
+#      the breakdown appeared to balance exactly when it was most wrong. Live
+#      T15 measured 78-194ms of real, unattributed latency reported as other=0.
+#
+# The additive breakdown is therefore the SEQUENTIAL timeline: each span below
+# is a leaf on that timeline and they do not overlap, so they sum to the total
+# exactly. The concurrent legs stay reported — they are the measurement the
+# instrumentation exists for — but as nested DETAIL, excluded from the sum.
+NESTED_SPANS = (
+    "goal_embedding",
+    "ann_query",
+    "trigger_scan",
+    "structured_scan",
+    "project_block",
+)
+
+# The sequential timeline. These, and only these, add up to latency_ms.
+ACCOUNTED_SPANS = tuple(n for n in SPAN_NAMES if n not in NESTED_SPANS)

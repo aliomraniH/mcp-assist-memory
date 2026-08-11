@@ -42,6 +42,7 @@ from config import settings
 from errors import AppError
 from storage.idempotency import idem_fingerprint
 from storage.intent_features import extract_features
+from storage.gate_targets import NESTED_SPANS
 from storage.phi import text_looks_identifying
 from storage.retrieval import apply_guard
 from storage.sanitize import sanitize, wrap_value
@@ -759,7 +760,21 @@ _ROLLUP_BASE = {
     "decisions": {GATE_APPROVED: 0, GATE_PREVIEW: 0, GATE_CONFLICT: 0,
                   GATE_CLARIFY: 0, GATE_BLOCKED: 0},
     "tiers": {}, "rules": {},
+    # TWO DIFFERENT THINGS, BOTH HISTORICALLY CALLED "CLOSURE".
+    #
+    # `closures` is BLOCK closure: a gate_blocked decision was later judged
+    # confirmed_correct / false_positive / unknown, written by the gate itself
+    # when an overridden block succeeds or an identical attempt fails again.
+    #
+    # `outcomes` is OUTCOME closure: what the caller actually did with a
+    # surfaced skill (followed / overridden / abandoned), written deliberately
+    # through gate_close_outcome. Different vocabulary, different writer,
+    # different question — and it never reached this rollup at all, because the
+    # shared word made it look like it already had. Keeping them as separate
+    # counters is the fix; folding an outcome verdict into `closures` would
+    # merge two populations that answer different questions.
     "closures": {"confirmed_correct": 0, "false_positive": 0, "unknown": 0},
+    "outcomes": {"followed": 0, "overridden": 0, "abandoned": 0},
     "skills": {},
 }
 
@@ -946,6 +961,22 @@ async def gate_close_outcome(
     except Exception:  # pragma: no cover - calibration backfill is never fatal
         pass
 
+    # Roll the outcome into gate/efficacy/<yyyymm>.outcomes. This is the step
+    # that was missing: every OTHER efficacy signal reaches the monthly rollup,
+    # so a reader comparing "how often did the gate fire" against "how often was
+    # its advice actually followed" found the second half simply absent — and
+    # the `closures` counter sitting right there, populated by block closure,
+    # made the gap look like a zero rather than a hole.
+    #
+    # Counted once per intent, not once per skill: the caller closed ONE
+    # outcome. A replay lands in `already` and must not re-count, or a retried
+    # close would inflate the very number it reports.
+    if closed:
+        try:
+            await bump_rollup(backend, namespace, {f"outcomes.{outcome}": 1})
+        except Exception:  # noqa: BLE001 - observability, never the caller's ack
+            pass
+
     return {
         "namespace": namespace,
         "intent_hash": intent_hash,
@@ -1030,6 +1061,25 @@ async def skill_define(
     if trigger_intent is not None:
         meta["trigger_intent"] = trigger_intent
     meta.setdefault("trigger_intent", guidance[:200])
+
+    # FRESHNESS IS ABOUT THE SKILL, NOT THE PREDICATE.
+    #
+    # last_validated used to be set only inside `if trigger_valid:`, so a skill
+    # authored WITHOUT a trigger was born expired: _skill_expired(None) is True,
+    # and the very first intent_open that surfaced it flagged it expired_skill.
+    # Publishing advice with no predicate is a legitimate, documented use of
+    # this tool — a display-only skill that advises and never escalates — and
+    # such a skill was unusable from the moment it was written.
+    #
+    # A named author looking at a skill IS the validation event, whether or not
+    # they also wrote a machine-checkable predicate, so the stamp belongs here.
+    # curator_provenance stays gated on trigger_valid below: that flag is about
+    # the PREDICATE having been validated and is the escalation gate, and a
+    # skill with no predicate must not acquire it.
+    if trigger_author in ("human", "curator"):
+        meta["last_validated"] = (calibration_ts
+                                  or datetime.now(timezone.utc).isoformat())
+
     if trigger_valid:
         meta["trigger"] = trigger
         meta["trigger_author"] = trigger_author
@@ -1046,8 +1096,6 @@ async def skill_define(
         # be defined but never escalates.
         if trigger_author in ("human", "curator"):
             meta["curator_provenance"] = True
-            meta["last_validated"] = (calibration_ts
-                                      or datetime.now(timezone.utc).isoformat())
     else:
         # Never leave a stale VALID trigger behind a rejected update — that
         # would silently keep escalating on a rule the author just tried to
@@ -1156,12 +1204,20 @@ async def intent_open(
         return await _semantic_candidates(
             backend, namespace, goal, include_quarantined, spans=spans)
 
+    # parallel_reads is the block's WALL time and the only part of it that
+    # belongs in the additive breakdown; the four legs overlap, so their
+    # durations are nested detail (see gate_targets.NESTED_SPANS). All four are
+    # timed — three of them previously were not, which meant "which leg is the
+    # slow one" was unanswerable for exactly the reads the concurrency was
+    # supposed to fix.
     t_par = time.monotonic()
     semantic_raw, trigger_hits, structured, project = await asyncio.gather(
         _semantic(),
-        _trigger_candidates(backend, namespace, goal, include_quarantined),
-        _structured_conflict(backend, namespace, goal),
-        _project_block(backend, namespace),
+        _timed(spans, "trigger_scan",
+               _trigger_candidates(backend, namespace, goal, include_quarantined)),
+        _timed(spans, "structured_scan",
+               _structured_conflict(backend, namespace, goal)),
+        _timed(spans, "project_block", _project_block(backend, namespace)),
     )
     spans["parallel_reads"] = int((time.monotonic() - t_par) * 1000)
 
@@ -1334,6 +1390,9 @@ async def intent_open(
     matched_snapshot = [{"key": m["key"], "revision_id": m.get("revision_id"),
                          "polarity": m.get("polarity"), "flags": m["flags"]}
                         for m in matched]
+    # SPAN: the intent INSERT. Previously unnamed and folded into `other`,
+    # which is exactly where a round trip goes to hide.
+    _t = time.monotonic()
     async with backend.pool.connection() as conn:
         await conn.execute(
             "INSERT INTO gate_intent (namespace, session_id, intent_hash, goal, "
@@ -1343,12 +1402,21 @@ async def intent_open(
              None if clinical else goal, list(scope or []), labels, hits or None,
              decision, Jsonb(_json_safe(conflict)) if conflict else None,
              Jsonb(_json_safe(matched_snapshot)), actor or "unattributed"))
+    spans["persist"] = int((time.monotonic() - _t) * 1000)
 
     latency_ms = int((time.monotonic() - t0) * 1000)
-    # Whatever the named spans do not account for: serialisation, wrapping,
-    # the intent INSERT, the ledger. Reported rather than left implicit, so the
+    # Whatever the sequential spans do not account for: serialisation, wrapping,
+    # the guard/predicate loop. Reported rather than left implicit, so the
     # breakdown always sums to the total and a missing cost cannot hide.
-    spans["other"] = max(0, latency_ms - sum(spans.values()))
+    #
+    # Only ACCOUNTED (non-overlapping) spans enter this subtraction — summing
+    # the nested legs too would double-count them and drive the residual
+    # negative. And there is deliberately NO max(0, ...) clamp: a negative
+    # `other` means the accounting itself is broken, and that must be visible
+    # in the response rather than silently floored to a tidy zero. The clamp is
+    # what let live T15 report other=0 while 78-194ms went unattributed.
+    accounted = sum(v for k, v in spans.items() if k not in NESTED_SPANS)
+    spans["other"] = latency_ms - accounted
     ctx = GateContext(tool="intent_open", key="", tier=1, decision=decision,
                       flags=flags, matched=[m["key"] for m in matched],
                       session_id=str(session_id) if session_id else None,
