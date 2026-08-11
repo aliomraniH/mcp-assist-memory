@@ -1,4 +1,4 @@
-"""FastMCP instance and the 27 tools.
+"""FastMCP instance and the 30 tools.
 
 The tools are thin: they validate/relay to the injected ``StorageBackend``.
 The backend is set on ``deps`` during the FastAPI lifespan (one pool, injected),
@@ -9,15 +9,20 @@ project == tenant) and the backend filters every query on it — there are no
 implicit cross-project reads. Artifacts are content-addressed and global, and
 ``coord_drift_scan``/``stats`` are deliberately store-wide coordination/admin views.
 
-Tool surface (27):
+Tool surface (30):
   memory:   memory_save, memory_get, memory_list, memory_history, memory_delete, memory_search
   handoff:  handoff_save, handoff_load, handoff_list
   session:  session_create, session_append_event, session_get, session_list, session_events
   artifact: artifact_put, artifact_get, artifact_list
   coord:    coord_health, coord_drift_scan, coord_reconcile, coord_curate
   gate:     intent_open, skill_define, gate_close_outcome, gate_cache_status
+  sequence: session_bootstrap, namespace_init, recall
   feedback: observation_log
   admin:    stats
+
+The `sequence` tools are the ones agents should reach for: each runs a fixed
+multi-step order server-side and reports `steps_run`. The primitives they are
+built from all remain, unchanged, for surgical use.
 """
 from __future__ import annotations
 
@@ -38,6 +43,7 @@ from config import settings
 from errors import AppError
 from errors.catalog import FEEDBACK_NUDGE
 from errors.suggest import did_you_mean
+from storage import sequences
 from storage.base import StorageBackend
 from storage.versioning import stamp
 
@@ -829,6 +835,131 @@ async def gate_cache_status() -> dict:
     An expired cache entry reads as UNKNOWN and is refetched, never served as
     still-true — the gate must not become its own stale-authority problem."""
     return _backend().gate_cache.status()
+
+
+# --------------------------------------------------------------- sequences
+# Three fixed multi-step sequences, run server-side. Everything they do was
+# previously possible by calling the primitives in the right order — and that
+# was the problem. The ordering lived in tool descriptions, skills and batons,
+# which means it was enforced by a model remembering advice mid-task, and a
+# skipped step produced no signal at all. These move the ordering into the
+# server and return `steps_run` so it is auditable rather than assumed.
+#
+# Strictly additive: every primitive still works exactly as before.
+@mcp.tool
+@instrument
+async def session_bootstrap(
+    namespace: str,
+    surface: str | None = None,
+    actor: str = "unattributed",
+    purpose: str | None = None,
+) -> dict:
+    """START HERE. The first call a session should make in a namespace —
+    replaces the stats → resolved_profile → coord_health → handoff_list →
+    session_create opening sequence with one call that runs those steps in a
+    fixed order and tells you what it ran.
+
+    Returns {session_id, db_identity, variant_profile, retrieval_policy,
+    gate_cache, health, pending_batons, attention, steps_run, degraded}.
+
+    `db_identity` comes FIRST and is the reason this tool exists: every other
+    fact a session learns is conditional on which database answered, and
+    nothing in any other response says which one that is. A previous deploy
+    spent seven minutes reading a database the server had never written to.
+
+    `attention` is the condensed "what should worry you" list — an uncalibrated
+    retrieval floor, a gate cache on TTL fallback, expired reconcile verdicts,
+    quarantined or tainted entries, unconsumed batons addressed to you. Read it
+    before trusting anything the namespace returns.
+
+    `degraded` names steps that FAILED. A bootstrap that half-worked says so
+    rather than returning a cheerful envelope; only session creation is fatal.
+    `steps_run` names the steps that actually executed, so a reviewer can see
+    the sequence ran instead of taking anyone's word for it."""
+    return await sequences.session_bootstrap(
+        _backend(), namespace, surface=surface, actor=actor, purpose=purpose)
+
+
+@mcp.tool
+@instrument
+async def namespace_init(
+    namespace: str,
+    actor: str = "unattributed",
+    intent_gate: str = "off",
+    clinical: bool = False,
+    similarity_floor: float | None = None,
+    top_fraction_alpha: float | None = None,
+    calibration_ts: str | None = None,
+    project_meta: dict | None = None,
+) -> dict:
+    """Create a namespace with its policy STATED rather than inherited.
+
+    Today a namespace comes into existence as a side effect of the first write,
+    taking whatever the server defaults were that week: nobody chose its gate
+    arming, its clinical flag, or its retrieval floor. At read time a defaulted
+    setting is indistinguishable from a decided one, so two namespaces created a
+    release apart can differ in ways no response ever mentions.
+
+    This writes the variant profile explicitly, stamps the retrieval policy with
+    its calibration provenance, optionally seeds project/meta, and records the
+    creation in the namespace registry (who, when, under which profile).
+
+    clinical:true engages the PHI hard gate for the namespace — free-text
+    channels are disabled or warned and intent goals are never stored verbatim.
+    Set it at creation; it is not a thing to remember later.
+
+    similarity_floor / top_fraction_alpha override the retrieval guard for this
+    namespace. Supply `calibration_ts` ONLY if you actually measured them
+    against this namespace's contents: without it the policy reports
+    calibrated:false everywhere it is surfaced, which is the honest state for
+    numbers nobody has verified here.
+
+    Idempotent and non-destructive: run against an existing namespace it changes
+    nothing and returns created:false with the live profile. Namespace creation
+    is exactly the call someone retries after a timeout."""
+    return await sequences.namespace_init(
+        _backend(), namespace, actor=actor, intent_gate=intent_gate,
+        clinical=clinical, similarity_floor=similarity_floor,
+        top_fraction_alpha=top_fraction_alpha, calibration_ts=calibration_ts,
+        project_meta=project_meta)
+
+
+@mcp.tool
+@instrument
+async def recall(
+    namespace: str,
+    query: str,
+    limit: int = 20,
+    include_below_floor: bool = False,
+    include_quarantined: bool = False,
+    actor: str = "unattributed",
+) -> dict:
+    """Guarded semantic recall — `memory_search` with the retrieval floor
+    ENFORCED, the verdict attached to every row, and the result logged for
+    threshold calibration. Prefer this over memory_search when you intend to act
+    on what comes back.
+
+    Both tools now run the same guard (one floor, one alpha, one definition of
+    "admitted"), so they can no longer disagree about what counts as a match.
+    They differ only in what they do with the verdict: memory_search returns
+    every row ANNOTATED, this one returns only admitted rows by default.
+
+    `guard` always reports the counts — {admitted, rejected_below_floor,
+    rejected_below_alpha, top_score} — so "nothing matched" and "nine things
+    matched and every one was noise" never look alike. Those are very different
+    answers and a bare empty list conflates them.
+
+    include_below_floor:true returns the rejected rows too, each marked
+    admitted:false with its reason, so nothing is ever dropped invisibly.
+
+    Every row carries `retrieval` (cosine, the floor and alpha that judged it,
+    and whether those numbers were ever calibrated against this namespace) and
+    `freshness` (temporal_mode, valid_until, repo_sha). A cosine here is
+    DISPLAY-ONLY: it never escalates anything, ever."""
+    return await sequences.recall(
+        _backend(), namespace, query, limit=limit,
+        include_below_floor=include_below_floor,
+        include_quarantined=include_quarantined, actor=actor)
 
 
 # ------------------------------------------------------------- observations

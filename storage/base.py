@@ -171,3 +171,23 @@ class StorageBackend(abc.ABC):
         which would silently restore the v1 behaviour this branch exists to fix."""
         from storage.profiles import resolve_gate_guard
         return resolve_gate_guard(None)
+
+    # ------------- sequence support (namespace_init / session_bootstrap) -------
+    # Non-abstract so alternate backends are not forced to carry a registry.
+    # They fail LOUDLY rather than silently no-op'ing, because a namespace_init
+    # that reports success while writing no profile is precisely the "defaulted
+    # policy indistinguishable from a chosen one" problem the sequence exists to
+    # remove.
+    async def write_variant_profile(self, namespace: str, profile: dict) -> dict:
+        raise NotImplementedError("this backend does not implement variant profiles")
+
+    async def register_namespace(self, namespace: str, **kwargs: Any) -> dict:
+        raise NotImplementedError("this backend does not implement the namespace registry")
+
+    async def namespace_record(self, namespace: str) -> dict | None:  # pragma: no cover - default
+        """None means "no creation record", which is also the honest answer for
+        a backend that keeps no registry."""
+        return None
+
+    async def namespace_list(self, *, limit: int = 200) -> list[dict]:  # pragma: no cover - default
+        return []

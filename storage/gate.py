@@ -43,6 +43,7 @@ from errors import AppError
 from storage.idempotency import idem_fingerprint
 from storage.intent_features import extract_features
 from storage.phi import text_looks_identifying
+from storage.retrieval import apply_guard
 from storage.sanitize import sanitize, wrap_value
 from storage.screening import screen_value
 from storage.triggers import evaluate_trigger, validate_trigger
@@ -1430,16 +1431,18 @@ def _guarded_candidates(candidates: list[dict], guard: dict) -> list[dict]:
     Both are RETRIEVAL guards. Neither escalates anything, ever; that is the
     predicate's job. Passing the floor is not evidence of a violation, and the
     two must not be conflated again.
+
+    This is a THIN ADAPTER over storage.retrieval.apply_guard, and deliberately
+    so. The gate's floor and memory_search's floor used to be different code —
+    in fact memory_search had none — which meant the same store answered the
+    same question two ways depending on which tool the caller reached for. One
+    implementation, shared, is the whole fix; a second copy here that merely
+    agreed today would drift by the next release.
     """
     if not candidates:
         return []
-    floor = float(guard.get("gate_similarity_floor", 0.45))
-    alpha = float(guard.get("gate_top_fraction_alpha", 0.85))
-    top = max((c.get("similarity") or 0.0) for c in candidates)
-    relative = alpha * top
-    return [c for c in candidates
-            if (c.get("similarity") or 0.0) >= floor
-            and (c.get("similarity") or 0.0) >= relative]
+    outcome = apply_guard([(c, c.get("similarity") or 0.0) for c in candidates], guard)
+    return [row for row, _ in outcome.admitted]
 
 
 async def _log_gate_matches(backend, namespace: str, intent_hash_: str,
