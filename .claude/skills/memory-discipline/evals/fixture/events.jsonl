@@ -1,0 +1,5 @@
+{"type": "set", "key": "a", "value": 1, "occurred_at": "2026-08-01T10:00:00Z"}
+{"type": "set", "key": "b", "value": 10, "occurred_at": "2026-08-01T10:05:00Z"}
+{"type": "delete", "key": "a", "occurred_at": "2026-08-01T12:00:00Z"}
+{"type": "set", "key": "a", "value": 2, "occurred_at": "2026-08-01T11:00:00Z"}
+{"type": "set", "key": "c", "value": 7, "occurred_at": "2026-08-01T09:00:00Z"}
